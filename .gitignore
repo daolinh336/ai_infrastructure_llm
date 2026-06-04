@@ -5,7 +5,13 @@ state/
 .env.*
 coverage/
 .claude
+.agents
 
 *.txt
+29-5-2026.txt
 CLAUDE.md
+README.md
+AGENTS.md
 
+
+docs/

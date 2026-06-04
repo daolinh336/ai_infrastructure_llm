@@ -27,12 +27,20 @@ program
       provider: options.provider,
     });
 
+
+    /// react agent bat dau lam viec: thought -> action -> xem log
     const agent = new ReActAgent(createProvider(input.provider));
     const engine = new ExecutionEngine();
     const result = await agent.run({ raw: input.prompt });
+
+
+    /// chay thu hoac chay that
     const execution = input.dryRun
       ? await engine.dryRun(result)
       : await engine.apply(result);
+
+
+    //in bao cao ra teminal
 
     console.log(chalk.cyan('Summary:'));
     console.log(result.plan.summary);
