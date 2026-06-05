@@ -47,16 +47,16 @@ This initial scaffold provides:
 
 ## Functional goals for phase 1
 
-The mini-project CLI should support:
+The mini-project CLI should currently support:
 - entering natural-language infrastructure requests
 - analyzing requests into an execution plan
-- showing the plan for user confirmation
-- running in **dry-run** mode to preview changes without applying them
+- showing the plan and observations in the CLI output
+- running in **dry-run** mode to preview changes without saving state or applying Docker changes
 - generating Docker Compose-style configuration as an intermediate artifact
-- deploying after confirmation
-- persisting infrastructure state
-- supporting status-style inspection and a future `destroy all` flow
-- detecting drift by comparing desired state against actual Docker runtime state
+- optionally persisting **desired state only** without deploying Docker (for example via `--save-state`)
+- supporting basic status-style inspection over saved snapshots
+
+Phase 1 intentionally stops short of real Docker deployment and full drift detection. Those behaviors belong to later phases after runtime boundaries, validation, and approval flows are stronger.
 
 For the first real Docker milestone, keep the demo intentionally basic: prove end-to-end execution with container/image-oriented flows before introducing a custom MCP server. That basic demo can include simple image pull/build and container create/start/inspect flows, as long as they still pass through dry-run, preview, and confirmation steps.
 
@@ -78,11 +78,11 @@ After the baseline is working, the project may evolve beyond a simple ReAct loop
 
 A practical roadmap is:
 - **Phase 1 / baseline scaffold** — natural-language planning, structured infra spec generation, compose rendering, dry-run, and file-based desired state.
-- **Phase 2 / basic Docker demo** — limited real runtime actions such as image pull/build, container create/start/inspect, and state observation, still with explicit preview and user confirmation.
+- **Phase 2 / basic Docker demo** — limited real runtime actions such as image pull/build, container create/start/inspect, and state observation, still with explicit preview and user confirmation. This phase may temporarily use an existing MCP server for prototyping.
 - **Phase 3 / custom MCP server** — after the basic Docker demo is stable, introduce a custom MCP server as a guarded capability layer around validated, policy-controlled runtime actions.
 - **Phase 4 / verification-heavy evolution** — expand toward verifier-oriented or dual-environment execution patterns once the runtime boundary is trustworthy.
 
-For a more detailed implementation sequence, see `docs/roadmap-11-phases.md`.
+For a more detailed implementation sequence, see `docs/roadmap-11-phases.md`. For a trackable execution checklist, see `docs/roadmap-11-phases-checklist.md`.
 
 One candidate long-term direction is a more verification-heavy architecture, for example:
 - **Robust Infrastructure by Verification Agents**

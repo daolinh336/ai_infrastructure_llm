@@ -1,10 +1,12 @@
 import type { InfrastructureSpec } from '../domain/types.js';
+import { validateInfrastructureSpec } from '../domain/schemas.js';
 import YAML from 'yaml';
 
 export function renderCompose(spec: InfrastructureSpec): string {
+  const validSpec = validateInfrastructureSpec(spec);
   const compose = {
     services: Object.fromEntries(
-      spec.services.map((service) => [
+      validSpec.services.map((service) => [
         service.name,
         {
           image: service.image,
@@ -15,12 +17,12 @@ export function renderCompose(spec: InfrastructureSpec): string {
           ...(service.environment ? { environment: service.environment } : {}),
           ...(service.dependsOn?.length ? { depends_on: service.dependsOn } : {}),
           ...(service.volumes?.length ? { volumes: service.volumes } : {}),
-          networks: spec.networks,
+          networks: validSpec.networks,
         },
       ]),
     ),
-    networks: Object.fromEntries(spec.networks.map((name) => [name, {}])),
-    volumes: Object.fromEntries(spec.volumes.map((name) => [name, {}])),
+    networks: Object.fromEntries(validSpec.networks.map((name) => [name, {}])),
+    volumes: Object.fromEntries(validSpec.volumes.map((name) => [name, {}])),
   };
 
   return YAML.stringify(compose);

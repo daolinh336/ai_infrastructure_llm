@@ -9,6 +9,69 @@ export interface UserCommand {
   raw: string;
 }
 
+export type InfrastructureIntent = 'create' | 'update' | 'status' | 'destroy' | 'drift';
+
+export interface IntentClassification {
+  scope: 'infrastructure' | 'out-of-scope' | 'unsafe';
+  intent: InfrastructureIntent | null;
+  reason: string;
+}
+
+export interface DraftServiceQuery {
+  name: string | null;
+  image: string | null;
+  port: number | null;
+  replicas: number | null;
+  requestedMounts: string[];
+  privileged: boolean | null;
+  networkMode: string | null;
+  pidMode: string | null;
+  ipcMode: string | null;
+  cpu: number | null;
+  memoryGb: number | null;
+}
+
+export interface DraftQuery {
+  raw: string;
+  normalizedPrompt: string;
+  intent: InfrastructureIntent;
+  services: DraftServiceQuery[];
+  destructive: boolean;
+  missingInformation: string[];
+}
+
+export interface StaticResourceEstimate {
+  totalContainers: number;
+  maxCpu: number | null;
+  maxMemoryGb: number | null;
+}
+
+export interface ValidatedQuery {
+  raw: string;
+  normalizedPrompt: string;
+  intent: InfrastructureIntent;
+  draft: DraftQuery;
+  riskFlags: string[];
+  securityFindings: string[];
+  resourceEstimate: StaticResourceEstimate;
+  clarificationRequired: boolean;
+  clarificationQuestion: string | null;
+}
+
+export interface StaticGatewayMetrics {
+  intentAccepted: number;
+  intentRejected: number;
+  unsafeRejected: number;
+  clarificationRequired: number;
+  schemaValidationPassed: number;
+  schemaValidationFailed: number;
+  securityBlocked: number;
+  resourceLimitBlocked: number;
+  imageWhitelistBlocked: number;
+  runtimeCallsDuringStaticValidation: number;
+  reactInvocationsAfterStaticValidationFailure: number;
+}
+
 export interface InfrastructureService {
   kind: 'reverse-proxy' | 'backend' | 'database';
   name: string;
@@ -45,9 +108,29 @@ export interface AgentObservation {
   message: string;
 }
 
+export interface ReActStep {
+  id: string;
+  phase: 'reason' | 'act' | 'observe';
+  message: string;
+  toolName: string | null;
+}
+
+export interface AgentToolResult {
+  ok: boolean;
+  observation: string;
+  data: unknown;
+}
+
+export interface AgentTool {
+  name: string;
+  description: string;
+  invoke(input: unknown): Promise<AgentToolResult>;
+}
+
 export interface AgentRunResult {
   plan: ExecutionPlan;
   observations: AgentObservation[];
+  trace?: ReActStep[];
 }
 
 export interface StateSnapshot {
@@ -56,5 +139,6 @@ export interface StateSnapshot {
     containers: string[];
     lastObservedAt: string | null;
   };
+  desiredStateSavedAt?: string | null;
   lastAppliedAt: string | null;
 }
