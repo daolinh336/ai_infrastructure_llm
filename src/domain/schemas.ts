@@ -5,9 +5,14 @@ import type {
   ExecutionPlan,
   InfrastructureSpec,
   IntentClassification,
+  ReActReasoningOutput,
   StateSnapshot,
   ValidatedQuery,
 } from './types.js';
+import {
+  SUPPORTED_IMAGE_BASES,
+  isSupportedImageReference,
+} from './supported-images.js';
 
 const identifierSchema = z
   .string()
@@ -108,8 +113,17 @@ export const validatedQuerySchema = z
 export const cliInputSchema = z.object({
   prompt: z.string().min(1, 'Prompt must not be empty.'),
   dryRun: z.boolean().default(false),
-  provider: z.enum(['openai', 'gemini', 'ollama']).default('openai'),
+  provider: z.enum(['stub', 'openai', 'gemini', 'ollama']).default('stub'),
 });
+
+export const reactReasoningOutputSchema = z
+  .object({
+    summary: z.string().min(1, 'Reasoning summary must not be empty.'),
+    nextAction: z.enum(['continue_planning', 'ask_user', 'stop']),
+    rationale: z.string().min(1, 'Reasoning rationale must not be empty.'),
+    safetyNotes: z.array(z.string().min(1)),
+  })
+  .strict();
 
 export const infrastructureServiceSchema = z
   .object({
@@ -141,6 +155,14 @@ export const infrastructureSpecSchema = z
     const volumeNames = new Set(spec.volumes);
 
     spec.services.forEach((service, serviceIndex) => {
+      if (!isSupportedImageReference(service.image)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['services', serviceIndex, 'image'],
+          message: `Image "${service.image}" is not supported. Supported images: ${SUPPORTED_IMAGE_BASES.join(', ')}.`,
+        });
+      }
+
       service.dependsOn?.forEach((dependency, dependencyIndex) => {
         if (dependency === service.name) {
           context.addIssue({
@@ -186,6 +208,9 @@ export const executionPlanSchema = z
   .object({
     summary: z.string().min(1, 'Plan summary must not be empty.'),
     spec: infrastructureSpecSchema,
+    assumptions: z
+      .array(z.string().min(1, 'Plan assumptions must not be empty.'))
+      .min(1, 'At least one plan assumption is required.'),
     steps: z.array(planStepSchema).min(1, 'At least one plan step is required.'),
   })
   .strict()
@@ -231,13 +256,28 @@ export const reactStepSchema = z
   })
   .strict();
 
-export const agentRunResultSchema = z
+export const plannedAgentRunResultSchema = z
   .object({
+    status: z.literal('planned'),
     plan: executionPlanSchema,
     observations: z.array(agentObservationSchema).min(1, 'At least one observation is required.'),
     trace: z.array(reactStepSchema).min(1).optional(),
   })
   .strict();
+
+export const clarificationAgentRunResultSchema = z
+  .object({
+    status: z.literal('clarification'),
+    clarificationQuestion: z.string().min(1, 'Clarification question must not be empty.'),
+    observations: z.array(agentObservationSchema).min(1, 'At least one observation is required.'),
+    trace: z.array(reactStepSchema).min(1).optional(),
+  })
+  .strict();
+
+export const agentRunResultSchema = z.discriminatedUnion('status', [
+  plannedAgentRunResultSchema,
+  clarificationAgentRunResultSchema,
+]);
 
 export const stateSnapshotSchema = z
   .object({
@@ -279,6 +319,14 @@ export function validateDraftQuery(value: unknown): DraftQuery {
 
 export function validateValidatedQuery(value: unknown): ValidatedQuery {
   return parseWithSchema(validatedQuerySchema, value, 'validated query') as ValidatedQuery;
+}
+
+export function validateReactReasoningOutput(value: unknown): ReActReasoningOutput {
+  return parseWithSchema(
+    reactReasoningOutputSchema,
+    value,
+    'ReAct reasoning output',
+  ) as ReActReasoningOutput;
 }
 
 export function validateInfrastructureSpec(value: unknown): InfrastructureSpec {

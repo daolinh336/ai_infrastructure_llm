@@ -1,4 +1,8 @@
-export type ProviderName = 'openai' | 'gemini' | 'ollama';
+export type ProviderName = 'stub' | 'openai' | 'gemini' | 'ollama';
+
+export type LlmPurpose = 'auxiliary' | 'react';
+
+export type JsonSchema = Record<string, unknown>;
 
 export interface CliOptions {
   dryRun: boolean;
@@ -72,6 +76,16 @@ export interface StaticGatewayMetrics {
   reactInvocationsAfterStaticValidationFailure: number;
 }
 
+export type ProgressPhase = 'cli' | 'static' | 'plan' | 'acting' | 'observe' | 'execution';
+
+export interface ProgressEvent {
+  phase: ProgressPhase;
+  message: string;
+  toolName?: string;
+}
+
+export type ProgressReporter = (event: ProgressEvent) => void;
+
 export interface InfrastructureService {
   kind: 'reverse-proxy' | 'backend' | 'database';
   name: string;
@@ -100,12 +114,20 @@ export interface PlanStep {
 export interface ExecutionPlan {
   summary: string;
   spec: InfrastructureSpec;
+  assumptions: string[];
   steps: PlanStep[];
 }
 
 export interface AgentObservation {
   source: string;
   message: string;
+}
+
+export interface ReActReasoningOutput {
+  summary: string;
+  nextAction: 'continue_planning' | 'ask_user' | 'stop';
+  rationale: string;
+  safetyNotes: string[];
 }
 
 export interface ReActStep {
@@ -127,11 +149,21 @@ export interface AgentTool {
   invoke(input: unknown): Promise<AgentToolResult>;
 }
 
-export interface AgentRunResult {
+export interface PlannedAgentRunResult {
+  status: 'planned';
   plan: ExecutionPlan;
   observations: AgentObservation[];
   trace?: ReActStep[];
 }
+
+export interface ClarificationAgentRunResult {
+  status: 'clarification';
+  clarificationQuestion: string;
+  observations: AgentObservation[];
+  trace?: ReActStep[];
+}
+
+export type AgentRunResult = PlannedAgentRunResult | ClarificationAgentRunResult;
 
 export interface StateSnapshot {
   desired: InfrastructureSpec;

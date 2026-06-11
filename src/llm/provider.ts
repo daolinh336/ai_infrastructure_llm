@@ -1,14 +1,33 @@
+/* eslint-disable no-irregular-whitespace -- Stub parser keeps legacy mojibake prompt fixtures working. */
+import OpenAI from 'openai';
 import type {
   DraftQuery,
   DraftServiceQuery,
   InfrastructureIntent,
   IntentClassification,
+  JsonSchema,
+  LlmPurpose,
   ProviderName,
+  ReActReasoningOutput,
 } from '../domain/types.js';
+import {
+  canonicalizeImageBase,
+  extractCanonicalImageBases,
+} from '../domain/supported-images.js';
+
+export const DEFAULT_OPENAI_AUX_MODEL = 'gpt-5.4-mini';
+export const DEFAULT_OPENAI_REACT_MODEL = 'gpt-5.4-mini';
 
 export interface LlmRequest {
   system: string;
   user: string;
+  purpose?: LlmPurpose;
+}
+
+export interface StructuredLlmRequest extends LlmRequest {
+  schemaName: string;
+  schema: JsonSchema;
+  purpose: LlmPurpose;
 }
 
 export interface LlmResponse {
@@ -18,10 +37,44 @@ export interface LlmResponse {
 export interface LlmProvider {
   readonly name: ProviderName;
   complete(input: LlmRequest): Promise<LlmResponse>;
+  completeStructured(input: StructuredLlmRequest): Promise<LlmResponse>;
+}
+
+export interface OpenAiProviderConfig {
+  apiKey: string;
+  auxiliaryModel: string;
+  reactModel: string;
+}
+
+export interface OpenAiResponseCreateInput {
+  model: string;
+  instructions: string;
+  input: string;
+  text?: {
+    format: {
+      type: 'json_schema';
+      name: string;
+      schema: JsonSchema;
+      strict: true;
+    };
+  };
+}
+
+export interface OpenAiResponsesClient {
+  responses: {
+    create(input: OpenAiResponseCreateInput): Promise<{ output_text?: string }>;
+  };
+}
+
+export class ProviderConfigurationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderConfigurationError';
+  }
 }
 
 export class StubLlmProvider implements LlmProvider {
-  constructor(public readonly name: ProviderName) {}
+  constructor(public readonly name: ProviderName = 'stub') {}
 
   async complete(input: LlmRequest): Promise<LlmResponse> {
     if (input.system.includes('INTENT_CLASSIFIER_V1')) {
@@ -44,10 +97,146 @@ export class StubLlmProvider implements LlmProvider {
       ].join('\n\n'),
     };
   }
+
+  async completeStructured(input: StructuredLlmRequest): Promise<LlmResponse> {
+    if (input.schemaName === 'intent_classification') {
+      return {
+        text: JSON.stringify(classifyIntentForStub(input.user)),
+      };
+    }
+
+    if (input.schemaName === 'draft_query') {
+      return {
+        text: JSON.stringify(parseDraftQueryForStub(input.user)),
+      };
+    }
+
+    if (input.schemaName === 'react_reasoning_output') {
+      return {
+        text: JSON.stringify(createReActReasoningForStub()),
+      };
+    }
+
+    return this.complete(input);
+  }
 }
 
-export function createProvider(name: ProviderName): LlmProvider {
-  return new StubLlmProvider(name);
+export class OpenAiLlmProvider implements LlmProvider {
+  readonly name = 'openai';
+  private readonly client: OpenAiResponsesClient;
+
+  constructor(
+    private readonly config: OpenAiProviderConfig,
+    client?: OpenAiResponsesClient,
+  ) {
+    this.client =
+      client ??
+      (new OpenAI({
+        apiKey: config.apiKey,
+      }) as unknown as OpenAiResponsesClient);
+  }
+
+  async complete(input: LlmRequest): Promise<LlmResponse> {
+    const response = await this.client.responses.create({
+      model: this.getModelForPurpose(input.purpose ?? 'react'),
+      instructions: input.system,
+      input: input.user,
+    });
+
+    return {
+      text: getOpenAiOutputText(response),
+    };
+  }
+
+  async completeStructured(input: StructuredLlmRequest): Promise<LlmResponse> {
+    const response = await this.client.responses.create({
+      model: this.getModelForPurpose(input.purpose),
+      instructions: input.system,
+      input: input.user,
+      text: {
+        format: {
+          type: 'json_schema',
+          name: input.schemaName,
+          schema: input.schema,
+          strict: true,
+        },
+      },
+    });
+
+    return {
+      text: getOpenAiOutputText(response),
+    };
+  }
+
+  private getModelForPurpose(purpose: LlmPurpose): string {
+    return purpose === 'auxiliary' ? this.config.auxiliaryModel : this.config.reactModel;
+  }
+}
+
+export function createProvider(name: ProviderName = getDefaultProviderName()): LlmProvider {
+  switch (name) {
+    case 'stub':
+      return new StubLlmProvider('stub');
+    case 'openai':
+      return new OpenAiLlmProvider(createOpenAiConfig());
+    case 'gemini':
+    case 'ollama':
+      throw new ProviderConfigurationError(
+        `Provider "${name}" is not implemented yet. Phase 4 implements the OpenAI provider first.`,
+      );
+  }
+}
+
+export function getDefaultProviderName(
+  env: NodeJS.ProcessEnv = process.env,
+): ProviderName {
+  const configuredProvider = env.INFRA_AGENT_PROVIDER;
+
+  if (configuredProvider === undefined || configuredProvider.trim() === '') {
+    return 'stub';
+  }
+
+  return parseProviderName(configuredProvider);
+}
+
+export function createOpenAiConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): OpenAiProviderConfig {
+  const apiKey = env.OPENAI_API_KEY?.trim();
+
+  if (!apiKey) {
+    throw new ProviderConfigurationError(
+      [
+        'OpenAI provider selected but OPENAI_API_KEY is not set.',
+        'Set it in PowerShell with: $env:OPENAI_API_KEY="your_api_key_here"',
+        'For persistent setup, run: setx OPENAI_API_KEY "your_api_key_here" and open a new terminal.',
+      ].join('\n'),
+    );
+  }
+
+  return {
+    apiKey,
+    auxiliaryModel: env.OPENAI_AUX_MODEL?.trim() || DEFAULT_OPENAI_AUX_MODEL,
+    reactModel: env.OPENAI_REACT_MODEL?.trim() || DEFAULT_OPENAI_REACT_MODEL,
+  };
+}
+
+function parseProviderName(value: string): ProviderName {
+  if (value === 'stub' || value === 'openai' || value === 'gemini' || value === 'ollama') {
+    return value;
+  }
+
+  throw new ProviderConfigurationError(
+    `Unknown provider "${value}". Supported providers: stub, openai, gemini, ollama.`,
+  );
+}
+
+function getOpenAiOutputText(response: { output_text?: string }): string {
+  if (typeof response.output_text === 'string' && response.output_text.trim() !== '') {
+    return response.output_text;
+  }
+
+  throw new Error('OpenAI response did not include output_text.');
 }
 
 function classifyIntentForStub(prompt: string): IntentClassification {
@@ -62,7 +251,7 @@ function classifyIntentForStub(prompt: string): IntentClassification {
   }
 
   if (
-    normalizedPrompt.includes('chuyện cười') ||
+    normalizedPrompt.includes('chuyá»‡n cÆ°á»i') ||
     normalizedPrompt.includes('cau chuyen cuoi') ||
     normalizedPrompt.includes('joke')
   ) {
@@ -77,7 +266,7 @@ function classifyIntentForStub(prompt: string): IntentClassification {
   const hasInfrastructureTerm =
     /\b(create|deploy|docker|container|service|infra|web|app|nginx|node|python|postgres|postgresql|mysql|redis|port|replica|status|drift|destroy)\b/i.test(
       prompt,
-    ) || /(tạo|xóa|xoá|triển khai|trang thái|hạ tầng|ứng dụng)/i.test(prompt);
+    ) || /(táº¡o|xÃ³a|xoÃ¡|triá»ƒn khai|trang thÃ¡i|háº¡ táº§ng|á»©ng dá»¥ng)/i.test(prompt);
 
   if (!hasInfrastructureTerm) {
     return {
@@ -101,7 +290,7 @@ function parseDraftQueryForStub(rawInput: string): DraftQuery {
   const normalizedPrompt = raw.trim();
   const services = extractServices(raw);
 
-  if (intent === 'create' && services.length === 0 && /(\bweb\b|\bapp\b|ứng dụng)/i.test(raw)) {
+  if (intent === 'create' && services.length === 0 && /(\bweb\b|\bapp\b|á»©ng dá»¥ng)/i.test(raw)) {
     services.push(createDraftService());
   }
 
@@ -112,6 +301,16 @@ function parseDraftQueryForStub(rawInput: string): DraftQuery {
     services,
     destructive: intent === 'destroy',
     missingInformation: [],
+  };
+}
+
+function createReActReasoningForStub(): ReActReasoningOutput {
+  return {
+    summary: 'Stub ReAct reasoning accepted the ValidatedQuery.',
+    nextAction: 'continue_planning',
+    rationale:
+      'Continue with deterministic internal tools for state loading, plan building, validation, and compose preview.',
+    safetyNotes: ['Do not call Docker, MCP, or side-effecting tools during Phase 4 planning.'],
   };
 }
 
@@ -134,11 +333,11 @@ function parseParserInput(rawInput: string): {
 }
 
 function detectIntent(prompt: string): InfrastructureIntent {
-  if (/(destroy|delete|remove|xóa|xoá)/i.test(prompt)) {
+  if (/(destroy|delete|remove|xÃ³a|xoÃ¡)/i.test(prompt)) {
     return 'destroy';
   }
 
-  if (/(status|trạng thái)/i.test(prompt)) {
+  if (/(status|tráº¡ng thÃ¡i)/i.test(prompt)) {
     return 'status';
   }
 
@@ -146,7 +345,7 @@ function detectIntent(prompt: string): InfrastructureIntent {
     return 'drift';
   }
 
-  if (/(update|cập nhật)/i.test(prompt)) {
+  if (/(update|cáº­p nháº­t)/i.test(prompt)) {
     return 'update';
   }
 
@@ -156,51 +355,47 @@ function detectIntent(prompt: string): InfrastructureIntent {
 function extractServices(prompt: string): DraftServiceQuery[] {
   const services: DraftServiceQuery[] = [];
   const normalizedPrompt = prompt.toLowerCase();
-  const serviceImages: Array<[RegExp, string, string]> = [
-    [/\bnginx\b/i, 'nginx', 'nginx'],
-    [/\bnode(?:\.js|js)?\b/i, 'node', 'node'],
-    [/\bpython\b/i, 'python', 'python'],
-    [/\bpostgres(?:ql)?\b/i, 'postgres', 'postgres'],
-    [/\bmysql\b/i, 'mysql', 'mysql'],
-    [/\bredis\b/i, 'redis', 'redis'],
-  ];
 
-  for (const [pattern, name, image] of serviceImages) {
-    if (pattern.test(prompt)) {
-      services.push(
-        createDraftService({
-          name,
-          image,
-        }),
-      );
-    }
-  }
-
-  const explicitImage = /\bimage\s+([A-Za-z0-9_./:-]+)/i.exec(prompt)?.[1];
-  if (explicitImage && !services.some((service) => service.image === explicitImage)) {
+  for (const image of extractCanonicalImageBases(prompt)) {
     services.push(
       createDraftService({
-        name: explicitImage.split(':')[0] ?? explicitImage,
-        image: explicitImage,
+        name: image,
+        image,
       }),
     );
   }
 
-  const port = extractNumber(prompt, /\b(?:port|cổng)\s*(?:là|=|:)?\s*(-?\d+)/i);
+  const explicitImage = /\bimage\s+([A-Za-z0-9_./:-]+)/i.exec(prompt)?.[1];
+  const normalizedExplicitImage =
+    explicitImage !== undefined ? normalizeExplicitImageReference(explicitImage) : null;
+  if (
+    normalizedExplicitImage !== null &&
+    !services.some((service) => service.image === normalizedExplicitImage)
+  ) {
+    services.push(
+      createDraftService({
+        name: getImageBaseFromReference(normalizedExplicitImage),
+        image: normalizedExplicitImage,
+      }),
+    );
+  }
+
+  const port = extractNumber(prompt, /\b(?:port|cá»•ng)\s*(?:lÃ |=|:)?\s*(-?\d+)/i);
   if (port !== null) {
     ensureFirstService(services).port = port;
   }
 
   const replicas =
-    extractNumber(prompt, /\b(?:replica|replicas|số lượng|so luong)[^\d-]*(-?\d+)/i) ??
+    extractNumber(prompt, /\bs\S*\s+l\S*ng[^\d-]*(-?\d+)/i) ??
+    extractNumber(prompt, /\b(?:replica|replicas|sá»‘ lÆ°á»£ng|so luong)[^\d-]*(-?\d+)/i) ??
     extractNumber(prompt, /(-?\d+)\s*(?:instance|instances|replica|replicas)/i);
   if (replicas !== null) {
     const targetService = services.find((service) => service.image === 'node') ?? ensureFirstService(services);
     targetService.replicas = replicas;
   }
 
-  const cpu = extractNumber(prompt, /\b(?:cpu)\s*(?:là|=|:)?\s*(-?\d+)/i);
-  const memoryGb = extractNumber(prompt, /\b(?:ram|memory)\s*(?:là|=|:)?\s*(-?\d+)\s*(?:gb)?/i);
+  const cpu = extractNumber(prompt, /\b(?:cpu)\s*(?:lÃ |=|:)?\s*(-?\d+)/i);
+  const memoryGb = extractNumber(prompt, /\b(?:ram|memory)\s*(?:lÃ |=|:)?\s*(-?\d+)\s*(?:gb)?/i);
   const requestedMounts = extractRequestedMounts(prompt);
   const privileged = /privileged\s*:?\s*true/i.test(prompt) ? true : null;
   const networkMode = /(host network|network_mode\s*:?\s*host)/i.test(prompt) ? 'host' : null;
@@ -293,6 +488,22 @@ function extractRequestedMounts(prompt: string): string[] {
   }
 
   return [...mounts];
+}
+
+function normalizeExplicitImageReference(image: string): string {
+  const slashIndex = image.lastIndexOf('/');
+  const prefix = slashIndex >= 0 ? image.slice(0, slashIndex + 1) : '';
+  const baseAndSuffix = slashIndex >= 0 ? image.slice(slashIndex + 1) : image;
+  const tagIndex = baseAndSuffix.indexOf(':');
+  const base = tagIndex < 0 ? baseAndSuffix : baseAndSuffix.slice(0, tagIndex);
+  const suffix = tagIndex < 0 ? '' : baseAndSuffix.slice(tagIndex);
+  const canonicalBase = canonicalizeImageBase(base).value;
+
+  return `${prefix}${canonicalBase}${suffix}`;
+}
+
+function getImageBaseFromReference(image: string): string {
+  return image.split(':')[0]?.split('/').pop()?.toLowerCase() ?? image.toLowerCase();
 }
 
 function isInfrastructureIntent(value: unknown): value is InfrastructureIntent {

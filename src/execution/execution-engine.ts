@@ -15,6 +15,10 @@ export interface ExecutionResult {
 export class ExecutionEngine {
   async dryRun(result: AgentRunResult): Promise<ExecutionResult> {
     const validResult = validateAgentRunResult(result);
+    if (validResult.status !== 'planned') {
+      throw new Error('Execution requires a planned agent result.');
+    }
+
     const composeYaml = renderCompose(validResult.plan.spec);
     const stateSnapshot = validateStateSnapshot(this.toStateSnapshot(validResult.plan));
 

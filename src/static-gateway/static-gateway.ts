@@ -2,16 +2,27 @@ import type {
   DraftQuery,
   DraftServiceQuery,
   IntentClassification,
+  ProgressReporter,
   StaticGatewayMetrics,
   StaticResourceEstimate,
   ValidatedQuery,
 } from '../domain/types.js';
 import {
-  DomainValidationError,
   validateDraftQuery,
   validateIntentClassification,
   validateValidatedQuery,
 } from '../domain/schemas.js';
+import {
+  draftQueryJsonSchema,
+  intentClassificationJsonSchema,
+} from '../domain/structured-output-schemas.js';
+import {
+  canonicalizeImageBase,
+  extractCanonicalImageBases,
+  isSupportedImageReference,
+  textMentionsSupportedImage,
+} from '../domain/supported-images.js';
+import { parseJsonResponse } from '../llm/json-response.js';
 import type { LlmProvider } from '../llm/provider.js';
 
 const INTENT_CLASSIFIER_SYSTEM_PROMPT = [
@@ -28,9 +39,9 @@ const STRUCTURED_QUERY_PARSER_SYSTEM_PROMPT = [
   'Do not create an execution plan.',
 ].join('\n');
 
-const ALLOWED_IMAGE_BASES = new Set(['nginx', 'node', 'python', 'postgres', 'mysql', 'redis']);
 const DOCKER_RESOURCE_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 const MAX_TOTAL_CONTAINERS = 10;
+const MAX_ABSURD_REPLICAS = 100_000;
 const MAX_CPU = 4;
 const MAX_MEMORY_GB = 8;
 
@@ -67,14 +78,25 @@ interface StaticValidationOutcome {
 }
 
 export class StaticGateway {
-  constructor(private readonly auxiliaryProvider: LlmProvider) {}
+  constructor(
+    private readonly auxiliaryProvider: LlmProvider,
+    private readonly reportProgress: ProgressReporter = noopProgress,
+  ) {}
 
   async validate(rawPrompt: string): Promise<StaticGatewayResult> {
     const metrics = createMetrics();
+    this.reportProgress({
+      phase: 'static',
+      message: 'thinking... normalize raw prompt before pre-ReAct validation.',
+    });
     const normalizedPrompt = rawPrompt.trim();
 
     if (!normalizedPrompt) {
       metrics.schemaValidationFailed = 1;
+      this.reportProgress({
+        phase: 'static',
+        message: 'observe... prompt is empty, stopping before ReAct.',
+      });
       return {
         status: 'rejected',
         reason: 'Static validation failed.',
@@ -83,10 +105,32 @@ export class StaticGateway {
       };
     }
 
-    const classification = await this.classifyIntent(normalizedPrompt);
+    let classification: IntentClassification;
+
+    try {
+      classification = await this.classifyIntentWithFastPath(normalizedPrompt);
+    } catch (error) {
+      metrics.schemaValidationFailed = 1;
+      this.reportProgress({
+        phase: 'static',
+        message: 'observe... intent classifier returned invalid output.',
+        toolName: 'intent_classifier',
+      });
+      return {
+        status: 'rejected',
+        reason: 'Intent classifier output was invalid.',
+        issues: [getErrorMessage(error)],
+        metrics,
+      };
+    }
 
     if (classification.scope === 'unsafe') {
       metrics.unsafeRejected = 1;
+      this.reportProgress({
+        phase: 'static',
+        message: `observe... unsafe request rejected: ${classification.reason}`,
+        toolName: 'intent_classifier',
+      });
       return {
         status: 'rejected',
         reason: classification.reason,
@@ -97,6 +141,11 @@ export class StaticGateway {
 
     if (classification.scope === 'out-of-scope' || classification.intent === null) {
       metrics.intentRejected = 1;
+      this.reportProgress({
+        phase: 'static',
+        message: `observe... out-of-scope request rejected: ${classification.reason}`,
+        toolName: 'intent_classifier',
+      });
       return {
         status: 'rejected',
         reason: classification.reason,
@@ -106,13 +155,23 @@ export class StaticGateway {
     }
 
     metrics.intentAccepted = 1;
+    this.reportProgress({
+      phase: 'static',
+      message: `observe... intent accepted as "${classification.intent}".`,
+      toolName: 'intent_classifier',
+    });
 
     let draft: DraftQuery;
 
     try {
-      draft = await this.parseDraftQuery(normalizedPrompt, classification);
+      draft = await this.parseDraftQueryWithFastPath(normalizedPrompt, classification);
     } catch (error) {
       metrics.schemaValidationFailed = 1;
+      this.reportProgress({
+        phase: 'static',
+        message: 'observe... structured parser returned invalid output.',
+        toolName: 'structured_parser',
+      });
       return {
         status: 'rejected',
         reason: 'Structured parser output was invalid.',
@@ -121,6 +180,27 @@ export class StaticGateway {
       };
     }
 
+    const normalization = normalizeDraftQueryImageAliases(draft);
+    draft = normalization.draft;
+    if (normalization.corrections.length) {
+      this.reportProgress({
+        phase: 'static',
+        message: `observe... normalized image alias(es): ${normalization.corrections.join(', ')}.`,
+        toolName: 'structured_parser',
+      });
+    }
+
+    this.reportProgress({
+      phase: 'static',
+      message: `observe... DraftQuery parsed with ${draft.services.length} service hint(s).`,
+      toolName: 'structured_parser',
+    });
+    this.reportProgress({
+      phase: 'static',
+      message: 'acting... run deterministic static safety and schema rules.',
+      toolName: 'static_validator',
+    });
+
     const outcome = validateStaticRules(draft);
     metrics.securityBlocked = outcome.blockedBySecurity ? 1 : 0;
     metrics.resourceLimitBlocked = outcome.blockedByResourceLimit ? 1 : 0;
@@ -128,6 +208,11 @@ export class StaticGateway {
 
     if (outcome.issues.length) {
       metrics.schemaValidationFailed = 1;
+      this.reportProgress({
+        phase: 'static',
+        message: `observe... static validation failed with ${outcome.issues.length} issue(s).`,
+        toolName: 'static_validator',
+      });
       return {
         status: 'rejected',
         reason: 'Static validation failed.',
@@ -150,6 +235,11 @@ export class StaticGateway {
 
     if (outcome.clarificationQuestion !== null) {
       metrics.clarificationRequired = 1;
+      this.reportProgress({
+        phase: 'static',
+        message: 'observe... clarification is required before ReAct can start.',
+        toolName: 'static_validator',
+      });
       return {
         status: 'clarification',
         question: outcome.clarificationQuestion,
@@ -160,6 +250,11 @@ export class StaticGateway {
     }
 
     metrics.schemaValidationPassed = 1;
+    this.reportProgress({
+      phase: 'static',
+      message: 'observe... ValidatedQuery ready; ReAct Agent may start.',
+      toolName: 'static_validator',
+    });
 
     return {
       status: 'validated',
@@ -170,28 +265,439 @@ export class StaticGateway {
   }
 
   private async classifyIntent(prompt: string): Promise<IntentClassification> {
-    const completion = await this.auxiliaryProvider.complete({
+    const completion = await this.auxiliaryProvider.completeStructured({
       system: INTENT_CLASSIFIER_SYSTEM_PROMPT,
       user: prompt,
+      purpose: 'auxiliary',
+      schemaName: 'intent_classification',
+      schema: intentClassificationJsonSchema,
     });
 
     return validateIntentClassification(parseJsonResponse(completion.text));
+  }
+
+  private async classifyIntentWithFastPath(prompt: string): Promise<IntentClassification> {
+    this.reportProgress({
+      phase: 'static',
+      message: 'thinking... try deterministic intent classifier fast path.',
+      toolName: 'intent_classifier',
+    });
+
+    const fastClassification = classifyIntentFastPath(prompt);
+    if (fastClassification !== null) {
+      this.reportProgress({
+        phase: 'static',
+        message: 'observe... intent classified locally; auxiliary LLM not needed.',
+        toolName: 'intent_classifier',
+      });
+      return validateIntentClassification(fastClassification);
+    }
+
+    this.reportProgress({
+      phase: 'static',
+      message: 'thinking... local classifier was uncertain; classify intent with auxiliary LLM.',
+      toolName: 'intent_classifier',
+    });
+    return this.classifyIntent(prompt);
   }
 
   private async parseDraftQuery(
     prompt: string,
     classification: IntentClassification,
   ): Promise<DraftQuery> {
-    const completion = await this.auxiliaryProvider.complete({
+    const completion = await this.auxiliaryProvider.completeStructured({
       system: STRUCTURED_QUERY_PARSER_SYSTEM_PROMPT,
       user: JSON.stringify({
         raw: prompt,
         intent: classification.intent,
       }),
+      purpose: 'auxiliary',
+      schemaName: 'draft_query',
+      schema: draftQueryJsonSchema,
     });
 
     return validateDraftQuery(parseJsonResponse(completion.text));
   }
+
+  private async parseDraftQueryWithFastPath(
+    prompt: string,
+    classification: IntentClassification,
+  ): Promise<DraftQuery> {
+    this.reportProgress({
+      phase: 'static',
+      message: 'thinking... try deterministic DraftQuery parser fast path.',
+      toolName: 'structured_parser',
+    });
+
+    const fastDraft = parseDraftQueryFastPath(prompt, classification);
+    if (fastDraft !== null) {
+      this.reportProgress({
+        phase: 'static',
+        message: 'observe... DraftQuery parsed locally; auxiliary LLM not needed.',
+        toolName: 'structured_parser',
+      });
+      return validateDraftQuery(fastDraft);
+    }
+
+    this.reportProgress({
+      phase: 'static',
+      message: 'thinking... local parser was uncertain; parse prompt with auxiliary LLM.',
+      toolName: 'structured_parser',
+    });
+    return this.parseDraftQuery(prompt, classification);
+  }
+}
+
+function classifyIntentFastPath(prompt: string): IntentClassification | null {
+  if (isUnsafePrompt(prompt)) {
+    return {
+      scope: 'unsafe',
+      intent: null,
+      reason: 'Request is unsafe or unrelated to infrastructure deployment.',
+    };
+  }
+
+  if (isClearlyOutOfScopePrompt(prompt)) {
+    return {
+      scope: 'out-of-scope',
+      intent: null,
+      reason: 'Request is not an infrastructure management command.',
+    };
+  }
+
+  if (!hasInfrastructureSignal(prompt)) {
+    return null;
+  }
+
+  return {
+    scope: 'infrastructure',
+    intent: detectIntentFastPath(prompt),
+    reason: 'Request matched deterministic infrastructure intent rules.',
+  };
+}
+
+function parseDraftQueryFastPath(
+  prompt: string,
+  classification: IntentClassification,
+): DraftQuery | null {
+  if (classification.scope !== 'infrastructure' || classification.intent === null) {
+    return null;
+  }
+
+  const services = extractDraftServicesFastPath(prompt);
+
+  if (classification.intent === 'create' && !services.length && !hasGenericDeployTarget(prompt)) {
+    return null;
+  }
+
+  return {
+    raw: prompt,
+    normalizedPrompt: prompt.trim(),
+    intent: classification.intent,
+    services,
+    destructive: classification.intent === 'destroy',
+    missingInformation: [],
+  };
+}
+
+function isUnsafePrompt(prompt: string): boolean {
+  return /\b(hack|exploit|malware|facebook)\b/i.test(prompt);
+}
+
+function isClearlyOutOfScopePrompt(prompt: string): boolean {
+  return /\b(joke|story|cau chuyen cuoi|chuyen cuoi)\b/i.test(prompt);
+}
+
+function hasInfrastructureSignal(prompt: string): boolean {
+  return (
+    /\b(create|deploy|docker|container|containers|image|images|service|infra|web|app|port|replica|replicas|status|drift|destroy)\b/i.test(
+      prompt,
+    ) ||
+    /\b(tao|xoa|tri?n khai|trang thai|ha tang|ung dung)\b/i.test(prompt) ||
+    textMentionsSupportedImage(prompt)
+  );
+}
+
+function detectIntentFastPath(prompt: string): IntentClassification['intent'] {
+  if (/(destroy|delete|remove|xoa)/i.test(prompt)) {
+    return 'destroy';
+  }
+
+  if (/(status|trang thai)/i.test(prompt)) {
+    return 'status';
+  }
+
+  if (/drift/i.test(prompt)) {
+    return 'drift';
+  }
+
+  if (/(update|cap nhat)/i.test(prompt)) {
+    return 'update';
+  }
+
+  return 'create';
+}
+
+function extractDraftServicesFastPath(prompt: string): DraftServiceQuery[] {
+  const services: DraftServiceQuery[] = [];
+
+  for (const image of extractCanonicalImageBases(prompt)) {
+    services.push(
+      createDraftService({
+        name: image,
+        image,
+      }),
+    );
+  }
+
+  const explicitImage = /\bimage\s+([A-Za-z0-9_./:-]+)/i.exec(prompt)?.[1];
+  const normalizedExplicitImage = normalizeImageReference(explicitImage ?? null).value;
+  if (
+    explicitImage &&
+    normalizedExplicitImage !== null &&
+    !services.some((service) => service.image === normalizedExplicitImage)
+  ) {
+    services.push(
+      createDraftService({
+        name: splitImageReference(normalizedExplicitImage).base,
+        image: normalizedExplicitImage,
+      }),
+    );
+  }
+
+  if (!services.length && hasGenericDeployTarget(prompt)) {
+    services.push(createDraftService());
+  }
+
+  const port = extractNumber(prompt, /\b(?:port|cong)\s*(?:la|=|:)?\s*(-?\d+)/i);
+  if (port !== null) {
+    ensureFirstService(services).port = port;
+  }
+
+  const replicas =
+    extractNumber(prompt, /\b(?:replica|replicas|so luong)[^\d-]*(-?\d+)/i) ??
+    extractNumber(
+      prompt,
+      /(-?\d+)\s*(?:cai\s+)?(?:container|containers|instance|instances|replica|replicas)\b/i,
+    );
+  if (replicas !== null) {
+    const targetService =
+      services.find((service) => service.image === 'node') ?? ensureFirstService(services);
+    targetService.replicas = replicas;
+  }
+
+  const cpu = extractNumber(prompt, /\bcpu\s*(?:la|=|:)?\s*(-?\d+)/i);
+  const memoryGb = extractNumber(
+    prompt,
+    /\b(?:ram|memory)\s*(?:la|=|:)?\s*(-?\d+)\s*(?:gb)?/i,
+  );
+  const requestedMounts = extractRequestedMounts(prompt);
+  const privileged = /privileged\s*:?\s*true/i.test(prompt) ? true : null;
+  const networkMode = /(host network|network_mode\s*:?\s*host)/i.test(prompt) ? 'host' : null;
+  const pidMode = /pid\s*:?\s*host/i.test(prompt) ? 'host' : null;
+  const ipcMode = /ipc\s*:?\s*host/i.test(prompt) ? 'host' : null;
+
+  if (
+    requestedMounts.length ||
+    privileged !== null ||
+    networkMode !== null ||
+    pidMode !== null ||
+    ipcMode !== null ||
+    cpu !== null ||
+    memoryGb !== null
+  ) {
+    const service = ensureFirstService(services);
+    service.requestedMounts = requestedMounts;
+    service.privileged = privileged;
+    service.networkMode = networkMode;
+    service.pidMode = pidMode;
+    service.ipcMode = ipcMode;
+    service.cpu = cpu;
+    service.memoryGb = memoryGb;
+  }
+
+  return services;
+}
+
+function hasGenericDeployTarget(prompt: string): boolean {
+  return /\b(web|app|service|container|containers|image|images|ung dung)\b/i.test(prompt);
+}
+
+function createDraftService(overrides: Partial<DraftServiceQuery> = {}): DraftServiceQuery {
+  return {
+    name: null,
+    image: null,
+    port: null,
+    replicas: null,
+    requestedMounts: [],
+    privileged: null,
+    networkMode: null,
+    pidMode: null,
+    ipcMode: null,
+    cpu: null,
+    memoryGb: null,
+    ...overrides,
+  };
+}
+
+function ensureFirstService(services: DraftServiceQuery[]): DraftServiceQuery {
+  const firstService = services[0];
+
+  if (firstService) {
+    return firstService;
+  }
+
+  const service = createDraftService();
+  services.push(service);
+  return service;
+}
+
+function extractNumber(prompt: string, pattern: RegExp): number | null {
+  const value = pattern.exec(prompt)?.[1];
+
+  if (value === undefined) {
+    return null;
+  }
+
+  return Number(value);
+}
+
+function extractRequestedMounts(prompt: string): string[] {
+  const mounts = new Set<string>();
+  const mountMatch = /\bmount\s+(\S+)/i.exec(prompt)?.[1];
+
+  if (mountMatch) {
+    mounts.add(mountMatch);
+  }
+
+  if (prompt.includes('/var/run/docker.sock')) {
+    mounts.add('/var/run/docker.sock:/var/run/docker.sock');
+  }
+
+  if (/\bmount\s+\/etc\b/i.test(prompt)) {
+    mounts.add('/etc:/etc');
+  }
+
+  if (/\bmount\s+\/(?:\s|$|:)/i.test(prompt)) {
+    mounts.add('/:root');
+  }
+
+  return [...mounts];
+}
+
+function normalizeDraftQueryImageAliases(draft: DraftQuery): {
+  draft: DraftQuery;
+  corrections: string[];
+} {
+  const corrections: string[] = [];
+  const services = draft.services.map((service) => {
+    const normalizedImage = normalizeImageReference(service.image);
+    const normalizedName = normalizeResourceNameAlias(service.name);
+
+    if (normalizedImage.correction !== null) {
+      corrections.push(normalizedImage.correction);
+    }
+
+    if (normalizedName.correction !== null) {
+      corrections.push(normalizedName.correction);
+    }
+
+    return {
+      ...service,
+      image: normalizedImage.value,
+      name: normalizedName.value,
+    };
+  });
+
+  return {
+    draft: {
+      ...draft,
+      services,
+    },
+    corrections,
+  };
+}
+
+function normalizeImageReference(image: string | null): {
+  value: string | null;
+  correction: string | null;
+} {
+  if (image === null) {
+    return {
+      value: null,
+      correction: null,
+    };
+  }
+
+  const parsed = splitImageReference(image);
+  const normalizedBase = normalizeImageBase(parsed.base);
+
+  if (normalizedBase === parsed.base) {
+    return {
+      value: image,
+      correction: null,
+    };
+  }
+
+  return {
+    value: `${parsed.prefix}${normalizedBase}${parsed.suffix}`,
+    correction: `${parsed.base}->${normalizedBase}`,
+  };
+}
+
+function normalizeResourceNameAlias(name: string | null): {
+  value: string | null;
+  correction: string | null;
+} {
+  if (name === null) {
+    return {
+      value: null,
+      correction: null,
+    };
+  }
+
+  const normalizedName = normalizeImageBase(name);
+
+  if (normalizedName === name) {
+    return {
+      value: name,
+      correction: null,
+    };
+  }
+
+  return {
+    value: normalizedName,
+    correction: `${name}->${normalizedName}`,
+  };
+}
+
+function splitImageReference(image: string): {
+  prefix: string;
+  base: string;
+  suffix: string;
+} {
+  const slashIndex = image.lastIndexOf('/');
+  const prefix = slashIndex >= 0 ? image.slice(0, slashIndex + 1) : '';
+  const baseAndSuffix = slashIndex >= 0 ? image.slice(slashIndex + 1) : image;
+  const tagIndex = baseAndSuffix.indexOf(':');
+
+  if (tagIndex < 0) {
+    return {
+      prefix,
+      base: baseAndSuffix.toLowerCase(),
+      suffix: '',
+    };
+  }
+
+  return {
+    prefix,
+    base: baseAndSuffix.slice(0, tagIndex).toLowerCase(),
+    suffix: baseAndSuffix.slice(tagIndex),
+  };
+}
+
+function normalizeImageBase(base: string): string {
+  return canonicalizeImageBase(base).value;
 }
 
 function validateStaticRules(draft: DraftQuery): StaticValidationOutcome {
@@ -200,7 +706,7 @@ function validateStaticRules(draft: DraftQuery): StaticValidationOutcome {
   const securityFindings: string[] = [];
   let blockedBySecurity = false;
   let blockedByResourceLimit = false;
-  let blockedByImageWhitelist = false;
+  const blockedByImageWhitelist = false;
 
   if (draft.destructive || draft.intent === 'destroy') {
     riskFlags.push('destructive-intent');
@@ -218,11 +724,11 @@ function validateStaticRules(draft: DraftQuery): StaticValidationOutcome {
     const serviceLabel = `services.${index}`;
 
     validateStaticService(service, serviceLabel, issues, securityFindings, {
+      markUnresolvedImageReference: (image) => {
+        riskFlags.push(`${serviceLabel}.unresolved-image-reference:${image}`);
+      },
       markSecurityBlocked: () => {
         blockedBySecurity = true;
-      },
-      markImageWhitelistBlocked: () => {
-        blockedByImageWhitelist = true;
       },
       markResourceLimitBlocked: () => {
         blockedByResourceLimit = true;
@@ -259,8 +765,8 @@ function validateStaticService(
   issues: string[],
   securityFindings: string[],
   markers: {
+    markUnresolvedImageReference(image: string): void;
     markSecurityBlocked(): void;
-    markImageWhitelistBlocked(): void;
     markResourceLimitBlocked(): void;
   },
 ): void {
@@ -270,24 +776,32 @@ function validateStaticService(
     );
   }
 
-  if (service.image !== null && !isAllowedImage(service.image)) {
-    markers.markImageWhitelistBlocked();
-    issues.push(
-      `${serviceLabel}.image "${service.image}" is not allowed. Supported images: ${[
-        ...ALLOWED_IMAGE_BASES,
-      ].join(', ')}.`,
-    );
+  if (service.image !== null && !isSupportedImageReference(service.image)) {
+    markers.markUnresolvedImageReference(service.image);
   }
 
   if (service.port !== null && (service.port < 1 || service.port > 65535)) {
     issues.push(`${serviceLabel}.port must be between 1 and 65535.`);
   }
 
+  if (service.replicas !== null && service.replicas < 1) {
+    issues.push(`${serviceLabel}.replicas must be >= 1.`);
+  }
+
   if (
     service.replicas !== null &&
-    (service.replicas < 1 || service.replicas > MAX_TOTAL_CONTAINERS)
+    service.image !== null &&
+    service.replicas > MAX_TOTAL_CONTAINERS
   ) {
-    issues.push(`${serviceLabel}.replicas must be between 1 and ${MAX_TOTAL_CONTAINERS}.`);
+    issues.push(`${serviceLabel}.replicas must be <= ${MAX_TOTAL_CONTAINERS}.`);
+  }
+
+  if (
+    service.replicas !== null &&
+    service.image === null &&
+    service.replicas > MAX_ABSURD_REPLICAS
+  ) {
+    issues.push(`${serviceLabel}.replicas is too large to be a valid static request.`);
   }
 
   for (const mount of service.requestedMounts) {
@@ -331,7 +845,8 @@ function validateStaticService(
 }
 
 function estimateResources(services: DraftServiceQuery[]): StaticResourceEstimate {
-  const totalContainers = services.reduce((total, service) => {
+  const deployableServices = services.filter((service) => service.image !== null);
+  const totalContainers = deployableServices.reduce((total, service) => {
     if (service.replicas === null) {
       return total + 1;
     }
@@ -339,10 +854,10 @@ function estimateResources(services: DraftServiceQuery[]): StaticResourceEstimat
     return total + Math.max(service.replicas, 0);
   }, 0);
 
-  const cpus = services
+  const cpus = deployableServices
     .map((service) => service.cpu)
     .filter((cpu): cpu is number => cpu !== null);
-  const memories = services
+  const memories = deployableServices
     .map((service) => service.memoryGb)
     .filter((memoryGb): memoryGb is number => memoryGb !== null);
 
@@ -354,20 +869,8 @@ function estimateResources(services: DraftServiceQuery[]): StaticResourceEstimat
 }
 
 function getClarificationQuestion(draft: DraftQuery): string | null {
-  if (draft.intent !== 'create') {
-    return null;
-  }
-
-  if (!draft.services.length || draft.services.every((service) => service.image === null)) {
-    return 'Bạn muốn dùng image/runtime nào? Hiện hỗ trợ: nginx, node, python, postgres, mysql, redis.';
-  }
-
+  void draft;
   return null;
-}
-
-function isAllowedImage(image: string): boolean {
-  const imageBase = image.split(':')[0]?.split('/').pop()?.toLowerCase();
-  return imageBase !== undefined && ALLOWED_IMAGE_BASES.has(imageBase);
 }
 
 function findDangerousPromptFragments(rawPrompt: string): string[] {
@@ -403,22 +906,6 @@ function getDangerousMountFinding(mount: string): string | null {
   return null;
 }
 
-function parseJsonResponse(text: string): unknown {
-  const trimmed = text.trim();
-  const withoutFence = trimmed
-    .replace(/^```json\s*/i, '')
-    .replace(/^```\s*/i, '')
-    .replace(/\s*```$/i, '');
-
-  try {
-    return JSON.parse(withoutFence);
-  } catch (error) {
-    throw new DomainValidationError('structured LLM JSON', [
-      `Response was not valid JSON: ${getErrorMessage(error)}`,
-    ]);
-  }
-}
-
 function createMetrics(): StaticGatewayMetrics {
   return {
     intentAccepted: 0,
@@ -433,6 +920,10 @@ function createMetrics(): StaticGatewayMetrics {
     runtimeCallsDuringStaticValidation: 0,
     reactInvocationsAfterStaticValidationFailure: 0,
   };
+}
+
+function noopProgress(): void {
+  return undefined;
 }
 
 function getErrorMessage(error: unknown): string {

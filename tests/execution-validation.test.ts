@@ -5,6 +5,7 @@ import { ExecutionEngine } from '../src/execution/execution-engine.js';
 describe('ExecutionEngine validation', () => {
   it('rejects invalid agent results before rendering compose YAML', async () => {
     const result: AgentRunResult = {
+      status: 'planned',
       observations: [
         {
           source: 'reason',
@@ -13,6 +14,7 @@ describe('ExecutionEngine validation', () => {
       ],
       plan: {
         summary: 'Invalid plan',
+        assumptions: ['Test plan fixture.'],
         spec: {
           projectName: 'bad-demo',
           networks: ['app-network'],

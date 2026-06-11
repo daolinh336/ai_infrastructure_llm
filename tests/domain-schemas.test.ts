@@ -86,6 +86,23 @@ describe('domain schemas', () => {
     ).toThrow(/Volume source "postgres-data" must be declared/);
   });
 
+  it('rejects unsupported images at the final spec validation boundary', () => {
+    expect(() =>
+      validateInfrastructureSpec({
+        projectName: 'bad-demo',
+        networks: ['app-network'],
+        volumes: [],
+        services: [
+          {
+            kind: 'database',
+            name: 'cassandra',
+            image: 'cassandra:latest',
+          },
+        ],
+      }),
+    ).toThrow(/Image "cassandra:latest" is not supported/);
+  });
+
   it('accepts a valid state snapshot', () => {
     const snapshot: StateSnapshot = {
       desired: validSpec,
