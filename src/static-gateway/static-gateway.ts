@@ -479,6 +479,10 @@ function extractDraftServicesFastPath(prompt: string): DraftServiceQuery[] {
     extractNumber(
       prompt,
       /(-?\d+)\s*(?:cai\s+)?(?:container|containers|instance|instances|replica|replicas)\b/i,
+    ) ??
+    extractNumber(
+      prompt,
+      /(-?\d+)\s*(?:cai\s+)?(?:node(?:\.js)?|backend|backends|api)\b/i,
     );
   if (replicas !== null) {
     const targetService =

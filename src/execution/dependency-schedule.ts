@@ -1,0 +1,445 @@
+import {
+  validateDependencyAwareExecutionSchedule,
+  validateDetailedDryRunPreview,
+  validateExecutionPlan,
+  validateInfrastructureSpec,
+} from '../domain/schemas.js';
+import type {
+  DependencyAwareExecutionSchedule,
+  DependencyGraphEntry,
+  DetailedDryRunPreview,
+  DryRunPolicyFinding,
+  ExecutionPlan,
+  ExecutionScheduleStep,
+  InfrastructureService,
+  InfrastructureSpec,
+} from '../domain/types.js';
+
+const ARTIFACT_TARGET_PATH = 'docker-compose.yaml';
+
+export function buildDependencyAwareExecutionSchedule(
+  spec: InfrastructureSpec,
+): DependencyAwareExecutionSchedule {
+  const validSpec = validateInfrastructureSpec(spec);
+  const dependents = buildDependentsMap(validSpec.services);
+  const serviceStartOrder = orderServicesByDependency(validSpec.services, dependents);
+  const steps: ExecutionScheduleStep[] = [];
+  let order = 1;
+
+  for (const network of validSpec.networks) {
+    steps.push({
+      order,
+      level: 0,
+      levelName: 'Level 0 - Foundation',
+      kind: 'create-resource',
+      resourceType: 'network',
+      resourceName: network,
+      action: `Create/use network: ${network}`,
+      dependsOn: [],
+      dependents: [],
+      waitCondition: null,
+      readinessEnforced: false,
+    });
+    order += 1;
+  }
+
+  for (const volume of validSpec.volumes) {
+    steps.push({
+      order,
+      level: 0,
+      levelName: 'Level 0 - Foundation',
+      kind: 'create-resource',
+      resourceType: 'volume',
+      resourceName: volume,
+      action: `Create/use volume: ${volume}`,
+      dependsOn: [],
+      dependents: [],
+      waitCondition: null,
+      readinessEnforced: false,
+    });
+    order += 1;
+  }
+
+  for (const serviceName of serviceStartOrder) {
+    const service = getService(validSpec.services, serviceName);
+    const level = getServiceLevel(service.kind);
+    const waitCondition = inferWaitCondition(service);
+    const serviceDependents = dependents.get(service.name) ?? [];
+
+    steps.push({
+      order,
+      level,
+      levelName: getLevelName(level),
+      kind: 'start-service',
+      resourceType: 'service',
+      resourceName: service.name,
+      action: `Create/start service: ${service.name}`,
+      dependsOn: service.dependsOn ?? [],
+      dependents: serviceDependents,
+      waitCondition: null,
+      readinessEnforced: false,
+      serviceKind: service.kind,
+      image: service.image,
+      replicas: service.replicas ?? 1,
+      ports: service.ports ?? [],
+      volumes: service.volumes ?? [],
+    });
+    order += 1;
+
+    steps.push({
+      order,
+      level,
+      levelName: getLevelName(level),
+      kind: 'wait-until-ready',
+      resourceType: 'service',
+      resourceName: service.name,
+      action: `Wait until service is ready: ${service.name}`,
+      dependsOn: service.dependsOn ?? [],
+      dependents: serviceDependents,
+      waitCondition,
+      readinessEnforced: false,
+      serviceKind: service.kind,
+      image: service.image,
+      replicas: service.replicas ?? 1,
+      ports: service.ports ?? [],
+      volumes: service.volumes ?? [],
+    });
+    order += 1;
+  }
+
+  return validateDependencyAwareExecutionSchedule({
+    projectName: validSpec.projectName,
+    steps,
+    dependencyGraph: buildDependencyGraph(validSpec.services, dependents),
+    serviceStartOrder,
+    destroyOrder: [...serviceStartOrder].reverse(),
+    warnings: buildScheduleWarnings(validSpec.services, serviceStartOrder),
+  });
+}
+
+export function buildDetailedDryRunPreview(
+  plan: ExecutionPlan,
+  composeYaml: string,
+  schedule = buildDependencyAwareExecutionSchedule(plan.spec),
+): DetailedDryRunPreview {
+  const validPlan = validateExecutionPlan(plan);
+  const validSchedule = validateDependencyAwareExecutionSchedule(schedule);
+  const policyFindings = evaluateDryRunPolicy(validPlan.spec, validSchedule);
+
+  return validateDetailedDryRunPreview({
+    projectName: validPlan.spec.projectName,
+    artifactTargetPath: ARTIFACT_TARGET_PATH,
+    artifactWritten: false,
+    stateSaved: false,
+    dockerCalled: false,
+    mcpCalled: false,
+    composePreviewLineCount: countNonEmptyLines(composeYaml),
+    totalServices: validPlan.spec.services.length,
+    totalContainers: validPlan.spec.services.reduce(
+      (total, service) => total + (service.replicas ?? 1),
+      0,
+    ),
+    networks: validPlan.spec.networks,
+    volumes: validPlan.spec.volumes,
+    services: validPlan.spec.services.map((service) => ({
+      name: service.name,
+      kind: service.kind,
+      image: service.image,
+      replicas: service.replicas ?? 1,
+      ports: service.ports ?? [],
+      volumes: service.volumes ?? [],
+      environmentKeys: Object.keys(service.environment ?? {}),
+      environment: service.environment ?? {},
+      dependsOn: service.dependsOn ?? [],
+      dependents:
+        validSchedule.dependencyGraph.find((entry) => entry.serviceName === service.name)
+          ?.dependents ?? [],
+      waitCondition: inferWaitCondition(service),
+      readinessEnforced: false,
+      warnings: buildServiceWarnings(service),
+    })),
+    schedule: validSchedule,
+    policyFindings,
+    actionsNotPerformed: [
+      'Docker Engine API was not called.',
+      'MCP tools were not called.',
+      `${ARTIFACT_TARGET_PATH} was not written.`,
+      'state/infra-state.json was not saved.',
+      'No containers, networks, volumes, or images were created or pulled.',
+    ],
+  });
+}
+
+export function evaluateDryRunPolicy(
+  spec: InfrastructureSpec,
+  schedule = buildDependencyAwareExecutionSchedule(spec),
+): DryRunPolicyFinding[] {
+  const validSpec = validateInfrastructureSpec(spec);
+  const findings: DryRunPolicyFinding[] = [];
+
+  for (const service of validSpec.services) {
+    for (const port of service.ports ?? []) {
+      findings.push({
+        severity: 'warning',
+        code: 'exposed-host-port',
+        message: `Service "${service.name}" would expose host port mapping ${port}.`,
+        resourceName: service.name,
+        resourceType: 'service',
+      });
+    }
+
+    for (const [key, value] of Object.entries(service.environment ?? {})) {
+      if (isSecretLikeEnvironmentKey(key) && isDefaultPreviewSecret(value)) {
+        findings.push({
+          severity: 'warning',
+          code: 'default-secret-preview-value',
+          message: `Service "${service.name}" uses default preview value for ${key}; replace it before real apply.`,
+          resourceName: service.name,
+          resourceType: 'service',
+        });
+      }
+    }
+
+    if (service.volumes?.length) {
+      findings.push({
+        severity: 'info',
+        code: 'persistent-volume-preview',
+        message: `Service "${service.name}" would use persistent volume mount(s): ${service.volumes.join(', ')}.`,
+        resourceName: service.name,
+        resourceType: 'service',
+      });
+    }
+
+    if ((service.replicas ?? 1) > 1) {
+      findings.push({
+        severity: 'info',
+        code: 'replica-preview',
+        message: `Service "${service.name}" would run ${service.replicas ?? 1} replicas.`,
+        resourceName: service.name,
+        resourceType: 'service',
+      });
+    }
+
+    findings.push({
+      severity: 'warning',
+      code: 'readiness-not-enforced-in-dry-run',
+      message: `Service "${service.name}" has a planned wait gate (${inferWaitCondition(service)}), but no explicit healthcheck/readiness rule is enforced in Phase 6 dry-run.`,
+      resourceName: service.name,
+      resourceType: 'service',
+    });
+  }
+
+  for (const warning of schedule.warnings) {
+    findings.push({
+      severity: 'warning',
+      code: 'schedule-readiness-warning',
+      message: warning,
+      resourceName: null,
+      resourceType: null,
+    });
+  }
+
+  return findings;
+}
+
+function orderServicesByDependency(
+  services: InfrastructureService[],
+  dependents: Map<string, string[]>,
+): string[] {
+  const originalOrder = new Map(services.map((service, index) => [service.name, index]));
+  const inDegree = new Map(
+    services.map((service) => [service.name, service.dependsOn?.length ?? 0]),
+  );
+  const queue = services
+    .filter((service) => (inDegree.get(service.name) ?? 0) === 0)
+    .map((service) => service.name);
+  const ordered: string[] = [];
+
+  sortServiceNamesByOriginalOrder(queue, originalOrder);
+
+  while (queue.length) {
+    const serviceName = queue.shift();
+    if (!serviceName) {
+      break;
+    }
+
+    ordered.push(serviceName);
+
+    for (const dependent of dependents.get(serviceName) ?? []) {
+      inDegree.set(dependent, (inDegree.get(dependent) ?? 0) - 1);
+
+      if ((inDegree.get(dependent) ?? 0) === 0) {
+        queue.push(dependent);
+        sortServiceNamesByOriginalOrder(queue, originalOrder);
+      }
+    }
+  }
+
+  if (ordered.length !== services.length) {
+    const unresolved = services
+      .map((service) => service.name)
+      .filter((serviceName) => !ordered.includes(serviceName));
+    throw new Error(
+      `Circular service dependency detected: ${unresolved.join(', ')}.`,
+    );
+  }
+
+  return ordered;
+}
+
+function buildDependentsMap(services: InfrastructureService[]): Map<string, string[]> {
+  const dependents = new Map(services.map((service) => [service.name, [] as string[]]));
+
+  for (const service of services) {
+    for (const dependency of service.dependsOn ?? []) {
+      dependents.get(dependency)?.push(service.name);
+    }
+  }
+
+  const originalOrder = new Map(services.map((service, index) => [service.name, index]));
+  for (const dependentList of dependents.values()) {
+    sortServiceNamesByOriginalOrder(dependentList, originalOrder);
+  }
+
+  return dependents;
+}
+
+function buildDependencyGraph(
+  services: InfrastructureService[],
+  dependents: Map<string, string[]>,
+): DependencyGraphEntry[] {
+  return services.map((service) => ({
+    serviceName: service.name,
+    dependsOn: service.dependsOn ?? [],
+    dependents: dependents.get(service.name) ?? [],
+  }));
+}
+
+function buildScheduleWarnings(
+  services: InfrastructureService[],
+  serviceStartOrder: string[],
+): string[] {
+  const servicesByName = new Map(services.map((service) => [service.name, service]));
+  const warnings: string[] = [];
+
+  for (const serviceName of serviceStartOrder) {
+    const service = servicesByName.get(serviceName);
+
+    if (!service) {
+      continue;
+    }
+
+    for (const dependencyName of service.dependsOn ?? []) {
+      const dependency = servicesByName.get(dependencyName);
+
+      if (dependency?.kind === 'database' && service.kind === 'backend') {
+        warnings.push(
+          `${getDatabaseDisplayName(dependency)} service "${dependency.name}" must be healthy before backend service "${service.name}" starts.`,
+        );
+      }
+
+      if (dependency?.kind === 'backend' && service.kind === 'reverse-proxy') {
+        warnings.push(
+          `Backend service "${dependency.name}" readiness is required before reverse proxy service "${service.name}" routes traffic.`,
+        );
+      }
+    }
+
+    warnings.push(
+      `Service "${service.name}" has planned wait condition "${inferWaitCondition(service)}", but Phase 6 does not enforce runtime healthchecks.`,
+    );
+  }
+
+  return warnings;
+}
+
+function buildServiceWarnings(service: InfrastructureService): string[] {
+  return [
+    `Readiness gate is preview-only in Phase 6: ${inferWaitCondition(service)}.`,
+  ];
+}
+
+function inferWaitCondition(service: InfrastructureService): string {
+  switch (service.kind) {
+    case 'database':
+      return 'wait until database accepts connections / service healthy';
+    case 'backend':
+      return 'wait until service running/healthy';
+    case 'reverse-proxy':
+      return 'wait until upstream backend ready/running';
+  }
+}
+
+function getDatabaseDisplayName(service: InfrastructureService): string {
+  const imageBase = service.image.split(':')[0]?.split('/').pop()?.toLowerCase();
+
+  switch (imageBase) {
+    case 'postgres':
+      return 'PostgreSQL';
+    case 'mysql':
+      return 'MySQL';
+    case 'mariadb':
+      return 'MariaDB';
+    case 'mongo':
+      return 'MongoDB';
+    case 'redis':
+      return 'Redis';
+    default:
+      return 'Database';
+  }
+}
+
+function getServiceLevel(kind: InfrastructureService['kind']): number {
+  switch (kind) {
+    case 'database':
+      return 1;
+    case 'backend':
+      return 2;
+    case 'reverse-proxy':
+      return 3;
+  }
+}
+
+function getLevelName(level: number): string {
+  switch (level) {
+    case 0:
+      return 'Level 0 - Foundation';
+    case 1:
+      return 'Level 1 - Data layer';
+    case 2:
+      return 'Level 2 - Application layer';
+    case 3:
+      return 'Level 3 - Routing/Proxy layer';
+    default:
+      return `Level ${level}`;
+  }
+}
+
+function getService(services: InfrastructureService[], name: string): InfrastructureService {
+  const service = services.find((candidate) => candidate.name === name);
+
+  if (!service) {
+    throw new Error(`Unknown service "${name}" while building execution schedule.`);
+  }
+
+  return service;
+}
+
+function sortServiceNamesByOriginalOrder(
+  names: string[],
+  originalOrder: Map<string, number>,
+): void {
+  names.sort((left, right) => (originalOrder.get(left) ?? 0) - (originalOrder.get(right) ?? 0));
+}
+
+function countNonEmptyLines(value: string): number {
+  return value.trim() === '' ? 0 : value.trim().split(/\r?\n/).length;
+}
+
+function isSecretLikeEnvironmentKey(key: string): boolean {
+  return /(PASSWORD|PASS|SECRET|TOKEN|KEY)$/i.test(key);
+}
+
+function isDefaultPreviewSecret(value: string): boolean {
+  return ['app', 'admin', 'password', 'changeme'].includes(value.toLowerCase());
+}

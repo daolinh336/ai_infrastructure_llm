@@ -1,8 +1,10 @@
 import {
+  validateDependencyAwareExecutionSchedule,
+  validateDetailedDryRunPreview,
   validateExecutionPlan,
+  validateInfrastructureStateFile,
   validateInfrastructureSpec,
   validateReactReasoningOutput,
-  validateStateSnapshot,
   validateValidatedQuery,
 } from '../domain/schemas.js';
 import { renderCompose } from '../compose/render-compose.js';
@@ -19,8 +21,11 @@ import type {
   AgentRunResult,
   AgentTool,
   AgentToolResult,
+  DependencyAwareExecutionSchedule,
+  DetailedDryRunPreview,
   DraftServiceQuery,
   ExecutionPlan,
+  InfrastructureStateFile,
   InfrastructureService,
   InfrastructureSpec,
   PlanStep,
@@ -31,7 +36,15 @@ import type {
 } from '../domain/types.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import type { LlmProvider } from '../llm/provider.js';
-import { loadState, saveState } from '../state/file-state-store.js';
+import {
+  loadState,
+  saveState,
+  type StateStoreOptions,
+} from '../state/file-state-store.js';
+import {
+  buildDependencyAwareExecutionSchedule,
+  buildDetailedDryRunPreview,
+} from '../execution/dependency-schedule.js';
 
 const DEPLOY_DETAILS_CLARIFICATION_QUESTION = [
   'Can ban noi ro hon truoc khi lap plan.',
@@ -96,6 +109,12 @@ interface ImageReferenceResolutionInput {
   image: string;
 }
 
+interface DetailedDryRunPreviewInput {
+  plan: ExecutionPlan;
+  composeYaml: string;
+  schedule: DependencyAwareExecutionSchedule;
+}
+
 function buildExecutionPlanFromSpec(input: PlanBuildInput): ExecutionPlan {
   const spec = validateInfrastructureSpec(input.spec);
 
@@ -141,16 +160,20 @@ export class ReActAgent {
   constructor(
     private readonly provider: LlmProvider,
     private readonly reportProgress: ProgressReporter = noopProgress,
+    private readonly stateStore: StateStoreOptions = {},
   ) {
     this.tools = [
-      createLoadStateTool(),
+      createLoadStateTool(this.stateStore),
       createResolveImageReferenceTool(),
       createProposeDraftSpecTool(),
       createRepairInfrastructureSpecTool(),
       createBuildExecutionPlanTool(),
       createValidateInfrastructureSpecTool(),
+      createBuildDependencyAwareExecutionScheduleTool(),
       createRenderComposePreviewTool(),
-      createSaveStateTool(),
+      createBuildDetailedDryRunPreviewTool(),
+      createEvaluateDryRunPolicyTool(),
+      createSaveStateTool(this.stateStore),
     ];
   }
 
@@ -359,7 +382,83 @@ export class ReActAgent {
     );
     const plan = planResult.data as ExecutionPlan;
 
-    await this.runTool('render_compose_preview', plan.spec, trace, observations);
+    recordStep(
+      trace,
+      observations,
+      {
+        phase: 'reason',
+        message:
+          'The plan is built, so create a dependency-aware execution schedule before rendering any dry-run preview.',
+        toolName: null,
+      },
+      this.reportProgress,
+    );
+
+    const scheduleResult = await this.runTool(
+      'build_dependency_aware_execution_schedule',
+      plan.spec,
+      trace,
+      observations,
+    );
+    const schedule = scheduleResult.data as DependencyAwareExecutionSchedule;
+
+    recordStep(
+      trace,
+      observations,
+      {
+        phase: 'reason',
+        message:
+          'The execution schedule is valid, so render Docker Compose as a preview artifact from the source-of-truth spec.',
+        toolName: null,
+      },
+      this.reportProgress,
+    );
+
+    const composePreviewResult = await this.runTool(
+      'render_compose_preview',
+      plan.spec,
+      trace,
+      observations,
+    );
+    const composeYaml = composePreviewResult.data as string;
+
+    recordStep(
+      trace,
+      observations,
+      {
+        phase: 'reason',
+        message:
+          'The compose preview and schedule are available, so build a detailed dry-run report without runtime side effects.',
+        toolName: null,
+      },
+      this.reportProgress,
+    );
+
+    const dryRunPreviewResult = await this.runTool(
+      'build_detailed_dry_run_preview',
+      {
+        plan,
+        composeYaml,
+        schedule,
+      } satisfies DetailedDryRunPreviewInput,
+      trace,
+      observations,
+    );
+    const dryRunPreview = dryRunPreviewResult.data as DetailedDryRunPreview;
+
+    recordStep(
+      trace,
+      observations,
+      {
+        phase: 'reason',
+        message:
+          'The detailed dry-run report is ready, so evaluate policy warnings before user review or approval.',
+        toolName: null,
+      },
+      this.reportProgress,
+    );
+
+    await this.runTool('evaluate_dry_run_policy', dryRunPreview, trace, observations);
 
     recordStep(
       trace,
@@ -375,6 +474,11 @@ export class ReActAgent {
 
     return {
       status: 'planned',
+      request: {
+        raw: validatedQuery.raw,
+        normalizedPrompt: validatedQuery.normalizedPrompt,
+        intent: validatedQuery.intent,
+      },
       plan,
       observations,
       trace,
@@ -549,12 +653,12 @@ export class ReActAgent {
   }
 }
 
-function createLoadStateTool(): AgentTool {
+function createLoadStateTool(stateStore: StateStoreOptions): AgentTool {
   return {
     name: 'load_state',
     description: 'Read saved desired/actual state as ReAct memory without mutating runtime.',
     async invoke(): Promise<AgentToolResult> {
-      const snapshot = await loadState().catch((error: unknown) => ({
+      const snapshot = await loadState(stateStore).catch((error: unknown) => ({
         error: getErrorMessage(error),
       }));
 
@@ -576,7 +680,7 @@ function createLoadStateTool(): AgentTool {
 
       return {
         ok: true,
-        observation: `Loaded saved state for project "${snapshot.desired.projectName}".`,
+        observation: formatStateMemoryObservation(snapshot),
         data: snapshot,
       };
     },
@@ -720,6 +824,37 @@ function createValidateInfrastructureSpecTool(): AgentTool {
   };
 }
 
+function createBuildDependencyAwareExecutionScheduleTool(): AgentTool {
+  return {
+    name: 'build_dependency_aware_execution_schedule',
+    description:
+      'Build a dependency-aware dry-run execution schedule without mutating runtime.',
+    async invoke(input: unknown): Promise<AgentToolResult> {
+      try {
+        const spec = validateInfrastructureSpec(input);
+        const schedule = buildDependencyAwareExecutionSchedule(spec);
+
+        return {
+          ok: true,
+          observation: [
+            `Built dependency-aware execution schedule with ${schedule.steps.length} step(s).`,
+            `Service start order: ${schedule.serviceStartOrder.join(' -> ')}.`,
+            `Destroy order preview: ${schedule.destroyOrder.join(' -> ')}.`,
+            `Readiness warnings: ${schedule.warnings.length}.`,
+          ].join(' '),
+          data: schedule,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          observation: getErrorMessage(error),
+          data: null,
+        };
+      }
+    },
+  };
+}
+
 function createRenderComposePreviewTool(): AgentTool {
   return {
     name: 'render_compose_preview',
@@ -746,19 +881,84 @@ function createRenderComposePreviewTool(): AgentTool {
   };
 }
 
-function createSaveStateTool(): AgentTool {
+function createBuildDetailedDryRunPreviewTool(): AgentTool {
+  return {
+    name: 'build_detailed_dry_run_preview',
+    description:
+      'Build a detailed dependency-aware dry-run report without Docker, MCP, artifact writes, or state writes.',
+    async invoke(input: unknown): Promise<AgentToolResult> {
+      try {
+        const previewInput = parseDetailedDryRunPreviewInput(input);
+        const preview = buildDetailedDryRunPreview(
+          previewInput.plan,
+          previewInput.composeYaml,
+          previewInput.schedule,
+        );
+
+        return {
+          ok: true,
+          observation: [
+            `Built detailed dry-run preview for ${preview.totalServices} service(s) and ${preview.totalContainers} container(s).`,
+            `Artifact target "${preview.artifactTargetPath}" was not written.`,
+            'Docker not called; MCP not called; state not saved.',
+          ].join(' '),
+          data: preview,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          observation: getErrorMessage(error),
+          data: null,
+        };
+      }
+    },
+  };
+}
+
+function createEvaluateDryRunPolicyTool(): AgentTool {
+  return {
+    name: 'evaluate_dry_run_policy',
+    description:
+      'Evaluate detailed dry-run policy warnings such as exposed ports, default secrets, volumes, and preview-only readiness gates.',
+    async invoke(input: unknown): Promise<AgentToolResult> {
+      try {
+        const preview = validateDetailedDryRunPreview(input);
+        const findings = preview.policyFindings;
+        const warningCount = findings.filter((finding) => finding.severity === 'warning').length;
+        const blockerCount = findings.filter((finding) => finding.severity === 'blocker').length;
+
+        return {
+          ok: blockerCount === 0,
+          observation: [
+            `Evaluated dry-run policy with ${findings.length} finding(s).`,
+            `Warnings: ${warningCount}. Blockers: ${blockerCount}.`,
+          ].join(' '),
+          data: findings,
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          observation: getErrorMessage(error),
+          data: null,
+        };
+      }
+    },
+  };
+}
+
+function createSaveStateTool(stateStore: StateStoreOptions): AgentTool {
   return {
     name: 'save_state',
     description:
       'Persist a validated desired-state snapshot after the approval/execution phase allows state writes.',
     async invoke(input: unknown): Promise<AgentToolResult> {
       try {
-        const snapshot = validateStateSnapshot(input);
-        await saveState(snapshot);
+        const snapshot = validateInfrastructureStateFile(input);
+        await saveState(snapshot, stateStore);
 
         return {
           ok: true,
-          observation: `Saved desired state for project "${snapshot.desired.projectName}".`,
+          observation: 'Saved infrastructure state memory file.',
           data: snapshot,
         };
       } catch (error) {
@@ -770,6 +970,20 @@ function createSaveStateTool(): AgentTool {
       }
     },
   };
+}
+
+function formatStateMemoryObservation(snapshot: InfrastructureStateFile): string {
+  const currentText = snapshot.current
+    ? `current verified project "${snapshot.current.desired.projectName}" with actual source "${snapshot.current.actual.source}"`
+    : 'no verified current runtime state';
+  const pendingText = snapshot.pendingPreview
+    ? `pending preview for project "${snapshot.pendingPreview.desired.projectName}" created at ${snapshot.pendingPreview.createdAt}`
+    : 'no pending preview';
+
+  return [
+    `Loaded state memory: ${currentText}; ${pendingText}.`,
+    'Actual Docker runtime remains unverified unless current.actual.source comes from a read-only runtime observation.',
+  ].join(' ');
 }
 
 function recordStep(
@@ -856,6 +1070,24 @@ function parseImageReferenceResolutionInput(input: unknown): ImageReferenceResol
 
   return {
     image,
+  };
+}
+
+function parseDetailedDryRunPreviewInput(input: unknown): DetailedDryRunPreviewInput {
+  if (!isRecord(input)) {
+    throw new Error('Detailed dry-run preview input must be an object.');
+  }
+
+  const composeYaml = input.composeYaml;
+
+  if (typeof composeYaml !== 'string' || composeYaml.trim() === '') {
+    throw new Error('Detailed dry-run preview input requires composeYaml.');
+  }
+
+  return {
+    plan: validateExecutionPlan(input.plan),
+    composeYaml,
+    schedule: validateDependencyAwareExecutionSchedule(input.schedule),
   };
 }
 

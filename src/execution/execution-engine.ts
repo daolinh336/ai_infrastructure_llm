@@ -1,18 +1,33 @@
-import type { AgentRunResult, ExecutionPlan, StateSnapshot } from '../domain/types.js';
+import type {
+  AgentRunResult,
+  DetailedDryRunPreview,
+  PendingPreviewState,
+} from '../domain/types.js';
 import { renderCompose } from '../compose/render-compose.js';
+import { validateAgentRunResult } from '../domain/schemas.js';
 import {
-  validateAgentRunResult,
-  validateExecutionPlan,
-  validateStateSnapshot,
-} from '../domain/schemas.js';
-import { saveState } from '../state/file-state-store.js';
+  createPendingPreviewState,
+  savePendingPreview,
+  type StateStoreOptions,
+} from '../state/file-state-store.js';
+import {
+  buildDependencyAwareExecutionSchedule,
+  buildDetailedDryRunPreview,
+} from './dependency-schedule.js';
 
 export interface ExecutionResult {
   composeYaml: string;
-  stateSnapshot: StateSnapshot;
+  dryRunPreview: DetailedDryRunPreview;
+  pendingPreview: PendingPreviewState;
+}
+
+export interface ExecutionEngineOptions {
+  stateStore?: StateStoreOptions;
 }
 
 export class ExecutionEngine {
+  constructor(private readonly options: ExecutionEngineOptions = {}) {}
+
   async dryRun(result: AgentRunResult): Promise<ExecutionResult> {
     const validResult = validateAgentRunResult(result);
     if (validResult.status !== 'planned') {
@@ -20,35 +35,35 @@ export class ExecutionEngine {
     }
 
     const composeYaml = renderCompose(validResult.plan.spec);
-    const stateSnapshot = validateStateSnapshot(this.toStateSnapshot(validResult.plan));
+    const schedule = buildDependencyAwareExecutionSchedule(validResult.plan.spec);
+    const dryRunPreview = buildDetailedDryRunPreview(
+      validResult.plan,
+      composeYaml,
+      schedule,
+    );
+    const pendingPreview = createPendingPreviewState({
+      request: validResult.request,
+      plan: validResult.plan,
+      composeYaml,
+      dryRunPreview,
+      observations: validResult.observations,
+      trace: validResult.trace ?? [],
+    });
 
     return {
       composeYaml,
-      stateSnapshot,
+      dryRunPreview,
+      pendingPreview,
     };
   }
 
   async saveDesiredState(result: AgentRunResult): Promise<ExecutionResult> {
     const executionResult = await this.dryRun(result);
-    await saveState(executionResult.stateSnapshot);
+    await savePendingPreview(executionResult.pendingPreview, this.options.stateStore);
     return executionResult;
   }
 
   async apply(result: AgentRunResult): Promise<ExecutionResult> {
     return this.saveDesiredState(result);
-  }
-
-  private toStateSnapshot(plan: ExecutionPlan): StateSnapshot {
-    const validPlan = validateExecutionPlan(plan);
-
-    return {
-      desired: validPlan.spec,
-      actual: {
-        containers: [],
-        lastObservedAt: null,
-      },
-      desiredStateSavedAt: new Date().toISOString(),
-      lastAppliedAt: null,
-    };
   }
 }

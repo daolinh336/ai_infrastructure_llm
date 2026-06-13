@@ -51,6 +51,24 @@ describe('StaticGateway', () => {
     expect(result.validatedQuery.draft.services[0]?.replicas).toBe(2);
   });
 
+  it('parses natural backend replica phrasing on the deterministic fast path', async () => {
+    const result = await createGateway().validate(
+      'Tao web application gom nginx reverse proxy, 2 node backend, va postgres database',
+    );
+
+    expect(result.status).toBe('validated');
+
+    if (result.status !== 'validated') {
+      throw new Error('Expected validated result.');
+    }
+
+    const nodeService = result.validatedQuery.draft.services.find(
+      (service) => service.image === 'node',
+    );
+    expect(nodeService?.replicas).toBe(2);
+    expect(result.validatedQuery.resourceEstimate.totalContainers).toBe(4);
+  });
+
   it('rejects static logic errors without invoking ReAct', async () => {
     const result = await createGateway().validate(
       'Tao web dung nginx port 99999 replica -2',

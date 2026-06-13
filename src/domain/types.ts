@@ -62,6 +62,12 @@ export interface ValidatedQuery {
   clarificationQuestion: string | null;
 }
 
+export interface RequestMetadata {
+  raw: string;
+  normalizedPrompt: string;
+  intent: InfrastructureIntent;
+}
+
 export interface StaticGatewayMetrics {
   intentAccepted: number;
   intentRejected: number;
@@ -118,6 +124,89 @@ export interface ExecutionPlan {
   steps: PlanStep[];
 }
 
+export type ExecutionScheduleStepKind =
+  | 'create-resource'
+  | 'start-service'
+  | 'wait-until-ready';
+
+export type ExecutionScheduleResourceType = 'network' | 'volume' | 'service';
+
+export interface DependencyGraphEntry {
+  serviceName: string;
+  dependsOn: string[];
+  dependents: string[];
+}
+
+export interface ExecutionScheduleStep {
+  order: number;
+  level: number;
+  levelName: string;
+  kind: ExecutionScheduleStepKind;
+  resourceType: ExecutionScheduleResourceType;
+  resourceName: string;
+  action: string;
+  dependsOn: string[];
+  dependents: string[];
+  waitCondition: string | null;
+  readinessEnforced: boolean;
+  serviceKind?: InfrastructureService['kind'];
+  image?: string;
+  replicas?: number;
+  ports?: string[];
+  volumes?: string[];
+}
+
+export interface DependencyAwareExecutionSchedule {
+  projectName: string;
+  steps: ExecutionScheduleStep[];
+  dependencyGraph: DependencyGraphEntry[];
+  serviceStartOrder: string[];
+  destroyOrder: string[];
+  warnings: string[];
+}
+
+export interface DryRunServiceImpact {
+  name: string;
+  kind: InfrastructureService['kind'];
+  image: string;
+  replicas: number;
+  ports: string[];
+  volumes: string[];
+  environmentKeys: string[];
+  environment: Record<string, string>;
+  dependsOn: string[];
+  dependents: string[];
+  waitCondition: string;
+  readinessEnforced: boolean;
+  warnings: string[];
+}
+
+export interface DryRunPolicyFinding {
+  severity: 'info' | 'warning' | 'blocker';
+  code: string;
+  message: string;
+  resourceName: string | null;
+  resourceType: ExecutionScheduleResourceType | null;
+}
+
+export interface DetailedDryRunPreview {
+  projectName: string;
+  artifactTargetPath: string;
+  artifactWritten: false;
+  stateSaved: false;
+  dockerCalled: false;
+  mcpCalled: false;
+  composePreviewLineCount: number;
+  totalServices: number;
+  totalContainers: number;
+  networks: string[];
+  volumes: string[];
+  services: DryRunServiceImpact[];
+  schedule: DependencyAwareExecutionSchedule;
+  policyFindings: DryRunPolicyFinding[];
+  actionsNotPerformed: string[];
+}
+
 export interface AgentObservation {
   source: string;
   message: string;
@@ -151,6 +240,7 @@ export interface AgentTool {
 
 export interface PlannedAgentRunResult {
   status: 'planned';
+  request: RequestMetadata;
   plan: ExecutionPlan;
   observations: AgentObservation[];
   trace?: ReActStep[];
@@ -165,7 +255,103 @@ export interface ClarificationAgentRunResult {
 
 export type AgentRunResult = PlannedAgentRunResult | ClarificationAgentRunResult;
 
-export interface StateSnapshot {
+export type RuntimeObservationSource =
+  | 'not-observed'
+  | 'mcp-readonly'
+  | 'runtime-adapter'
+  | 'legacy-placeholder';
+
+export interface RuntimeContainerObservation {
+  name: string;
+  image: string | null;
+  status: string | null;
+  ports: string[];
+}
+
+export interface RuntimeNamedResourceObservation {
+  name: string;
+  status: string | null;
+}
+
+export interface RuntimeImageObservation {
+  reference: string;
+  id: string | null;
+  status: string | null;
+}
+
+export interface RuntimeActualState {
+  source: RuntimeObservationSource;
+  containers: RuntimeContainerObservation[];
+  networks: RuntimeNamedResourceObservation[];
+  volumes: RuntimeNamedResourceObservation[];
+  images: RuntimeImageObservation[];
+  lastObservedAt: string | null;
+}
+
+export interface ComposeArtifactRecord {
+  targetPath: string;
+  previewContent: string;
+  previewSha256: string;
+  lineCount: number;
+  written: boolean;
+  writtenAt: string | null;
+}
+
+export interface VerificationState {
+  status: 'not-run' | 'passed' | 'failed' | 'uncertain';
+  scope: 'preview' | 'runtime';
+  checkedAt: string | null;
+  summary: string;
+  issues: string[];
+  evidence: string[];
+}
+
+export interface PendingPreviewState {
+  id: string;
+  request: RequestMetadata;
+  desired: InfrastructureSpec;
+  plan: ExecutionPlan;
+  composeArtifact: ComposeArtifactRecord;
+  dryRunPreview: DetailedDryRunPreview | null;
+  observations: AgentObservation[];
+  trace: ReActStep[];
+  verification: VerificationState;
+  createdAt: string;
+  acceptedAt: string | null;
+}
+
+export interface VerifiedRuntimeSnapshot {
+  id: string;
+  request: RequestMetadata;
+  desired: InfrastructureSpec;
+  composeArtifact: ComposeArtifactRecord;
+  actual: RuntimeActualState;
+  verification: VerificationState;
+  approvedAt: string | null;
+  appliedAt: string | null;
+  savedAt: string;
+}
+
+export interface StateOperationRecord {
+  id: string;
+  type:
+    | 'pending-preview-saved'
+    | 'verified-runtime-saved'
+    | 'legacy-state-migrated';
+  projectName: string;
+  request: RequestMetadata | null;
+  summary: string;
+  createdAt: string;
+}
+
+export interface InfrastructureStateFile {
+  schemaVersion: 1;
+  current: VerifiedRuntimeSnapshot | null;
+  pendingPreview: PendingPreviewState | null;
+  history: StateOperationRecord[];
+}
+
+export interface LegacyStateSnapshot {
   desired: InfrastructureSpec;
   actual: {
     containers: string[];

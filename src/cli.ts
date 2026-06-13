@@ -8,7 +8,13 @@ import { createProvider } from './llm/provider.js';
 import { getStateFilePath } from './state/file-state-store.js';
 import { StaticGateway } from './static-gateway/static-gateway.js';
 import { StatusService } from './status/status-service.js';
-import type { ProgressEvent, ProgressPhase, StaticGatewayMetrics } from './domain/types.js';
+import type {
+  DetailedDryRunPreview,
+  ExecutionScheduleStep,
+  ProgressEvent,
+  ProgressPhase,
+  StaticGatewayMetrics,
+} from './domain/types.js';
 
 loadLocalEnvFile();
 
@@ -107,7 +113,7 @@ program
       phase: 'execution',
       message: input.dryRun
         ? 'acting... render dry-run output and compose preview.'
-        : 'acting... persist desired state snapshot without Docker deployment.',
+        : 'acting... persist pending preview memory without Docker deployment.',
     });
     const execution = input.dryRun
       ? await engine.dryRun(result)
@@ -116,7 +122,7 @@ program
       phase: 'execution',
       message: input.dryRun
         ? 'observe... dry-run completed without state mutation.'
-        : 'observe... desired state saved; no Docker deployment executed.',
+        : 'observe... pending preview saved; no Docker deployment executed.',
     });
 
     console.log(chalk.cyan('Summary:'));
@@ -141,6 +147,10 @@ program
     }
     console.log();
 
+    if (input.dryRun) {
+      printDetailedDryRunPreview(execution.dryRunPreview);
+    }
+
     console.log(chalk.cyan('Generated docker-compose.yaml:'));
     console.log(execution.composeYaml);
     console.log();
@@ -152,7 +162,7 @@ program
     console.log(
       input.dryRun
         ? chalk.yellow('Dry run only. No state saved and no Docker deployment executed.')
-        : chalk.green('Desired state saved. No Docker deployment executed.'),
+        : chalk.green('Pending preview saved. No Docker deployment executed.'),
     );
   });
 
@@ -239,6 +249,108 @@ function printTrace(
     console.log(`- ${step.id} [${step.phase}${toolText}]: ${step.message}`);
   }
   console.log();
+}
+
+function printDetailedDryRunPreview(preview: DetailedDryRunPreview): void {
+  console.log(chalk.cyan('Detailed dry-run preview:'));
+  console.log(`Project: ${preview.projectName}`);
+  console.log(`Services: ${preview.totalServices}`);
+  console.log(`Container count if applied: ${preview.totalContainers}`);
+  console.log(`Compose artifact target: ${preview.artifactTargetPath} (not written)`);
+  console.log(
+    `Runtime side effects: Docker called=${preview.dockerCalled}, MCP called=${preview.mcpCalled}, state saved=${preview.stateSaved}`,
+  );
+  console.log();
+
+  console.log(chalk.cyan('Resources that would be created:'));
+  console.log(`- Networks: ${preview.networks.join(', ') || 'none'}`);
+  console.log(`- Volumes: ${preview.volumes.join(', ') || 'none'}`);
+  console.log();
+
+  console.log(chalk.cyan('Execution order:'));
+  for (const step of preview.schedule.steps) {
+    console.log(formatScheduleStep(step));
+  }
+  console.log();
+
+  console.log(chalk.cyan('Dependency graph:'));
+  for (const entry of preview.schedule.dependencyGraph) {
+    console.log(
+      `- ${entry.serviceName}: depends on ${entry.dependsOn.join(', ') || 'none'}; dependents ${entry.dependents.join(', ') || 'none'}`,
+    );
+  }
+  console.log();
+
+  console.log(chalk.cyan('Service details:'));
+  for (const service of preview.services) {
+    console.log(`- ${service.name} (${service.kind})`);
+    console.log(`  image: ${service.image}`);
+    console.log(`  replicas: ${service.replicas}`);
+    console.log(`  depends on: ${service.dependsOn.join(', ') || 'none'}`);
+    console.log(`  dependents: ${service.dependents.join(', ') || 'none'}`);
+    console.log(`  ports: ${service.ports.join(', ') || 'none'}`);
+    console.log(`  volumes: ${service.volumes.join(', ') || 'none'}`);
+    console.log(`  environment keys: ${service.environmentKeys.join(', ') || 'none'}`);
+    console.log(`  environment preview: ${formatEnvironmentPreview(service.environment)}`);
+    console.log(`  wait condition: ${service.waitCondition}`);
+    console.log(
+      `  readiness enforced now: ${service.readinessEnforced ? 'yes' : 'no, preview only'}`,
+    );
+    for (const warning of service.warnings) {
+      console.log(`  warning: ${warning}`);
+    }
+  }
+  console.log();
+
+  console.log(chalk.cyan('Policy findings:'));
+  if (!preview.policyFindings.length) {
+    console.log('- none');
+  }
+  for (const finding of preview.policyFindings) {
+    const target = finding.resourceName ? ` (${finding.resourceName})` : '';
+    console.log(`- [${finding.severity}] ${finding.code}${target}: ${finding.message}`);
+  }
+  console.log();
+
+  console.log(chalk.cyan('Actions not performed:'));
+  for (const action of preview.actionsNotPerformed) {
+    console.log(`- ${action}`);
+  }
+  console.log();
+}
+
+function formatScheduleStep(step: ExecutionScheduleStep): string {
+  const waitText = step.waitCondition ? `; wait: ${step.waitCondition}` : '';
+  const dependencyText = step.dependsOn.length ? `; waits for: ${step.dependsOn.join(', ')}` : '';
+  const dependentText = step.dependents.length ? `; then allows: ${step.dependents.join(', ')}` : '';
+  const replicaText = step.replicas && step.replicas > 1 ? `; replicas: ${step.replicas}` : '';
+
+  return [
+    `- ${step.order}. ${step.levelName}: ${step.action}`,
+    dependencyText,
+    dependentText,
+    replicaText,
+    waitText,
+  ].join('');
+}
+
+function formatEnvironmentPreview(environment: Record<string, string>): string {
+  const entries = Object.entries(environment);
+
+  if (!entries.length) {
+    return 'none';
+  }
+
+  return entries
+    .map(([key, value]) => {
+      const secretText = isSecretLikeEnvironmentKey(key) ? ' (default preview secret)' : '';
+      return `${key}=${value}${secretText}`;
+    })
+    .join(', ');
+}
+
+function isSecretLikeEnvironmentKey(key: string): boolean {
+  return /(PASSWORD|PASS|SECRET|TOKEN|KEY)$/i.test(key);
 }
 
 function loadLocalEnvFile(): void {

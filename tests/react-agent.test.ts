@@ -1,8 +1,20 @@
 import { describe, expect, it } from 'vitest';
-import type { ValidatedQuery } from '../src/domain/types.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+import type {
+  InfrastructureSpec,
+  InfrastructureStateFile,
+  ValidatedQuery,
+} from '../src/domain/types.js';
 import { ReActAgent } from '../src/agent/react-agent.js';
 import { StubLlmProvider, type StructuredLlmRequest } from '../src/llm/provider.js';
 import { StaticGateway } from '../src/static-gateway/static-gateway.js';
+import {
+  createComposeArtifactRecord,
+  createVerificationState,
+  saveState,
+} from '../src/state/file-state-store.js';
 
 describe('ReActAgent', () => {
   it('runs a structured Reason-Act-Observe trace from a ValidatedQuery', async () => {
@@ -30,6 +42,13 @@ describe('ReActAgent', () => {
     expect(agent.listTools().map((tool) => tool.name)).toContain('resolve_image_reference');
     expect(agent.listTools().map((tool) => tool.name)).toContain('propose_draft_spec');
     expect(agent.listTools().map((tool) => tool.name)).toContain('repair_infra_spec');
+    expect(agent.listTools().map((tool) => tool.name)).toContain(
+      'build_dependency_aware_execution_schedule',
+    );
+    expect(agent.listTools().map((tool) => tool.name)).toContain(
+      'build_detailed_dry_run_preview',
+    );
+    expect(agent.listTools().map((tool) => tool.name)).toContain('evaluate_dry_run_policy');
     expect(result.observations.some((observation) => observation.source === 'act:load_state')).toBe(
       true,
     );
@@ -48,6 +67,27 @@ describe('ReActAgent', () => {
     expect(
       result.observations.some(
         (observation) =>
+          observation.source === 'observe:build_dependency_aware_execution_schedule' &&
+          observation.message.includes('postgres -> api -> nginx'),
+      ),
+    ).toBe(true);
+    expect(
+      result.observations.some(
+        (observation) =>
+          observation.source === 'observe:build_detailed_dry_run_preview' &&
+          observation.message.includes('Docker not called'),
+      ),
+    ).toBe(true);
+    expect(
+      result.observations.some(
+        (observation) =>
+          observation.source === 'observe:evaluate_dry_run_policy' &&
+          observation.message.includes('Warnings:'),
+      ),
+    ).toBe(true);
+    expect(
+      result.observations.some(
+        (observation) =>
           observation.source === 'observe:llm_reasoning' &&
           observation.message.includes('Structured LLM reasoning summary'),
       ),
@@ -55,6 +95,11 @@ describe('ReActAgent', () => {
     expect(
       result.observations.some((observation) => observation.source === 'act:save_state'),
     ).toBe(false);
+    expect(result.request).toMatchObject({
+      raw: gatewayResult.validatedQuery.raw,
+      normalizedPrompt: gatewayResult.validatedQuery.normalizedPrompt,
+      intent: 'create',
+    });
     expect(result.plan.spec.services.map((service) => service.name)).toEqual([
       'nginx',
       'api',
@@ -71,6 +116,43 @@ describe('ReActAgent', () => {
     expect(result.plan.steps.find((step) => step.id === 'write-state')?.dependsOn).toEqual([
       'generate-compose',
     ]);
+  });
+
+  it('loads current and pending state memory as a ReAct observation', async () => {
+    const tempDir = await mkdtemp(path.join(os.tmpdir(), 'infra-agent-react-'));
+    const stateFilePath = path.join(tempDir, 'infra-state.json');
+
+    try {
+      await saveState(createMemoryStateFile(), { stateFilePath });
+      const gateway = new StaticGateway(new StubLlmProvider('stub'));
+      const gatewayResult = await gateway.validate('Tao nginx port 80');
+
+      if (gatewayResult.status !== 'validated') {
+        throw new Error('Expected validated query.');
+      }
+
+      const agent = new ReActAgent(
+        new StubLlmProvider('stub'),
+        () => undefined,
+        { stateFilePath },
+      );
+      const result = await agent.run(gatewayResult.validatedQuery);
+
+      expect(result.status).toBe('planned');
+      expect(
+        result.observations.some(
+          (observation) =>
+            observation.source === 'observe:load_state' &&
+            observation.message.includes('current verified project "demo"') &&
+            observation.message.includes('pending preview for project "demo"'),
+        ),
+      ).toBe(true);
+      expect(
+        result.observations.some((observation) => observation.source === 'act:save_state'),
+      ).toBe(false);
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
   });
 
   it('lets different natural-language prompts produce different specs', async () => {
@@ -270,6 +352,17 @@ describe('ReActAgent', () => {
       result.observations.some((observation) => observation.source === 'observe:render_compose_preview'),
     ).toBe(true);
     expect(
+      result.observations.some(
+        (observation) =>
+          observation.source === 'observe:build_dependency_aware_execution_schedule',
+      ),
+    ).toBe(true);
+    expect(
+      result.observations.some(
+        (observation) => observation.source === 'observe:build_detailed_dry_run_preview',
+      ),
+    ).toBe(true);
+    expect(
       result.observations.some((observation) => observation.source === 'act:save_state'),
     ).toBe(false);
   });
@@ -396,5 +489,116 @@ function createValidatedQueryWithSingleImage(
     },
     clarificationRequired: false,
     clarificationQuestion: null,
+  };
+}
+
+function createMemoryStateFile(): InfrastructureStateFile {
+  const spec = createSingleNginxSpec();
+  const composeYaml = 'services:\n  nginx:\n    image: nginx:stable\n';
+
+  return {
+    schemaVersion: 1,
+    current: {
+      id: 'current-test',
+      request: {
+        raw: 'Tao nginx port 80',
+        normalizedPrompt: 'Tao nginx port 80',
+        intent: 'create',
+      },
+      desired: spec,
+      composeArtifact: createComposeArtifactRecord(
+        'docker-compose.yaml',
+        composeYaml,
+        true,
+        '2026-06-04T11:24:44.723Z',
+      ),
+      actual: {
+        source: 'runtime-adapter',
+        containers: [
+          {
+            name: 'demo-nginx',
+            image: 'nginx:stable',
+            status: 'running',
+            ports: ['80:80'],
+          },
+        ],
+        networks: [
+          {
+            name: 'app-network',
+            status: 'present',
+          },
+        ],
+        volumes: [],
+        images: [
+          {
+            reference: 'nginx:stable',
+            id: 'sha256:test',
+            status: 'present',
+          },
+        ],
+        lastObservedAt: '2026-06-04T11:25:44.723Z',
+      },
+      verification: {
+        status: 'passed',
+        scope: 'runtime',
+        checkedAt: '2026-06-04T11:25:44.723Z',
+        summary: 'Runtime state matched desired state.',
+        issues: [],
+        evidence: ['Container demo-nginx was running.'],
+      },
+      approvedAt: '2026-06-04T11:24:50.000Z',
+      appliedAt: '2026-06-04T11:25:00.000Z',
+      savedAt: '2026-06-04T11:25:44.723Z',
+    },
+    pendingPreview: {
+      id: 'pending-test',
+      request: {
+        raw: 'Tao nginx port 80',
+        normalizedPrompt: 'Tao nginx port 80',
+        intent: 'create',
+      },
+      desired: spec,
+      plan: {
+        summary: 'Pending test plan',
+        spec,
+        assumptions: ['Test fixture.'],
+        steps: [
+          {
+            id: 'generate-compose',
+            description: 'Generate compose.',
+            action: 'generate-compose',
+          },
+        ],
+      },
+      composeArtifact: createComposeArtifactRecord(
+        'docker-compose.yaml',
+        composeYaml,
+        false,
+        null,
+      ),
+      dryRunPreview: null,
+      observations: [],
+      trace: [],
+      verification: createVerificationState('preview', 'Preview not verified.'),
+      createdAt: '2026-06-04T12:00:00.000Z',
+      acceptedAt: null,
+    },
+    history: [],
+  };
+}
+
+function createSingleNginxSpec(): InfrastructureSpec {
+  return {
+    projectName: 'demo',
+    networks: ['app-network'],
+    volumes: [],
+    services: [
+      {
+        kind: 'reverse-proxy',
+        name: 'nginx',
+        image: 'nginx:stable',
+        ports: ['80:80'],
+      },
+    ],
   };
 }

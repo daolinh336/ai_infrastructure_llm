@@ -41,32 +41,53 @@ This baseline is the first milestone, not the final research direction.
 
 ## Current scope
 
-This initial scaffold provides:
+The current implementation is synced through the Phase 7 boundary in the
+11-phase roadmap. It provides:
 - a TypeScript CLI entrypoint
-- a seed ReAct agent loop abstraction
-- provider-agnostic LLM interface with a stub provider
-- execution plan generation
-- Docker Compose YAML rendering
-- file-based infrastructure state storage
-- a basic `status` command
+- a pre-ReAct Static Gateway for intent classification, structured query parsing,
+  static validation, and early rejection/clarification
+- a structured ReAct agent loop with explicit reason/act/observe trace steps
+- provider-agnostic LLM interface with a stub provider and an OpenAI Responses
+  API provider path
+- prompt-to-spec planning that builds an `InfrastructureSpec` from a validated
+  query
+- execution plan generation from the validated spec
+- deterministic Docker Compose YAML rendering as a preview artifact
+- dependency-aware detailed dry-run preview with policy/readiness observations
+- file-based state storage with schema versioning, pending preview memory,
+  current verified runtime snapshot shape, history, validation, and atomic writes
+- a `status` command that reads saved pending/current state memory
 
-## Functional goals for phase 1
+Still not implemented:
+- explicit approval gate / y-n approval workflow
+- typed `ApprovedAction`
+- MetaVerifier / ToolVerifier / `VerificationReport`
+- custom MCP server
+- Docker Runtime Adapter or Docker Engine API apply/observe path
+- real runtime drift detection, destroy, repair, or healing
 
-The mini-project CLI should currently support:
+## Functional goals through phase 7
+
+The mini-project CLI currently supports:
 - entering natural-language infrastructure requests
-- analyzing requests into an execution plan
-- showing the plan and observations in the CLI output
+- running the Static Gateway before ReAct starts
+- analyzing validated requests into a desired-state `InfrastructureSpec`
+- showing assumptions, observations, ReAct trace, plan steps, and preview output
 - running in **dry-run** mode to preview changes without saving state or applying Docker changes
-- generating Docker Compose-style configuration as an intermediate artifact
-- optionally persisting **desired state only** without deploying Docker (for example via `--save-state`)
-- supporting basic status-style inspection over saved snapshots
+- generating Docker Compose-style configuration as an intermediate preview artifact
+- optionally persisting a **pending preview memory record** without deploying Docker (for example via `--save-state`)
+- supporting status-style inspection over saved pending/current state memory
 
-Phase 1 uses the following data boundary:
+The current data boundary is:
 - the validated **InfrastructureSpec** is the canonical desired-state model
 - the generated **Docker Compose YAML** is a derived preview/execution artifact
-- state persistence should save the spec and related metadata rather than treating compose text as the primary domain object
+- state persistence saves pending preview memory separately from future verified desired/actual runtime state
+- compose text is stored only as artifact metadata/content and must not become the primary domain object
 
-Phase 1 intentionally stops short of real Docker deployment and full drift detection. Those behaviors belong to later phases after runtime boundaries, validation, approval flows, error handling, verification, and observation paths are stronger.
+The current implementation intentionally stops short of real Docker deployment,
+runtime observation, and full drift detection. Those behaviors belong to Phase
+8+ after approval, typed action, preflight, verification, MCP, and Docker runtime
+boundaries are stronger.
 
 For the first real Docker milestone, keep the demo intentionally basic, but define the custom/wrapper MCP contract before exposing runtime tools to the agent. Existing Docker MCP servers may be used for prototyping behind an adapter, but the agent should only see the project's narrow, policy-controlled tool surface.
 
@@ -78,9 +99,9 @@ Before the agent is allowed to operate on Docker through MCP or direct runtime a
 - **Docker runtime interface** — Docker Engine API access should live behind a dedicated runtime adapter so agent logic, CLI code, and status code do not depend on low-level Docker request details.
 - **Safety / approval gate** — read-only inspection, dry-run generation, and state persistence can be low-risk paths, but create/start/stop/remove actions must be classified and gated by approval or policy.
 - **Tool input/output validation** — MCP tool calls should use explicit schemas, constrained arguments, and structured results so the system can reject malformed or unsafe requests before execution.
-- **Test-before-apply pipeline** — every real apply flow should validate the infrastructure spec, render outputs deterministically, run preflight checks, and surface the expected impact before touching the runtime.
-- **Split-Act pipeline** — the LLM proposes an action, an action builder creates a typed tool call, preflight validation checks schema/policy/state, approval gates side effects, the executor calls MCP/runtime, and an observer/verifier reads the result.
-- **Sandbox dry-run path** — when available, a sandbox such as `repo2run` or an equivalent isolated runtime can sit between preview and real apply so failures become observations before host runtime mutation.
+- **Test-before-apply pipeline** — every real apply flow should validate the infrastructure spec, render outputs deterministically, build a detailed dependency-aware dry-run preview, run preflight checks, and surface the expected impact before touching the runtime.
+- **Split-Act pipeline** — the LLM proposes an action, an action builder creates a typed tool call, preflight validation checks schema/policy/state/dry-run evidence, approval gates side effects, the executor calls MCP/runtime, and an observer/verifier reads the result.
+- **Detailed dry-run preview** — before any runtime mutation, the system should show the resources, dependency order, readiness gates, ports, volumes, networks, environment/default secrets, and actions not performed.
 - **Read-only verifier path** — post-action verification should use read-only tools and must not share mutation permissions with the executor.
 
 These layers are the architectural "guardrails" that let the agent act without turning runtime execution into opaque LLM behavior.
@@ -93,7 +114,7 @@ A practical roadmap is:
 - **Phase 1 / baseline scaffold** — natural-language planning, structured infra spec generation, compose rendering, dry-run, and file-based desired state.
 - **Phase 2 / controlled runtime boundary** — keep `InfrastructureSpec` as the desired-state source of truth, strengthen validation and typed execution planning around it, and avoid promoting compose output into the domain model.
 - **Phase 3 / custom or wrapper MCP contract** — define the project's narrow MCP tool surface early; existing Docker MCP servers can be wrapped behind it for prototyping.
-- **Phase 4 / Docker runtime + sandbox + verifier** — connect the custom MCP boundary to Docker Engine API or a wrapped Docker MCP implementation, add sandbox dry-run where available, classify failure modes, and verify results with read-only observation tools.
+- **Phase 4 / Docker runtime + verifier** — connect the custom MCP boundary to Docker Engine API or a wrapped Docker MCP implementation, classify failure modes, and verify results with read-only observation tools.
 - **Phase 5 / end-to-end hardening** — complete apply/status/destroy/drift flows, strengthen policy, logging, contract tests, error handling, verification, and observation-heavy workflows.
 
 For a more detailed implementation sequence, see `docs/roadmap-11-phases.md`. For a trackable execution checklist, see `docs/roadmap-11-phases-checklist.md`.
@@ -110,7 +131,7 @@ In addition to those longer-term ideas, the near-term roadmap for Docker Engine 
 - `InfrastructureSpec` as the desired-state source of truth and `ExecutionPlan` as the procedural layer
 - Docker Compose as a rendered artifact for preview/execution support rather than the canonical domain model
 - split-Act execution with preflight validation before the executor can call MCP/runtime
-- sandbox dry-run before host runtime mutation when an isolated runtime is available
+- detailed dependency-aware dry-run preview before host runtime mutation
 - runtime observation paths for status, drift detection, post-action verification, and failure classification
 - explicit error handling for validation failures, preflight failures, approval rejection, runtime failures, and post-apply verification mismatches
 - policy controls for destructive or externally exposed operations
@@ -132,5 +153,12 @@ npm test
 
 ## Notes
 
-- The current implementation is scaffolding-first: it generates a seed plan and compose file, but does not yet perform real Docker deployment or real provider API calls.
-- `state/infra-state.json` is used for desired/actual state persistence in the first phase.
+- The current implementation is preview/state-memory-first: it can plan, validate,
+  render, dry-run, and save a pending preview, but does not yet perform real
+  Docker deployment.
+- OpenAI provider integration exists; the stub provider remains the default
+  deterministic path for local dev/tests. Gemini and Ollama are explicit
+  not-implemented paths.
+- `state/infra-state.json` may contain legacy v0 state; the loader migrates it
+  into v1 pending preview memory and keeps current verified runtime state empty
+  until a future approved apply observes Docker runtime.
