@@ -1,0 +1,143 @@
+﻿import type { InfrastructureSpec } from '../domain/types.js';
+
+/**
+ * Secret resolution layer (roadmap: "Hệ thống quản lý Secret").
+ *
+ * The agent already injects temporary default secrets via `generateDefaultSecret()`
+ * into the InfrastructureSpec. This module runs AFTER the agent returns and decides
+ * the final value for every secret-like environment key, using the priority:
+ *
+ *   1. SQLite state store (deployed/saved desired state) — authoritative truth;
+ *      keeps desired ≈ actual Docker state and prevents `.env` from churning a
+ *      running service's password. Users change passwords via other tools, not `.env`.
+ *   2. `.env` (process.env) — seed/reference for NEW services not yet in SQLite.
+ *   3. auto-generated (the value already in the spec) — fallback for new services.
+ *
+ * No new fields are added to InfrastructureSpec; the resolver only rewrites
+ * `service.environment` values for secret-like keys.
+ */
+
+const SECRET_KEY_PATTERN = /(PASSWORD|PASS|SECRET|TOKEN|KEY)$/i;
+
+export type SecretSource = 'env-file' | 'state-store' | 'auto-generated';
+
+export interface ResolvedSecret {
+  /** Original environment variable name, e.g. "POSTGRES_PASSWORD". */
+  key: string;
+  /** Name used to look up process.env (prefixed when the same key is shared by 2+ services). */
+  envVarName: string;
+  /** Resolved real value. */
+  value: string;
+  source: SecretSource;
+}
+
+export interface ServiceSecretResolution {
+  serviceName: string;
+  secrets: ResolvedSecret[];
+}
+
+export interface SecretResolutionResult {
+  services: ServiceSecretResolution[];
+  /** Spec with resolved secret values substituted into service.environment. */
+  updatedSpec: InfrastructureSpec;
+}
+
+/** Shared secret-key detector so CLI / policy / resolver do not duplicate the regex. */
+export function isSecretLikeKey(key: string): boolean {
+  return SECRET_KEY_PATTERN.test(key);
+}
+
+export interface ResolveSecretsOptions {
+  /**
+   * Environment to read `.env`-style values from. Defaults to `process.env`
+   * (already loaded by the CLI via `process.loadEnvFile('.env')`).
+   */
+  env?: Record<string, string | undefined>;
+}
+
+export function resolveSecrets(
+  spec: InfrastructureSpec,
+  previousSpec?: InfrastructureSpec | null,
+  options: ResolveSecretsOptions = {},
+): SecretResolutionResult {
+  const env = options.env ?? process.env;
+
+  // 1. Count secret-like keys across services to detect duplicates that need prefixing.
+  const secretKeyCounts = new Map<string, number>();
+  for (const service of spec.services) {
+    for (const key of Object.keys(service.environment ?? {})) {
+      if (isSecretLikeKey(key)) {
+        secretKeyCounts.set(key, (secretKeyCounts.get(key) ?? 0) + 1);
+      }
+    }
+  }
+
+  // 2. Index the previous spec by service name for state-store lookups.
+  const previousEnvByName = new Map<string, Record<string, string>>();
+  for (const service of previousSpec?.services ?? []) {
+    if (service.environment) {
+      previousEnvByName.set(service.name, service.environment);
+    }
+  }
+
+  const resolutions: ServiceSecretResolution[] = [];
+  const updatedServices = spec.services.map((service) => {
+    const secrets: ResolvedSecret[] = [];
+    const updatedEnvironment = { ...(service.environment ?? {}) };
+
+    for (const [key, currentValue] of Object.entries(service.environment ?? {})) {
+      if (!isSecretLikeKey(key)) {
+        continue;
+      }
+
+      const isDuplicate = (secretKeyCounts.get(key) ?? 0) > 1;
+      const envVarName = isDuplicate ? `${toEnvPrefix(service.name)}_${key}` : key;
+
+      let value = currentValue;
+      let source: SecretSource = 'auto-generated';
+
+      // Priority 1: SQLite state store — deployed truth wins so desired ≈ actual.
+      // `.env` must NOT override a service that is already deployed/saved; users
+      // change passwords via other tools, and SQLite↔Docker must stay accurately mapped.
+      const previousValue = previousEnvByName.get(service.name)?.[key];
+      if (previousValue !== undefined) {
+        value = previousValue;
+        source = 'state-store';
+      } else {
+        // Priority 2: `.env` — seed/reference for NEW services not yet in SQLite.
+        // Empty string counts as "not provided".
+        const envValue = env[envVarName];
+        if (envValue !== undefined && envValue !== '') {
+          value = envValue;
+          source = 'env-file';
+        }
+        // Priority 3: keep the auto-generated value already in the spec.
+      }
+
+      updatedEnvironment[key] = value;
+      secrets.push({ key, envVarName, value, source });
+    }
+
+    if (secrets.length > 0) {
+      resolutions.push({ serviceName: service.name, secrets });
+    }
+
+    return { ...service, environment: updatedEnvironment };
+  });
+
+  return {
+    services: resolutions,
+    updatedSpec: { ...spec, services: updatedServices },
+  };
+}
+
+/** True when at least one resolved secret came from the auto-generated fallback. */
+export function hasAutoGeneratedSecrets(result: SecretResolutionResult): boolean {
+  return result.services.some((service) =>
+    service.secrets.some((secret) => secret.source === 'auto-generated'),
+  );
+}
+
+function toEnvPrefix(serviceName: string): string {
+  return serviceName.replace(/[^A-Za-z0-9]/g, '_').toUpperCase();
+}

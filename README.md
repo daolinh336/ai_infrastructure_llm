@@ -34,14 +34,14 @@ The current baseline target is intentionally narrow:
 - **Runtime and backend:** Node.js + TypeScript
 - **AI providers:** Gemini and OpenAI API integration
 - **Container runtime:** Docker Engine API
-- **State storage:** file-based JSON and YAML
+- **State storage:** SQLite through `better-sqlite3`; validated domain objects are stored as JSON payloads in SQLite tables, while YAML remains a generated artifact format
 - **Agent pattern:** ReAct (Reason → Act → Observe → Repeat)
 
 This baseline is the first milestone, not the final research direction.
 
 ## Current scope
 
-The current implementation is synced through the Phase 7 boundary in the
+The current implementation is synced through the Phase 8 control boundary in the
 11-phase roadmap. It provides:
 - a TypeScript CLI entrypoint
 - a pre-ReAct Static Gateway for intent classification, structured query parsing,
@@ -54,19 +54,21 @@ The current implementation is synced through the Phase 7 boundary in the
 - execution plan generation from the validated spec
 - deterministic Docker Compose YAML rendering as a preview artifact
 - dependency-aware detailed dry-run preview with policy/readiness observations
-- file-based state storage with schema versioning, pending preview memory,
-  current verified runtime snapshot shape, history, validation, and atomic writes
+- SQLite state storage with schema versioning, pending preview memory,
+  current verified runtime snapshot shape, history, validation, and read-only
+  legacy JSON compatibility
+- Phase 8 approval/preflight boundary: `plan --apply` runs preflight, asks y/n,
+  writes `docker-compose.yaml` only after approval, and creates an
+  `ApprovedAction`
+- a read-only `doctor --docker` setup check for Docker CLI/Desktop reachability
 - a `status` command that reads saved pending/current state memory
 
 Still not implemented:
-- explicit approval gate / y-n approval workflow
-- typed `ApprovedAction`
-- MetaVerifier / ToolVerifier / `VerificationReport`
 - custom MCP server
 - Docker Runtime Adapter or Docker Engine API apply/observe path
 - real runtime drift detection, destroy, repair, or healing
 
-## Functional goals through phase 7
+## Functional goals through phase 8
 
 The mini-project CLI currently supports:
 - entering natural-language infrastructure requests
@@ -75,19 +77,22 @@ The mini-project CLI currently supports:
 - showing assumptions, observations, ReAct trace, plan steps, and preview output
 - running in **dry-run** mode to preview changes without saving state or applying Docker changes
 - generating Docker Compose-style configuration as an intermediate preview artifact
-- optionally persisting a **pending preview memory record** without deploying Docker (for example via `--save-state`)
+- optionally persisting a **pending preview memory record** in SQLite without deploying Docker (for example via `--save-state`)
+- running `plan --apply` to preview, preflight, ask approval, write the compose
+  artifact only after approval, and save the approved action in SQLite
+- running `doctor --docker` as a read-only Docker Desktop setup check
 - supporting status-style inspection over saved pending/current state memory
 
 The current data boundary is:
 - the validated **InfrastructureSpec** is the canonical desired-state model
 - the generated **Docker Compose YAML** is a derived preview/execution artifact
-- state persistence saves pending preview memory separately from future verified desired/actual runtime state
+- SQLite persistence saves pending preview memory and approved action records
+  separately from future verified desired/actual runtime state
 - compose text is stored only as artifact metadata/content and must not become the primary domain object
 
 The current implementation intentionally stops short of real Docker deployment,
 runtime observation, and full drift detection. Those behaviors belong to Phase
-8+ after approval, typed action, preflight, verification, MCP, and Docker runtime
-boundaries are stronger.
+9+ after MCP and Docker runtime boundaries are implemented.
 
 For the first real Docker milestone, keep the demo intentionally basic, but define the custom/wrapper MCP contract before exposing runtime tools to the agent. Existing Docker MCP servers may be used for prototyping behind an adapter, but the agent should only see the project's narrow, policy-controlled tool surface.
 
@@ -111,7 +116,7 @@ These layers are the architectural "guardrails" that let the agent act without t
 After the baseline is working, the project may evolve beyond a simple ReAct loop.
 
 A practical roadmap is:
-- **Phase 1 / baseline scaffold** — natural-language planning, structured infra spec generation, compose rendering, dry-run, and file-based desired state.
+- **Phase 1 / baseline scaffold** — natural-language planning, structured infra spec generation, compose rendering, dry-run, and persisted desired/pending state.
 - **Phase 2 / controlled runtime boundary** — keep `InfrastructureSpec` as the desired-state source of truth, strengthen validation and typed execution planning around it, and avoid promoting compose output into the domain model.
 - **Phase 3 / custom or wrapper MCP contract** — define the project's narrow MCP tool surface early; existing Docker MCP servers can be wrapped behind it for prototyping.
 - **Phase 4 / Docker runtime + verifier** — connect the custom MCP boundary to Docker Engine API or a wrapped Docker MCP implementation, classify failure modes, and verify results with read-only observation tools.
@@ -144,6 +149,8 @@ The purpose of that direction is to avoid blind AI execution of generated infras
 ```bash
 npm install
 npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres"
+npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres" --apply
+npm run dev -- doctor --docker
 npm run dev -- status
 npm run build
 npm run typecheck
@@ -151,14 +158,50 @@ npm run lint
 npm test
 ```
 
+## LLM provider setup
+
+The stub provider remains the default deterministic path. OpenAI and Gemini are
+both first-class provider choices configured through a local `.env` file. Set
+`INFRA_AGENT_PROVIDER` to `openai`, `gemini`, or `stub`; optionally set
+`INFRA_AGENT_FALLBACK_PROVIDER` so a failed primary provider falls back to the
+other one.
+
+```bash
+INFRA_AGENT_PROVIDER=openai
+INFRA_AGENT_FALLBACK_PROVIDER=gemini
+OPENAI_API_KEY=your_openai_key
+OPENAI_BASE_URL=https://api.vietapi.tech/v1
+OPENAI_REACT_MODEL=gpt-5.5
+OPENAI_AUX_MODEL=gpt-5.5
+
+# Gemini calls the Google API directly (no proxy).
+GEMINI_API_KEY=your_gemini_key
+GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta
+GEMINI_REACT_MODEL=gemini-2.5-flash
+GEMINI_AUX_MODEL=gemini-2.5-flash
+```
+
+Provider variables:
+
+- **OpenAI**: `OPENAI_API_KEY` (required), `OPENAI_BASE_URL` (optional, for
+  OpenAI-compatible proxies), `OPENAI_REACT_MODEL`, `OPENAI_AUX_MODEL`.
+- **Gemini**: `GEMINI_API_KEY` or `GOOGLE_API_KEY` (required), `GEMINI_BASE_URL`
+  (defaults to the direct Google endpoint), `GEMINI_REACT_MODEL`, `GEMINI_AUX_MODEL`.
+- `OPENAI_BASE_URL` only affects the OpenAI provider; Gemini always uses its own
+  direct Google endpoint via `GEMINI_BASE_URL`.
+
 ## Notes
 
 - The current implementation is preview/state-memory-first: it can plan, validate,
-  render, dry-run, and save a pending preview, but does not yet perform real
-  Docker deployment.
-- OpenAI provider integration exists; the stub provider remains the default
-  deterministic path for local dev/tests. Gemini and Ollama are explicit
-  not-implemented paths.
-- `state/infra-state.json` may contain legacy v0 state; the loader migrates it
-  into v1 pending preview memory and keeps current verified runtime state empty
-  until a future approved apply observes Docker runtime.
+  render, dry-run, save a pending preview, and create a Phase 8 approved compose
+  artifact action, but does not yet perform real Docker deployment.
+- OpenAI and Gemini are both working first-class provider choices configured
+  via `.env` (see provider setup above); the stub provider remains the default
+  deterministic path for local dev/tests. Only OpenAI and Gemini are
+  supported as real providers.
+- SQLite is the primary state storage at `state/infra-state.sqlite`.
+  `state/infra-state.json` is legacy-only input; when present beside a missing
+  SQLite database, read paths can translate it into pending preview memory
+  without writing the database. The next explicit state-write path persists
+  SQLite, and current verified runtime state remains empty until a future
+  approved runtime apply observes Docker.

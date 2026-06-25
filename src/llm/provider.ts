@@ -17,6 +17,10 @@ import {
 
 export const DEFAULT_OPENAI_AUX_MODEL = 'gpt-5.4-mini';
 export const DEFAULT_OPENAI_REACT_MODEL = 'gpt-5.4-mini';
+export const DEFAULT_GEMINI_AUX_MODEL = 'gemini-2.5-flash';
+export const DEFAULT_GEMINI_REACT_MODEL = 'gemini-2.5-flash';
+export const DEFAULT_GEMINI_BASE_URL =
+  'https://generativelanguage.googleapis.com/v1beta';
 
 export interface LlmRequest {
   system: string;
@@ -44,6 +48,14 @@ export interface OpenAiProviderConfig {
   apiKey: string;
   auxiliaryModel: string;
   reactModel: string;
+  baseURL?: string | undefined;
+}
+
+export interface GeminiProviderConfig {
+  apiKey: string;
+  auxiliaryModel: string;
+  reactModel: string;
+  baseUrl: string;
 }
 
 export interface OpenAiResponseCreateInput {
@@ -64,6 +76,35 @@ export interface OpenAiResponsesClient {
   responses: {
     create(input: OpenAiResponseCreateInput): Promise<{ output_text?: string }>;
   };
+}
+
+export interface GeminiGenerateContentInput {
+  systemInstruction?: {
+    parts: Array<{ text: string }>;
+  };
+  contents: Array<{
+    role: 'user';
+    parts: Array<{ text: string }>;
+  }>;
+  generationConfig?: {
+    responseMimeType: 'application/json';
+    responseSchema: JsonSchema;
+  };
+}
+
+export interface GeminiGenerateContentResponse {
+  candidates?: Array<{
+    content?: {
+      parts?: Array<{ text?: string }>;
+    };
+  }>;
+}
+
+export interface GeminiGenerateContentClient {
+  generateContent(
+    model: string,
+    input: GeminiGenerateContentInput,
+  ): Promise<GeminiGenerateContentResponse>;
 }
 
 export class ProviderConfigurationError extends Error {
@@ -90,11 +131,7 @@ export class StubLlmProvider implements LlmProvider {
     }
 
     return {
-      text: [
-        `[stub:${this.name}]`,
-        input.system,
-        input.user,
-      ].join('\n\n'),
+      text: [`[stub:${this.name}]`, input.system, input.user].join('\n\n'),
     };
   }
 
@@ -133,6 +170,7 @@ export class OpenAiLlmProvider implements LlmProvider {
       client ??
       (new OpenAI({
         apiKey: config.apiKey,
+        baseURL: config.baseURL,
       }) as unknown as OpenAiResponsesClient);
   }
 
@@ -169,21 +207,157 @@ export class OpenAiLlmProvider implements LlmProvider {
   }
 
   private getModelForPurpose(purpose: LlmPurpose): string {
-    return purpose === 'auxiliary' ? this.config.auxiliaryModel : this.config.reactModel;
+    return purpose === 'auxiliary'
+      ? this.config.auxiliaryModel
+      : this.config.reactModel;
   }
 }
 
-export function createProvider(name: ProviderName = getDefaultProviderName()): LlmProvider {
+export class GeminiLlmProvider implements LlmProvider {
+  readonly name = 'gemini';
+  private readonly client: GeminiGenerateContentClient;
+
+  constructor(
+    private readonly config: GeminiProviderConfig,
+    client?: GeminiGenerateContentClient,
+  ) {
+    this.client = client ?? new GeminiHttpGenerateContentClient(config);
+  }
+
+  async complete(input: LlmRequest): Promise<LlmResponse> {
+    const response = await this.client.generateContent(
+      this.getModelForPurpose(input.purpose ?? 'react'),
+      this.createGenerateContentInput(input),
+    );
+
+    return {
+      text: getGeminiOutputText(response),
+    };
+  }
+
+  async completeStructured(input: StructuredLlmRequest): Promise<LlmResponse> {
+    const response = await this.client.generateContent(
+      this.getModelForPurpose(input.purpose),
+      this.createGenerateContentInput(input, {
+        responseMimeType: 'application/json',
+        responseSchema: input.schema,
+      }),
+    );
+
+    return {
+      text: getGeminiOutputText(response),
+    };
+  }
+
+  private createGenerateContentInput(
+    input: LlmRequest,
+    generationConfig?: GeminiGenerateContentInput['generationConfig'],
+  ): GeminiGenerateContentInput {
+    return {
+      systemInstruction: {
+        parts: [{ text: input.system }],
+      },
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: input.user }],
+        },
+      ],
+      ...(generationConfig ? { generationConfig } : {}),
+    };
+  }
+
+  private getModelForPurpose(purpose: LlmPurpose): string {
+    return purpose === 'auxiliary'
+      ? this.config.auxiliaryModel
+      : this.config.reactModel;
+  }
+}
+
+export class FallbackLlmProvider implements LlmProvider {
+  readonly name: ProviderName;
+
+  constructor(
+    private readonly primary: LlmProvider,
+    private readonly fallback: LlmProvider,
+  ) {
+    this.name = primary.name;
+  }
+
+  async complete(input: LlmRequest): Promise<LlmResponse> {
+    return this.withFallback(
+      () => this.primary.complete(input),
+      () => this.fallback.complete(input),
+    );
+  }
+
+  async completeStructured(input: StructuredLlmRequest): Promise<LlmResponse> {
+    return this.withFallback(
+      () => this.primary.completeStructured(input),
+      () => this.fallback.completeStructured(input),
+    );
+  }
+
+  private async withFallback(
+    callPrimary: () => Promise<LlmResponse>,
+    callFallback: () => Promise<LlmResponse>,
+  ) {
+    try {
+      return await callPrimary();
+    } catch (primaryError) {
+      try {
+        return await callFallback();
+      } catch (fallbackError) {
+        throw new Error(
+          [
+            `Primary provider "${this.primary.name}" failed and fallback provider "${this.fallback.name}" also failed.`,
+            `Primary error: ${getErrorMessage(primaryError)}`,
+            `Fallback error: ${getErrorMessage(fallbackError)}`,
+          ].join('\n'),
+        );
+      }
+    }
+  }
+}
+
+export function createProvider(
+  name: ProviderName = getDefaultProviderName(),
+  env: NodeJS.ProcessEnv = process.env,
+): LlmProvider {
+  const fallbackName = getFallbackProviderName(env);
+  let primary: LlmProvider;
+
+  try {
+    primary = createSingleProvider(name, env);
+  } catch (error) {
+    if (fallbackName !== null && error instanceof ProviderConfigurationError) {
+      return createSingleProvider(fallbackName, env);
+    }
+
+    throw error;
+  }
+
+  if (fallbackName === null || fallbackName === name) {
+    return primary;
+  }
+
+  return new FallbackLlmProvider(
+    primary,
+    createSingleProvider(fallbackName, env),
+  );
+}
+
+function createSingleProvider(
+  name: ProviderName,
+  env: NodeJS.ProcessEnv,
+): LlmProvider {
   switch (name) {
     case 'stub':
       return new StubLlmProvider('stub');
     case 'openai':
-      return new OpenAiLlmProvider(createOpenAiConfig());
+      return new OpenAiLlmProvider(createOpenAiConfig(env));
     case 'gemini':
-    case 'ollama':
-      throw new ProviderConfigurationError(
-        `Provider "${name}" is not implemented yet. Phase 4 implements the OpenAI provider first.`,
-      );
+      return new GeminiLlmProvider(createGeminiConfig(env));
   }
 }
 
@@ -208,8 +382,9 @@ export function createOpenAiConfig(
     throw new ProviderConfigurationError(
       [
         'OpenAI provider selected but OPENAI_API_KEY is not set.',
-        'Set it in PowerShell with: $env:OPENAI_API_KEY="your_api_key_here"',
-        'For persistent setup, run: setx OPENAI_API_KEY "your_api_key_here" and open a new terminal.',
+        'Add OPENAI_API_KEY to your local .env file, e.g.:',
+        'OPENAI_API_KEY=your_openai_api_key_here',
+        'Alternatively export it in PowerShell with: $env:OPENAI_API_KEY="your_api_key_here"',
       ].join('\n'),
     );
   }
@@ -218,25 +393,117 @@ export function createOpenAiConfig(
     apiKey,
     auxiliaryModel: env.OPENAI_AUX_MODEL?.trim() || DEFAULT_OPENAI_AUX_MODEL,
     reactModel: env.OPENAI_REACT_MODEL?.trim() || DEFAULT_OPENAI_REACT_MODEL,
+    baseURL: env.OPENAI_BASE_URL?.trim() || undefined,
   };
 }
 
+export function createGeminiConfig(
+  env: NodeJS.ProcessEnv = process.env,
+): GeminiProviderConfig {
+  const apiKey = env.GEMINI_API_KEY?.trim() || env.GOOGLE_API_KEY?.trim();
+
+  if (!apiKey) {
+    throw new ProviderConfigurationError(
+      [
+        'Gemini provider selected but GEMINI_API_KEY is not set.',
+        'Add GEMINI_API_KEY to your local .env file, e.g.:',
+        'GEMINI_API_KEY=your_gemini_api_key_here',
+        'Alternatively export it in PowerShell with: $env:GEMINI_API_KEY="your_api_key_here"',
+      ].join('\n'),
+    );
+  }
+
+  return {
+    apiKey,
+    auxiliaryModel: env.GEMINI_AUX_MODEL?.trim() || DEFAULT_GEMINI_AUX_MODEL,
+    reactModel: env.GEMINI_REACT_MODEL?.trim() || DEFAULT_GEMINI_REACT_MODEL,
+    baseUrl: env.GEMINI_BASE_URL?.trim() || DEFAULT_GEMINI_BASE_URL,
+  };
+}
+
+export function getFallbackProviderName(
+  env: NodeJS.ProcessEnv = process.env,
+): ProviderName | null {
+  const configuredProvider = env.INFRA_AGENT_FALLBACK_PROVIDER;
+
+  if (configuredProvider === undefined || configuredProvider.trim() === '') {
+    return null;
+  }
+
+  return parseProviderName(configuredProvider);
+}
+
 function parseProviderName(value: string): ProviderName {
-  if (value === 'stub' || value === 'openai' || value === 'gemini' || value === 'ollama') {
+  if (value === 'stub' || value === 'openai' || value === 'gemini') {
     return value;
   }
 
   throw new ProviderConfigurationError(
-    `Unknown provider "${value}". Supported providers: stub, openai, gemini, ollama.`,
+    `Unknown provider "${value}". Supported providers: stub, openai, gemini.`,
   );
 }
 
 function getOpenAiOutputText(response: { output_text?: string }): string {
-  if (typeof response.output_text === 'string' && response.output_text.trim() !== '') {
+  if (
+    typeof response.output_text === 'string' &&
+    response.output_text.trim() !== ''
+  ) {
     return response.output_text;
   }
 
   throw new Error('OpenAI response did not include output_text.');
+}
+
+class GeminiHttpGenerateContentClient implements GeminiGenerateContentClient {
+  constructor(private readonly config: GeminiProviderConfig) {}
+
+  async generateContent(
+    model: string,
+    input: GeminiGenerateContentInput,
+  ): Promise<GeminiGenerateContentResponse> {
+    const response = await fetch(this.getGenerateContentUrl(model), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': this.config.apiKey,
+      },
+      body: JSON.stringify(input),
+    });
+
+    if (!response.ok) {
+      throw new Error(
+        `Gemini generateContent failed with HTTP ${response.status}: ${truncate(await response.text())}`,
+      );
+    }
+
+    return (await response.json()) as GeminiGenerateContentResponse;
+  }
+
+  private getGenerateContentUrl(model: string): string {
+    return `${this.config.baseUrl.replace(/\/+$/, '')}/models/${encodeURIComponent(model)}:generateContent`;
+  }
+}
+
+function getGeminiOutputText(response: GeminiGenerateContentResponse): string {
+  const text = response.candidates?.[0]?.content?.parts
+    ?.map((part) => part.text)
+    .filter((part): part is string => typeof part === 'string')
+    .join('');
+
+  if (typeof text === 'string' && text.trim() !== '') {
+    return text;
+  }
+
+  throw new Error('Gemini response did not include text output.');
+}
+
+function truncate(value: string, maxLength = 500): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength)}...`;
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 function classifyIntentForStub(prompt: string): IntentClassification {
@@ -266,7 +533,10 @@ function classifyIntentForStub(prompt: string): IntentClassification {
   const hasInfrastructureTerm =
     /\b(create|deploy|docker|container|service|infra|web|app|nginx|node|python|postgres|postgresql|mysql|redis|port|replica|status|drift|destroy)\b/i.test(
       prompt,
-    ) || /(táº¡o|xÃ³a|xoÃ¡|triá»ƒn khai|trang thÃ¡i|háº¡ táº§ng|á»©ng dá»¥ng)/i.test(prompt);
+    ) ||
+    /(táº¡o|xÃ³a|xoÃ¡|triá»ƒn khai|trang thÃ¡i|háº¡ táº§ng|á»©ng dá»¥ng)/i.test(
+      prompt,
+    );
 
   if (!hasInfrastructureTerm) {
     return {
@@ -290,7 +560,11 @@ function parseDraftQueryForStub(rawInput: string): DraftQuery {
   const normalizedPrompt = raw.trim();
   const services = extractServices(raw);
 
-  if (intent === 'create' && services.length === 0 && /(\bweb\b|\bapp\b|á»©ng dá»¥ng)/i.test(raw)) {
+  if (
+    intent === 'create' &&
+    services.length === 0 &&
+    /(\bweb\b|\bapp\b|á»©ng dá»¥ng)/i.test(raw)
+  ) {
     services.push(createDraftService());
   }
 
@@ -310,7 +584,9 @@ function createReActReasoningForStub(): ReActReasoningOutput {
     nextAction: 'continue_planning',
     rationale:
       'Continue with deterministic internal tools for state loading, plan building, validation, and compose preview.',
-    safetyNotes: ['Do not call Docker, MCP, or side-effecting tools during Phase 4 planning.'],
+    safetyNotes: [
+      'Do not call Docker, MCP, or side-effecting tools during Phase 4 planning.',
+    ],
   };
 }
 
@@ -367,7 +643,9 @@ function extractServices(prompt: string): DraftServiceQuery[] {
 
   const explicitImage = /\bimage\s+([A-Za-z0-9_./:-]+)/i.exec(prompt)?.[1];
   const normalizedExplicitImage =
-    explicitImage !== undefined ? normalizeExplicitImageReference(explicitImage) : null;
+    explicitImage !== undefined
+      ? normalizeExplicitImageReference(explicitImage)
+      : null;
   if (
     normalizedExplicitImage !== null &&
     !services.some((service) => service.image === normalizedExplicitImage)
@@ -380,25 +658,38 @@ function extractServices(prompt: string): DraftServiceQuery[] {
     );
   }
 
-  const port = extractNumber(prompt, /\b(?:port|cá»•ng)\s*(?:lÃ |=|:)?\s*(-?\d+)/i);
+  const port = extractNumber(
+    prompt,
+    /\b(?:port|cá»•ng)\s*(?:lÃ |=|:)?\s*(-?\d+)/i,
+  );
   if (port !== null) {
     ensureFirstService(services).port = port;
   }
 
   const replicas =
     extractNumber(prompt, /\bs\S*\s+l\S*ng[^\d-]*(-?\d+)/i) ??
-    extractNumber(prompt, /\b(?:replica|replicas|sá»‘ lÆ°á»£ng|so luong)[^\d-]*(-?\d+)/i) ??
+    extractNumber(
+      prompt,
+      /\b(?:replica|replicas|sá»‘ lÆ°á»£ng|so luong)[^\d-]*(-?\d+)/i,
+    ) ??
     extractNumber(prompt, /(-?\d+)\s*(?:instance|instances|replica|replicas)/i);
   if (replicas !== null) {
-    const targetService = services.find((service) => service.image === 'node') ?? ensureFirstService(services);
+    const targetService =
+      services.find((service) => service.image === 'node') ??
+      ensureFirstService(services);
     targetService.replicas = replicas;
   }
 
   const cpu = extractNumber(prompt, /\b(?:cpu)\s*(?:lÃ |=|:)?\s*(-?\d+)/i);
-  const memoryGb = extractNumber(prompt, /\b(?:ram|memory)\s*(?:lÃ |=|:)?\s*(-?\d+)\s*(?:gb)?/i);
+  const memoryGb = extractNumber(
+    prompt,
+    /\b(?:ram|memory)\s*(?:lÃ |=|:)?\s*(-?\d+)\s*(?:gb)?/i,
+  );
   const requestedMounts = extractRequestedMounts(prompt);
   const privileged = /privileged\s*:?\s*true/i.test(prompt) ? true : null;
-  const networkMode = /(host network|network_mode\s*:?\s*host)/i.test(prompt) ? 'host' : null;
+  const networkMode = /(host network|network_mode\s*:?\s*host)/i.test(prompt)
+    ? 'host'
+    : null;
   const pidMode = /pid\s*:?\s*host/i.test(prompt) ? 'host' : null;
   const ipcMode = /ipc\s*:?\s*host/i.test(prompt) ? 'host' : null;
 
@@ -428,7 +719,9 @@ function extractServices(prompt: string): DraftServiceQuery[] {
   return services;
 }
 
-function createDraftService(overrides: Partial<DraftServiceQuery> = {}): DraftServiceQuery {
+function createDraftService(
+  overrides: Partial<DraftServiceQuery> = {},
+): DraftServiceQuery {
   return {
     name: null,
     image: null,
@@ -503,7 +796,9 @@ function normalizeExplicitImageReference(image: string): string {
 }
 
 function getImageBaseFromReference(image: string): string {
-  return image.split(':')[0]?.split('/').pop()?.toLowerCase() ?? image.toLowerCase();
+  return (
+    image.split(':')[0]?.split('/').pop()?.toLowerCase() ?? image.toLowerCase()
+  );
 }
 
 function isInfrastructureIntent(value: unknown): value is InfrastructureIntent {

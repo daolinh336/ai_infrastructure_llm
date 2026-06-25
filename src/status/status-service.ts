@@ -1,15 +1,18 @@
-import type { InfrastructureStateFile } from '../domain/types.js';
+import type {
+  InfrastructureStateSnapshot,
+  VerifiedRuntimeSnapshot,
+} from '../domain/types.js';
 import {
   loadState,
   StateStoreError,
   type StateStoreOptions,
-} from '../state/file-state-store.js';
+} from '../state/sqlite-state-store.js';
 
 export class StatusService {
   constructor(private readonly stateStore: StateStoreOptions = {}) {}
 
   async showStatus(): Promise<string> {
-    let snapshot: InfrastructureStateFile | null;
+    let snapshot: InfrastructureStateSnapshot | null;
 
     try {
       snapshot = await loadState(this.stateStore);
@@ -34,7 +37,60 @@ export class StatusService {
   }
 }
 
-function formatCurrentState(snapshot: InfrastructureStateFile): string {
+function toContainerName(projectName: string, serviceName: string): string {
+  return projectName + '-' + serviceName.replace(/[_\s]+/g, '-');
+}
+
+function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string[] {
+  const desired = current.desired;
+  const containers = current.actual.containers;
+  const nameWidth = Math.max(...desired.services.map((service) => service.name.length), '(extra)'.length);
+  const lines: string[] = [];
+  const matched = new Set<string>();
+
+  for (const service of desired.services) {
+    const expected = toContainerName(desired.projectName, service.name);
+    const container =
+      containers.find((entry) => entry.name === expected) ??
+      containers.find((entry) => entry.name.includes(service.name)) ??
+      null;
+    if (container) matched.add(container.name);
+    const label = service.name.padEnd(nameWidth);
+
+    if (!container) {
+      lines.push(
+        `  - ${label} | MISSING | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | status: absent (DRIFT)`,
+      );
+      continue;
+    }
+
+    const imageOk =
+      container.image == null ||
+      container.image.startsWith(service.image) ||
+      service.image.startsWith(container.image);
+    const desiredPorts = (service.ports ?? []).join(', ') || 'none';
+    const actualPorts = (container.ports ?? []).join(', ') || 'none';
+    const portsOk = (service.ports ?? []).every((port) =>
+      (container.ports ?? []).some((actualPort) => actualPort.includes(port.split(':')[0] ?? '')),
+    );
+    const status = container.status ?? 'unknown';
+    lines.push(
+      `  - ${label} | image: ${service.image} ${imageOk ? '==' : '!='} ${container.image ?? 'unknown'} ${imageOk ? '(ok)' : '(DRIFT)'} | ports: ${desiredPorts} ${portsOk ? '==' : '!='} ${actualPorts} ${portsOk ? '(ok)' : '(DRIFT)'} | status: ${status}`,
+    );
+  }
+
+  for (const container of containers) {
+    if (matched.has(container.name)) continue;
+    const label = '(extra)'.padEnd(nameWidth);
+    lines.push(
+      `  - ${label} | EXTRA   | container: ${container.name} | image: ${container.image ?? 'unknown'} | status: ${container.status ?? 'unknown'}`,
+    );
+  }
+
+  return lines;
+}
+
+function formatCurrentState(snapshot: InfrastructureStateSnapshot): string {
   if (!snapshot.current) {
     return [
       'Current verified state: none',
@@ -55,10 +111,19 @@ function formatCurrentState(snapshot: InfrastructureStateFile): string {
     `Actual runtime source: ${current.actual.source}`,
     `Observed containers: ${observedContainers || 'none'}`,
     `Last observed: ${current.actual.lastObservedAt ?? 'never'}`,
+    `Verification status: ${current.verificationReport?.status ?? current.verification.status}`,
+    `Observed networks: ${current.actual.networks.map((n) => n.name).join(', ') || 'none'}`,
+    `Observed volumes: ${current.actual.volumes.map((v) => v.name).join(', ') || 'none'}`,
+    `Observed images: ${current.actual.images.map((i) => i.reference).join(', ') || 'none'}`,
+    `Drift status: ${current.driftReport?.status ?? 'not checked'}`,
+    `Operation: ${current.operation ?? 'deploy'}`,
+    '',
+    'Desired vs actual comparison:',
+    ...formatDesiredActualComparison(current),
   ].join('\n');
 }
 
-function formatPendingPreview(snapshot: InfrastructureStateFile): string {
+function formatPendingPreview(snapshot: InfrastructureStateSnapshot): string {
   if (!snapshot.pendingPreview) {
     return 'Pending preview: none';
   }

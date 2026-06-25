@@ -1,4 +1,4 @@
-export type ProviderName = 'stub' | 'openai' | 'gemini' | 'ollama';
+export type ProviderName = 'stub' | 'openai' | 'gemini';
 
 export type LlmPurpose = 'auxiliary' | 'react';
 
@@ -194,8 +194,8 @@ export interface DetailedDryRunPreview {
   artifactTargetPath: string;
   artifactWritten: false;
   stateSaved: false;
-  dockerCalled: false;
-  mcpCalled: false;
+  dockerCalled: boolean;
+  mcpCalled: boolean;
   composePreviewLineCount: number;
   totalServices: number;
   totalContainers: number;
@@ -205,6 +205,188 @@ export interface DetailedDryRunPreview {
   schedule: DependencyAwareExecutionSchedule;
   policyFindings: DryRunPolicyFinding[];
   actionsNotPerformed: string[];
+}
+
+export type ActionRisk =
+  | 'read-only'
+  | 'state-write'
+  | 'artifact-write'
+  | 'runtime-create'
+  | 'runtime-destroy';
+
+export interface ActionClassification {
+  capability: 'compose-artifact-write';
+  risk: ActionRisk;
+  summary: string;
+  requiresApproval: boolean;
+  mutatesRuntime: boolean;
+  writesArtifact: boolean;
+  writesState: boolean;
+  callsDocker: boolean;
+  callsMcp: boolean;
+}
+
+export interface VerificationReport {
+  status: 'passed' | 'failed' | 'uncertain';
+  scope: 'meta-preflight' | 'tool-runtime';
+  checkedAt: string;
+  issues: string[];
+  evidence: string[];
+  errorReason: string | null;
+  revisionHint: string | null;
+  confidence: number;
+}
+
+export interface PreflightReport {
+  status: 'passed' | 'failed';
+  checkedAt: string;
+  issues: string[];
+  evidence: string[];
+  policyFindings: DryRunPolicyFinding[];
+  verificationReport: VerificationReport;
+}
+
+export interface ApprovalRequest {
+  id: string;
+  requestedAt: string;
+  action: 'write-compose-artifact';
+  request: RequestMetadata;
+  planSummary: string;
+  classification: ActionClassification;
+  artifactTargetPath: string;
+  composePreviewSha256: string;
+  totalContainers: number;
+  policyFindings: DryRunPolicyFinding[];
+  preflight: PreflightReport;
+}
+
+export interface ApprovalResult {
+  id: string;
+  requestId: string;
+  decision: 'approved' | 'rejected';
+  respondedAt: string;
+  approvedBy: 'cli-user';
+  reason: string | null;
+}
+
+export interface ApprovalMarker {
+  type: 'phase8-human-approval';
+  approvalId: string;
+  approvedAt: string;
+  approvedBy: 'cli-user';
+}
+
+export interface ApprovedAction {
+  id: string;
+  action: 'write-compose-artifact';
+  request: RequestMetadata;
+  classification: ActionClassification;
+  approval: ApprovalResult;
+  approvalMarker: ApprovalMarker;
+  validatedSpec: InfrastructureSpec;
+  composeArtifact: ComposeArtifactRecord;
+  dependencySchedule: DependencyAwareExecutionSchedule;
+  preflight: PreflightReport;
+  policyFindings: DryRunPolicyFinding[];
+  dockerCalled: boolean;
+  mcpCalled: boolean;
+  runtimeMutation: boolean;
+}
+
+export interface ContainerCreateSpec {
+  name: string;
+  image: string;
+  ports: string[] | undefined;
+  environment: Record<string, string> | undefined;
+  volumes: string[] | undefined;
+  networks: string[] | undefined;
+}
+
+export interface DockerDeployResult {
+  networksCreated: string[];
+  imagesPulled: string[];
+  containersStarted: Array<{ name: string; id: string }>;
+  startedAt: string;
+}
+
+export interface RuntimeResourceRefs {
+  projectName: string;
+  containers: string[];
+  networks: string[];
+  volumes: string[];
+  images: string[];
+}
+
+export type DriftSeverity = 'minor' | 'major' | 'risky' | 'unknown';
+
+export type DriftFindingKind =
+  | 'missing-container'
+  | 'stopped-container'
+  | 'image-mismatch'
+  | 'port-mismatch'
+  | 'missing-network'
+  | 'missing-volume'
+  | 'missing-image'
+  | 'extra-project-resource'
+  | 'uncertain-runtime-evidence';
+
+export interface DriftFinding {
+  kind: DriftFindingKind;
+  severity: DriftSeverity;
+  resourceType: 'container' | 'network' | 'volume' | 'image' | 'runtime';
+  resourceName: string;
+  message: string;
+  expected: string | null;
+  actual: string | null;
+  autoRepairable: boolean;
+}
+
+export interface DriftReport {
+  status: 'none' | 'drifted' | 'uncertain';
+  checkedAt: string;
+  projectName: string;
+  findings: DriftFinding[];
+  summary: string;
+}
+
+export interface RepairAction {
+  kind: 'start-container' | 'recreate-container' | 'pull-image' | 'create-network' | 'create-volume';
+  resourceName: string;
+  risk: 'safe' | 'approval-required';
+  reason: string;
+}
+
+export interface RepairPlan {
+  projectName: string;
+  findings: DriftFinding[];
+  actions: RepairAction[];
+  requiresApproval: boolean;
+  autoRepairable: boolean;
+}
+
+export interface RepairReport {
+  status: 'applied' | 'rejected' | 'failed' | 'partial';
+  actionsAttempted: RepairAction[];
+  actionsSucceeded: RepairAction[];
+  actionsFailed: Array<{ action: RepairAction; error: string }>;
+}
+
+export interface CleanupReport {
+  trigger: 'deploy-failed' | 'repair-failed';
+  attempted: string[];
+  succeeded: string[];
+  failed: Array<{ resource: string; error: string }>;
+  leftovers: string[];
+}
+
+export class DockerMutationSafetyError extends Error {
+  readonly toolName: string;
+
+  constructor(toolName: string, message?: string) {
+    super(message ?? `Docker MCP mutation '${toolName}' requires allowMutations=true`);
+    this.name = 'DockerMutationSafetyError';
+    this.toolName = toolName;
+  }
 }
 
 export interface AgentObservation {
@@ -238,12 +420,36 @@ export interface AgentTool {
   invoke(input: unknown): Promise<AgentToolResult>;
 }
 
+export interface GuardToolCallCount {
+  tool: string;
+  count: number;
+  capped: boolean;
+}
+
+export interface GuardDeltaEntry {
+  iteration: number;
+  hasDelta: boolean;
+  specHash: string;
+  issueCount: number;
+  stepHash: string;
+}
+
+export interface GuardTelemetry {
+  iterations: number;
+  outcome: 'converged' | 'blocked';
+  blockReason: string | null;
+  perToolCounts: GuardToolCallCount[];
+  deltaHistory: GuardDeltaEntry[];
+  logFilePath: string | null;
+}
+
 export interface PlannedAgentRunResult {
   status: 'planned';
   request: RequestMetadata;
   plan: ExecutionPlan;
   observations: AgentObservation[];
   trace?: ReActStep[];
+  guardTelemetry?: GuardTelemetry;
 }
 
 export interface ClarificationAgentRunResult {
@@ -251,9 +457,22 @@ export interface ClarificationAgentRunResult {
   clarificationQuestion: string;
   observations: AgentObservation[];
   trace?: ReActStep[];
+  guardTelemetry?: GuardTelemetry;
 }
 
-export type AgentRunResult = PlannedAgentRunResult | ClarificationAgentRunResult;
+export interface BlockedAgentRunResult {
+  status: 'blocked';
+  blockReason: string;
+  iterations: number;
+  guardTelemetry: GuardTelemetry;
+  observations: AgentObservation[];
+  trace?: ReActStep[];
+}
+
+export type AgentRunResult =
+  | PlannedAgentRunResult
+  | ClarificationAgentRunResult
+  | BlockedAgentRunResult;
 
 export type RuntimeObservationSource =
   | 'not-observed'
@@ -318,6 +537,8 @@ export interface PendingPreviewState {
   verification: VerificationState;
   createdAt: string;
   acceptedAt: string | null;
+  approval?: ApprovalResult | null;
+  approvedAction?: ApprovedAction | null;
 }
 
 export interface VerifiedRuntimeSnapshot {
@@ -327,6 +548,13 @@ export interface VerifiedRuntimeSnapshot {
   composeArtifact: ComposeArtifactRecord;
   actual: RuntimeActualState;
   verification: VerificationState;
+  verificationReport?: VerificationReport;
+  driftReport?: DriftReport | null;
+  repairReport?: RepairReport | null;
+  cleanupReport?: CleanupReport | null;
+  resourceRefs?: RuntimeResourceRefs;
+  observedAt?: string;
+  operation?: 'deploy' | 'repair' | 'destroy' | 'sync';
   approvedAt: string | null;
   appliedAt: string | null;
   savedAt: string;
@@ -336,15 +564,20 @@ export interface StateOperationRecord {
   id: string;
   type:
     | 'pending-preview-saved'
+    | 'approval-rejected'
+    | 'approved-action-created'
+    | 'compose-artifact-written'
     | 'verified-runtime-saved'
-    | 'legacy-state-migrated';
+    | 'legacy-state-migrated'
+    | 'repair-rejected'
+    | 'drift-observed';
   projectName: string;
   request: RequestMetadata | null;
   summary: string;
   createdAt: string;
 }
 
-export interface InfrastructureStateFile {
+export interface InfrastructureStateSnapshot {
   schemaVersion: 1;
   current: VerifiedRuntimeSnapshot | null;
   pendingPreview: PendingPreviewState | null;
@@ -360,3 +593,16 @@ export interface LegacyStateSnapshot {
   desiredStateSavedAt?: string | null;
   lastAppliedAt: string | null;
 }
+
+export interface TopologyIssue {
+  severity: 'error' | 'warning';
+  message: string;
+  affectedServices: string[];
+  suggestion: string;
+}
+
+export interface TopologyValidationResult {
+  valid: boolean;
+  issues: TopologyIssue[];
+}
+

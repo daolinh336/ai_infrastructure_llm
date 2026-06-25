@@ -3,31 +3,36 @@ import type { JsonSchema } from './types.js';
 const infrastructureIntentValues = ['create', 'update', 'status', 'destroy', 'drift'];
 
 const nullableStringSchema = {
-  anyOf: [{ type: 'string', minLength: 1 }, { type: 'null' }],
+  type: 'string',
+  nullable: true,
 };
 
 const nullableIntegerSchema = {
-  anyOf: [{ type: 'integer' }, { type: 'null' }],
+  type: 'integer',
+  nullable: true,
 };
 
 const nullableNumberSchema = {
-  anyOf: [{ type: 'number' }, { type: 'null' }],
+  type: 'number',
+  nullable: true,
 };
 
 const nullableBooleanSchema = {
-  anyOf: [{ type: 'boolean' }, { type: 'null' }],
+  type: 'boolean',
+  nullable: true,
 };
 
 export const intentClassificationJsonSchema = {
   type: 'object',
-  additionalProperties: false,
   properties: {
     scope: {
       type: 'string',
       enum: ['infrastructure', 'out-of-scope', 'unsafe'],
     },
     intent: {
-      anyOf: [{ type: 'string', enum: infrastructureIntentValues }, { type: 'null' }],
+      type: 'string',
+      enum: infrastructureIntentValues,
+      nullable: true,
     },
     reason: {
       type: 'string',
@@ -39,7 +44,6 @@ export const intentClassificationJsonSchema = {
 
 export const draftQueryJsonSchema = {
   type: 'object',
-  additionalProperties: false,
   properties: {
     raw: {
       type: 'string',
@@ -57,7 +61,6 @@ export const draftQueryJsonSchema = {
       type: 'array',
       items: {
         type: 'object',
-        additionalProperties: false,
         properties: {
           name: nullableStringSchema,
           image: nullableStringSchema,
@@ -109,7 +112,6 @@ export const draftQueryJsonSchema = {
 
 export const reactReasoningOutputJsonSchema = {
   type: 'object',
-  additionalProperties: false,
   properties: {
     summary: {
       type: 'string',

@@ -1,0 +1,23 @@
+services:
+  nginx:
+    image: nginx:stable
+    restart: unless-stopped
+    ports:
+      - 80:80
+    environment: {}
+    depends_on:
+      - api
+    networks: &a1
+      - app-network
+  api:
+    image: node:20-alpine
+    restart: unless-stopped
+    environment: {}
+    command:
+      - tail
+      - -f
+      - /dev/null
+    networks: *a1
+networks:
+  app-network: {}
+volumes: {}

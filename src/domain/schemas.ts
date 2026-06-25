@@ -1,16 +1,26 @@
 import { z } from 'zod';
 import type {
   AgentRunResult,
+  ActionClassification,
+  ApprovalRequest,
+  ApprovalResult,
+  ApprovedAction,
   DependencyAwareExecutionSchedule,
   DetailedDryRunPreview,
   DraftQuery,
   ExecutionPlan,
-  InfrastructureStateFile,
+  InfrastructureStateSnapshot,
   InfrastructureSpec,
   IntentClassification,
   LegacyStateSnapshot,
+  PreflightReport,
   ReActReasoningOutput,
+  TopologyIssue,
+  TopologyValidationResult,
   ValidatedQuery,
+  VerificationReport,
+  ContainerCreateSpec,
+  DockerDeployResult,
 } from './types.js';
 import {
   SUPPORTED_IMAGE_BASES,
@@ -124,7 +134,7 @@ export const requestMetadataSchema = z
 export const cliInputSchema = z.object({
   prompt: z.string().min(1, 'Prompt must not be empty.'),
   dryRun: z.boolean().default(false),
-  provider: z.enum(['stub', 'openai', 'gemini', 'ollama']).default('stub'),
+  provider: z.enum(['stub', 'openai', 'gemini']).default('stub'),
 });
 
 export const reactReasoningOutputSchema = z
@@ -149,6 +159,70 @@ export const infrastructureServiceSchema = z
   })
   .strict();
 
+export function validateTopologyGraph(spec: {
+  services: Array<{
+    kind: 'reverse-proxy' | 'backend' | 'database';
+    name: string;
+  }>;
+}): TopologyValidationResult {
+  const issues: TopologyIssue[] = [];
+
+  const services = spec.services;
+  const databaseNames = services
+    .filter((s) => s.kind === 'database')
+    .map((s) => s.name);
+  const backendNames = services
+    .filter((s) => s.kind === 'backend')
+    .map((s) => s.name);
+  const proxyNames = services
+    .filter((s) => s.kind === 'reverse-proxy')
+    .map((s) => s.name);
+
+  // 1. Reverse-proxy defined but no backend app service exists to route traffic.
+  if (proxyNames.length > 0 && backendNames.length === 0 && services.length > 1) {
+    if (databaseNames.length > 0) {
+      issues.push({
+        severity: 'error',
+        message: 'Incomplete topology: Reverse proxy and database are defined, but no backend app service exists to route traffic.',
+        affectedServices: [...proxyNames, ...databaseNames],
+        suggestion: 'Add a backend service to connect the proxy to the database, or remove one of the layers.',
+      });
+    } else {
+      issues.push({
+        severity: 'error',
+        message: 'Incomplete topology: Reverse proxy is defined, but no backend app service exists to handle the traffic.',
+        affectedServices: [...proxyNames],
+        suggestion: 'Add a backend service that the reverse proxy can route traffic to.',
+      });
+    }
+  }
+
+  // 2. Backend service is defined without a database.
+  if (backendNames.length > 0 && databaseNames.length === 0) {
+    issues.push({
+      severity: 'warning',
+      message: 'Stateless backend: Backend service is defined without a database. Ensure this is intended and the backend is stateless.',
+      affectedServices: [...backendNames],
+      suggestion: 'If the backend requires persistent storage, add a database service (e.g., postgres, mysql, redis).',
+    });
+  }
+
+  // 3. Backend and database are defined, but no reverse proxy is configured.
+  if (backendNames.length > 0 && databaseNames.length > 0 && proxyNames.length === 0) {
+    issues.push({
+      severity: 'warning',
+      message: 'No entry point: Backend and database are defined, but no reverse proxy is configured. Services will not be externally accessible via a proxy.',
+      affectedServices: [...backendNames],
+      suggestion: 'Add a reverse-proxy service (e.g., nginx) to route external traffic to your backend.',
+    });
+  }
+
+  return {
+    valid: !issues.some((issue) => issue.severity === 'error'),
+    issues,
+  };
+}
+
 export const infrastructureSpecSchema = z
   .object({
     projectName: identifierSchema,
@@ -161,6 +235,17 @@ export const infrastructureSpecSchema = z
     addDuplicateIssues(spec.services.map((service) => service.name), ['services'], context);
     addDuplicateIssues(spec.networks, ['networks'], context);
     addDuplicateIssues(spec.volumes, ['volumes'], context);
+
+    const topologyResult = validateTopologyGraph(spec);
+    topologyResult.issues.forEach((issue) => {
+      if (issue.severity === 'error') {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['services'],
+          message: `${issue.message} Suggestion: ${issue.suggestion}`,
+        });
+      }
+    });
 
     const serviceNames = new Set(spec.services.map((service) => service.name));
     const volumeNames = new Set(spec.volumes);
@@ -333,8 +418,8 @@ export const detailedDryRunPreviewSchema = z
     artifactTargetPath: z.string().min(1),
     artifactWritten: z.literal(false),
     stateSaved: z.literal(false),
-    dockerCalled: z.literal(false),
-    mcpCalled: z.literal(false),
+    dockerCalled: z.boolean(),
+    mcpCalled: z.boolean(),
     composePreviewLineCount: z.number().int().min(0),
     totalServices: z.number().int().min(1),
     totalContainers: z.number().int().min(1),
@@ -346,97 +431,6 @@ export const detailedDryRunPreviewSchema = z
     actionsNotPerformed: z.array(z.string().min(1)),
   })
   .strict();
-
-export const agentObservationSchema = z
-  .object({
-    source: z.string().min(1, 'Observation source must not be empty.'),
-    message: z.string().min(1, 'Observation message must not be empty.'),
-  })
-  .strict();
-
-export const reactStepSchema = z
-  .object({
-    id: identifierSchema,
-    phase: z.enum(['reason', 'act', 'observe']),
-    message: z.string().min(1, 'ReAct step message must not be empty.'),
-    toolName: z.string().min(1).nullable(),
-  })
-  .strict();
-
-export const plannedAgentRunResultSchema = z
-  .object({
-    status: z.literal('planned'),
-    request: requestMetadataSchema,
-    plan: executionPlanSchema,
-    observations: z.array(agentObservationSchema).min(1, 'At least one observation is required.'),
-    trace: z.array(reactStepSchema).min(1).optional(),
-  })
-  .strict();
-
-export const clarificationAgentRunResultSchema = z
-  .object({
-    status: z.literal('clarification'),
-    clarificationQuestion: z.string().min(1, 'Clarification question must not be empty.'),
-    observations: z.array(agentObservationSchema).min(1, 'At least one observation is required.'),
-    trace: z.array(reactStepSchema).min(1).optional(),
-  })
-  .strict();
-
-export const agentRunResultSchema = z.discriminatedUnion('status', [
-  plannedAgentRunResultSchema,
-  clarificationAgentRunResultSchema,
-]);
-
-const runtimeObservationSourceSchema = z.enum([
-  'not-observed',
-  'mcp-readonly',
-  'runtime-adapter',
-  'legacy-placeholder',
-]);
-
-export const runtimeContainerObservationSchema = z
-  .object({
-    name: identifierSchema,
-    image: z.string().min(1).nullable(),
-    status: z.string().min(1).nullable(),
-    ports: z.array(z.string().min(1)),
-  })
-  .strict();
-
-export const runtimeNamedResourceObservationSchema = z
-  .object({
-    name: identifierSchema,
-    status: z.string().min(1).nullable(),
-  })
-  .strict();
-
-export const runtimeImageObservationSchema = z
-  .object({
-    reference: z.string().min(1),
-    id: z.string().min(1).nullable(),
-    status: z.string().min(1).nullable(),
-  })
-  .strict();
-
-export const runtimeActualStateSchema = z
-  .object({
-    source: runtimeObservationSourceSchema,
-    containers: z.array(runtimeContainerObservationSchema),
-    networks: z.array(runtimeNamedResourceObservationSchema),
-    volumes: z.array(runtimeNamedResourceObservationSchema),
-    images: z.array(runtimeImageObservationSchema),
-    lastObservedAt: timestampSchema.nullable(),
-  })
-  .strict()
-  .superRefine((actual, context) => {
-    if (actual.source === 'not-observed' && actual.lastObservedAt !== null) {
-      context.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['lastObservedAt'],
-        message: 'Actual runtime state cannot have lastObservedAt when source is not-observed.',
-      });
-    }
-  });
 
 export const composeArtifactRecordSchema = z
   .object({
@@ -468,6 +462,465 @@ export const composeArtifactRecordSchema = z
     }
   });
 
+export const actionClassificationSchema = z
+  .object({
+    capability: z.literal('compose-artifact-write'),
+    risk: z.literal('artifact-write'),
+    summary: z.string().min(1),
+    requiresApproval: z.literal(true),
+    mutatesRuntime: z.boolean(),
+    writesArtifact: z.literal(true),
+    writesState: z.literal(true),
+    callsDocker: z.boolean(),
+    callsMcp: z.boolean(),
+  })
+  .strict();
+
+export const verificationReportSchema = z
+  .object({
+    status: z.enum(['passed', 'failed', 'uncertain']),
+    scope: z.enum(['meta-preflight', 'tool-runtime']),
+    checkedAt: timestampSchema,
+    issues: z.array(z.string().min(1)),
+    evidence: z.array(z.string().min(1)),
+    errorReason: z.string().min(1).nullable(),
+    revisionHint: z.string().min(1).nullable(),
+    confidence: z.number().min(0).max(1),
+  })
+  .strict()
+  .superRefine((report, context) => {
+    if (report.status === 'passed' && report.issues.length > 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['issues'],
+        message: 'Passed verification reports must not contain issues.',
+      });
+    }
+
+    if (report.status !== 'passed' && report.issues.length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['issues'],
+        message: 'Failed or uncertain verification reports require at least one issue.',
+      });
+    }
+  });
+
+export const preflightReportSchema = z
+  .object({
+    status: z.enum(['passed', 'failed']),
+    checkedAt: timestampSchema,
+    issues: z.array(z.string().min(1)),
+    evidence: z.array(z.string().min(1)),
+    policyFindings: z.array(dryRunPolicyFindingSchema),
+    verificationReport: verificationReportSchema,
+  })
+  .strict()
+  .superRefine((report, context) => {
+    if (report.status === 'passed' && report.issues.length > 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['issues'],
+        message: 'Passed preflight reports must not contain issues.',
+      });
+    }
+
+    if (report.status === 'passed' && report.evidence.length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['evidence'],
+        message: 'Passed preflight reports require evidence.',
+      });
+    }
+
+    if (report.status === 'passed' && report.policyFindings.length === 0) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['policyFindings'],
+        message: 'Passed preflight reports require policy evidence.',
+      });
+    }
+
+    if (report.status === 'passed' && report.verificationReport.status !== 'passed') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['verificationReport', 'status'],
+        message: 'Passed preflight reports require passed meta verification.',
+      });
+    }
+
+    if (report.verificationReport.scope !== 'meta-preflight') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['verificationReport', 'scope'],
+        message: 'Phase 8 preflight uses only meta-preflight verification.',
+      });
+    }
+  });
+
+export const approvalRequestSchema = z
+  .object({
+    id: z.string().min(1),
+    requestedAt: timestampSchema,
+    action: z.literal('write-compose-artifact'),
+    request: requestMetadataSchema,
+    planSummary: z.string().min(1),
+    classification: actionClassificationSchema,
+    artifactTargetPath: z.string().min(1),
+    composePreviewSha256: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/, 'Compose preview hash must be a SHA-256 hex digest.'),
+    totalContainers: z.number().int().min(1),
+    policyFindings: z.array(dryRunPolicyFindingSchema).min(1),
+    preflight: preflightReportSchema,
+  })
+  .strict()
+  .superRefine((request, context) => {
+    if (request.preflight.status !== 'passed') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['preflight', 'status'],
+        message: 'Approval requests require a passed preflight report.',
+      });
+    }
+  });
+
+export const approvalResultSchema = z
+  .object({
+    id: z.string().min(1),
+    requestId: z.string().min(1),
+    decision: z.enum(['approved', 'rejected']),
+    respondedAt: timestampSchema,
+    approvedBy: z.literal('cli-user'),
+    reason: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export const approvalMarkerSchema = z
+  .object({
+    type: z.literal('phase8-human-approval'),
+    approvalId: z.string().min(1),
+    approvedAt: timestampSchema,
+    approvedBy: z.literal('cli-user'),
+  })
+  .strict();
+
+export const approvedActionSchema = z
+  .object({
+    id: z.string().min(1),
+    action: z.literal('write-compose-artifact'),
+    request: requestMetadataSchema,
+    classification: actionClassificationSchema,
+    approval: approvalResultSchema,
+    approvalMarker: approvalMarkerSchema,
+    validatedSpec: infrastructureSpecSchema,
+    composeArtifact: composeArtifactRecordSchema,
+    dependencySchedule: dependencyAwareExecutionScheduleSchema,
+    preflight: preflightReportSchema,
+    policyFindings: z.array(dryRunPolicyFindingSchema).min(1),
+    dockerCalled: z.boolean(),
+    mcpCalled: z.boolean(),
+    runtimeMutation: z.boolean(),
+  })
+  .strict()
+  .superRefine((action, context) => {
+    if (action.approval.decision !== 'approved') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['approval', 'decision'],
+        message: 'ApprovedAction requires an approved approval result.',
+      });
+    }
+
+    if (action.approvalMarker.approvalId !== action.approval.id) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['approvalMarker', 'approvalId'],
+        message: 'Approval marker must reference the approval result.',
+      });
+    }
+
+    if (action.approvalMarker.approvedAt !== action.approval.respondedAt) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['approvalMarker', 'approvedAt'],
+        message: 'Approval marker timestamp must match approval result timestamp.',
+      });
+    }
+
+    if (action.preflight.status !== 'passed') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['preflight', 'status'],
+        message: 'ApprovedAction requires passed preflight.',
+      });
+    }
+
+    if (!action.composeArtifact.written) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['composeArtifact', 'written'],
+        message: 'ApprovedAction requires a written compose artifact record.',
+      });
+    }
+
+    if (action.composeArtifact.writtenAt !== action.approvalMarker.approvedAt) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['composeArtifact', 'writtenAt'],
+        message: 'Compose artifact writtenAt must match the approval marker timestamp.',
+      });
+    }
+
+    if (action.dependencySchedule.projectName !== action.validatedSpec.projectName) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['dependencySchedule', 'projectName'],
+        message: 'ApprovedAction schedule must belong to the validated spec project.',
+      });
+    }
+  });
+
+export const containerCreateSpecSchema = z
+  .object({
+    name: identifierSchema,
+    image: z.string().min(1),
+    ports: z.array(portMappingSchema).optional(),
+    environment: z.record(environmentKeySchema, z.string()).optional(),
+    volumes: z.array(volumeMountSchema).optional(),
+    networks: z.array(identifierSchema).optional(),
+  })
+  .strict();
+
+export const dockerDeployResultSchema = z
+  .object({
+    networksCreated: z.array(z.string().min(1)),
+    imagesPulled: z.array(z.string().min(1)),
+    containersStarted: z.array(
+      z.object({
+        name: z.string().min(1),
+        id: z.string().min(1),
+      }).strict(),
+    ),
+    startedAt: timestampSchema,
+  })
+  .strict();
+
+export const agentObservationSchema = z
+  .object({
+    source: z.string().min(1, 'Observation source must not be empty.'),
+    message: z.string().min(1, 'Observation message must not be empty.'),
+  })
+  .strict();
+
+export const reactStepSchema = z
+  .object({
+    id: identifierSchema,
+    phase: z.enum(['reason', 'act', 'observe']),
+    message: z.string().min(1, 'ReAct step message must not be empty.'),
+    toolName: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export const guardToolCallCountSchema = z
+  .object({
+    tool: z.string().min(1),
+    count: z.number().int().nonnegative(),
+    capped: z.boolean(),
+  })
+  .strict();
+
+export const guardDeltaEntrySchema = z
+  .object({
+    iteration: z.number().int().nonnegative(),
+    hasDelta: z.boolean(),
+    specHash: z.string(),
+    issueCount: z.number().int().nonnegative(),
+    stepHash: z.string(),
+  })
+  .strict();
+
+export const guardTelemetrySchema = z
+  .object({
+    iterations: z.number().int().nonnegative(),
+    outcome: z.enum(['converged', 'blocked']),
+    blockReason: z.string().nullable(),
+    perToolCounts: z.array(guardToolCallCountSchema),
+    deltaHistory: z.array(guardDeltaEntrySchema),
+    logFilePath: z.string().nullable(),
+  })
+  .strict();
+
+export const plannedAgentRunResultSchema = z
+  .object({
+    status: z.literal('planned'),
+    request: requestMetadataSchema,
+    plan: executionPlanSchema,
+    observations: z.array(agentObservationSchema).min(1, 'At least one observation is required.'),
+    trace: z.array(reactStepSchema).min(1).optional(),
+    guardTelemetry: guardTelemetrySchema.optional(),
+  })
+  .strict();
+
+export const clarificationAgentRunResultSchema = z
+  .object({
+    status: z.literal('clarification'),
+    clarificationQuestion: z.string().min(1, 'Clarification question must not be empty.'),
+    observations: z.array(agentObservationSchema).min(1, 'At least one observation is required.'),
+    trace: z.array(reactStepSchema).min(1).optional(),
+    guardTelemetry: guardTelemetrySchema.optional(),
+  })
+  .strict();
+
+export const blockedAgentRunResultSchema = z
+  .object({
+    status: z.literal('blocked'),
+    blockReason: z.string().min(1, 'Block reason must not be empty.'),
+    iterations: z.number().int().nonnegative(),
+    guardTelemetry: guardTelemetrySchema,
+    observations: z.array(agentObservationSchema),
+    trace: z.array(reactStepSchema).min(1).optional(),
+  })
+  .strict();
+
+export const agentRunResultSchema = z.discriminatedUnion('status', [
+  plannedAgentRunResultSchema,
+  clarificationAgentRunResultSchema,
+  blockedAgentRunResultSchema,
+]);
+
+const runtimeObservationSourceSchema = z.enum([
+  'not-observed',
+  'mcp-readonly',
+  'runtime-adapter',
+  'legacy-placeholder',
+]);
+
+export const runtimeContainerObservationSchema = z
+  .object({
+    name: identifierSchema,
+    image: z.string().min(1).nullable(),
+    status: z.string().min(1).nullable(),
+    ports: z.array(z.string().min(1)),
+  })
+  .strict();
+
+export const runtimeNamedResourceObservationSchema = z
+  .object({
+    name: identifierSchema,
+    status: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export const runtimeResourceRefsSchema = z
+  .object({
+    projectName: identifierSchema,
+    containers: z.array(identifierSchema),
+    networks: z.array(identifierSchema),
+    volumes: z.array(identifierSchema),
+    images: z.array(z.string().min(1)),
+  })
+  .strict();
+
+export const driftFindingSchema = z
+  .object({
+    kind: z.enum([
+      'missing-container',
+      'stopped-container',
+      'image-mismatch',
+      'port-mismatch',
+      'missing-network',
+      'missing-volume',
+      'missing-image',
+      'extra-project-resource',
+      'uncertain-runtime-evidence',
+    ]),
+    severity: z.enum(['minor', 'major', 'risky', 'unknown']),
+    resourceType: z.enum(['container', 'network', 'volume', 'image', 'runtime']),
+    resourceName: z.string().min(1),
+    message: z.string().min(1),
+    expected: z.string().nullable(),
+    actual: z.string().nullable(),
+    autoRepairable: z.boolean(),
+  })
+  .strict();
+
+export const driftReportSchema = z
+  .object({
+    status: z.enum(['none', 'drifted', 'uncertain']),
+    checkedAt: timestampSchema,
+    projectName: identifierSchema,
+    findings: z.array(driftFindingSchema),
+    summary: z.string().min(1),
+  })
+  .strict();
+
+export const repairActionSchema = z
+  .object({
+    kind: z.enum(['start-container', 'recreate-container', 'pull-image', 'create-network', 'create-volume']),
+    resourceName: z.string().min(1),
+    risk: z.enum(['safe', 'approval-required']),
+    reason: z.string().min(1),
+  })
+  .strict();
+
+export const repairPlanSchema = z
+  .object({
+    projectName: identifierSchema,
+    findings: z.array(driftFindingSchema),
+    actions: z.array(repairActionSchema),
+    requiresApproval: z.boolean(),
+    autoRepairable: z.boolean(),
+  })
+  .strict();
+
+export const repairReportSchema = z
+  .object({
+    status: z.enum(['applied', 'rejected', 'failed', 'partial']),
+    actionsAttempted: z.array(repairActionSchema),
+    actionsSucceeded: z.array(repairActionSchema),
+    actionsFailed: z.array(z.object({ action: repairActionSchema, error: z.string().min(1) }).strict()),
+  })
+  .strict();
+
+export const cleanupReportSchema = z
+  .object({
+    trigger: z.enum(['deploy-failed', 'repair-failed']),
+    attempted: z.array(z.string().min(1)),
+    succeeded: z.array(z.string().min(1)),
+    failed: z.array(z.object({ resource: z.string().min(1), error: z.string().min(1) }).strict()),
+    leftovers: z.array(z.string().min(1)),
+  })
+  .strict();
+
+export const runtimeImageObservationSchema = z
+  .object({
+    reference: z.string().min(1),
+    id: z.string().min(1).nullable(),
+    status: z.string().min(1).nullable(),
+  })
+  .strict();
+
+export const runtimeActualStateSchema = z
+  .object({
+    source: runtimeObservationSourceSchema,
+    containers: z.array(runtimeContainerObservationSchema),
+    networks: z.array(runtimeNamedResourceObservationSchema),
+    volumes: z.array(runtimeNamedResourceObservationSchema),
+    images: z.array(runtimeImageObservationSchema),
+    lastObservedAt: timestampSchema.nullable(),
+  })
+  .strict()
+  .superRefine((actual, context) => {
+    if (actual.source === 'not-observed' && actual.lastObservedAt !== null) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['lastObservedAt'],
+        message: 'Actual runtime state cannot have lastObservedAt when source is not-observed.',
+      });
+    }
+  });
+
 export const verificationStateSchema = z
   .object({
     status: z.enum(['not-run', 'passed', 'failed', 'uncertain']),
@@ -492,6 +945,8 @@ export const pendingPreviewStateSchema = z
     verification: verificationStateSchema,
     createdAt: timestampSchema,
     acceptedAt: timestampSchema.nullable(),
+    approval: approvalResultSchema.nullable().optional(),
+    approvedAction: approvedActionSchema.nullable().optional(),
   })
   .strict();
 
@@ -503,6 +958,13 @@ export const verifiedRuntimeSnapshotSchema = z
     composeArtifact: composeArtifactRecordSchema,
     actual: runtimeActualStateSchema,
     verification: verificationStateSchema,
+    verificationReport: verificationReportSchema.optional(),
+    resourceRefs: runtimeResourceRefsSchema.optional(),
+    driftReport: driftReportSchema.nullable().optional(),
+    repairReport: repairReportSchema.nullable().optional(),
+    cleanupReport: cleanupReportSchema.nullable().optional(),
+    observedAt: timestampSchema.nullable().optional(),
+    operation: z.enum(['deploy', 'repair', 'destroy', 'sync']).optional(),
     approvedAt: timestampSchema.nullable(),
     appliedAt: timestampSchema.nullable(),
     savedAt: timestampSchema,
@@ -514,8 +976,13 @@ export const stateOperationRecordSchema = z
     id: z.string().min(1),
     type: z.enum([
       'pending-preview-saved',
+      'approval-rejected',
+      'approved-action-created',
+      'compose-artifact-written',
       'verified-runtime-saved',
       'legacy-state-migrated',
+        'repair-rejected',
+        'drift-observed',
     ]),
     projectName: identifierSchema,
     request: requestMetadataSchema.nullable(),
@@ -524,7 +991,7 @@ export const stateOperationRecordSchema = z
   })
   .strict();
 
-export const infrastructureStateFileSchema = z
+export const infrastructureStateSnapshotSchema = z
   .object({
     schemaVersion: z.literal(1),
     current: verifiedRuntimeSnapshotSchema.nullable(),
@@ -609,16 +1076,79 @@ export function validateDetailedDryRunPreview(value: unknown): DetailedDryRunPre
   ) as DetailedDryRunPreview;
 }
 
+export function validateActionClassification(value: unknown): ActionClassification {
+  return parseWithSchema(
+    actionClassificationSchema,
+    value,
+    'action classification',
+  ) as ActionClassification;
+}
+
+export function validateVerificationReport(value: unknown): VerificationReport {
+  return parseWithSchema(
+    verificationReportSchema,
+    value,
+    'verification report',
+  ) as VerificationReport;
+}
+
+export function validatePreflightReport(value: unknown): PreflightReport {
+  return parseWithSchema(
+    preflightReportSchema,
+    value,
+    'preflight report',
+  ) as PreflightReport;
+}
+
+export function validateApprovalRequest(value: unknown): ApprovalRequest {
+  return parseWithSchema(
+    approvalRequestSchema,
+    value,
+    'approval request',
+  ) as ApprovalRequest;
+}
+
+export function validateApprovalResult(value: unknown): ApprovalResult {
+  return parseWithSchema(
+    approvalResultSchema,
+    value,
+    'approval result',
+  ) as ApprovalResult;
+}
+
+export function validateApprovedAction(value: unknown): ApprovedAction {
+  return parseWithSchema(
+    approvedActionSchema,
+    value,
+    'approved action',
+  ) as ApprovedAction;
+}
+
+export function validateContainerCreateSpec(value: unknown): ContainerCreateSpec {
+  return parseWithSchema(
+    containerCreateSpecSchema,
+    value,
+    'container create spec',
+  ) as ContainerCreateSpec;
+}
+
+export function validateDockerDeployResult(value: unknown): DockerDeployResult {
+  return parseWithSchema(
+    dockerDeployResultSchema,
+    value,
+    'Docker deploy result',
+  ) as DockerDeployResult;
+}
 export function validateAgentRunResult(value: unknown): AgentRunResult {
   return parseWithSchema(agentRunResultSchema, value, 'agent run result') as AgentRunResult;
 }
 
-export function validateInfrastructureStateFile(value: unknown): InfrastructureStateFile {
+export function validateInfrastructureStateSnapshot(value: unknown): InfrastructureStateSnapshot {
   return parseWithSchema(
-    infrastructureStateFileSchema,
+    infrastructureStateSnapshotSchema,
     value,
-    'infrastructure state file',
-  ) as InfrastructureStateFile;
+    'infrastructure state snapshot',
+  ) as InfrastructureStateSnapshot;
 }
 
 export function validateLegacyStateSnapshot(value: unknown): LegacyStateSnapshot {

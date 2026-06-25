@@ -6,9 +6,9 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 This repository is being developed into a natural-language infrastructure management CLI. The current stack is:
 - **Node.js + TypeScript** for the application runtime and CLI
-- **Provider-agnostic LLM integration** behind an adapter interface (intended to support OpenAI, Gemini, and Ollama)
+- **Provider-agnostic LLM integration** behind an adapter interface (intended to support OpenAI and Gemini)
 - **Docker Compose generation** as the first infrastructure output target
-- **File-based state storage** in `state/infra-state.json` for desired vs actual state tracking
+- **SQLite state storage** in `state/infra-state.sqlite` via `better-sqlite3` for desired vs actual state tracking. Domain objects are still validated with Zod and serialized as JSON payloads inside SQLite.
 
 Reference and legacy files still present in the repo:
 - `ReAct.pdf` — reference paper describing the ReAct paradigm (interleaving reasoning and acting in language models)
@@ -54,7 +54,7 @@ The codebase is organized around a small agent pipeline for infrastructure autom
 - `src/domain/` — shared domain types and input schemas for infrastructure specs, execution plans, and CLI validation.
 - `src/compose/` — generation of Docker Compose YAML from the internal infrastructure spec.
 - `src/execution/` — execution engine that handles dry-run/apply flows and will later own deployment sequencing and dependency-aware execution.
-- `src/state/` — persistence of desired/actual state snapshots for status and drift detection.
+- `src/state/` — SQLite persistence of desired/actual state snapshots for status and drift detection.
 - `src/status/` — read-model style status reporting over saved infrastructure state.
 - `tests/` — unit tests, currently focused on deterministic generators such as Compose rendering.
 
@@ -67,8 +67,8 @@ As the project grows toward MCP integration and direct Docker runtime control, p
 Current control flow is:
 1. CLI receives a natural-language infrastructure request
 2. ReAct agent produces an execution plan and structured infrastructure spec
-3. execution engine renders Compose YAML and optionally persists desired state
-4. status/state services expose saved snapshots for later inspection and drift workflows
+3. execution engine renders Compose YAML and can persist pending preview memory into SQLite
+4. status/state services expose SQLite-backed snapshots for later inspection and drift workflows
 
 Near-term delivery should stay phased:
 - **Baseline scaffold** — planning, compose rendering, state persistence, and dry-run behavior
@@ -118,7 +118,7 @@ If an MCP server is introduced, it should behave like a guarded capability layer
 
 ## Implementation notes for future Codex instances
 
-- Keep the **provider abstraction** clean. If adding OpenAI/Gemini/Ollama support, isolate request/response formatting in `src/llm/`.
+- Keep the **provider abstraction** clean. If adding OpenAI/Gemini support, isolate request/response formatting in `src/llm/`.
 - Preserve the distinction between **desired state** and **actual state**. Drift detection should compare the saved spec against observed container/runtime information rather than only checking whether files exist.
 - Keep **dry-run** as a first-class path through the execution engine, not a last-minute flag.
 - Treat Docker deployment as an execution concern (`src/execution/` or dedicated tool modules), not as CLI glue code.

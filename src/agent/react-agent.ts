@@ -1,8 +1,9 @@
+import { randomBytes } from 'node:crypto';
 import {
   validateDependencyAwareExecutionSchedule,
   validateDetailedDryRunPreview,
   validateExecutionPlan,
-  validateInfrastructureStateFile,
+  validateInfrastructureStateSnapshot,
   validateInfrastructureSpec,
   validateReactReasoningOutput,
   validateValidatedQuery,
@@ -25,7 +26,7 @@ import type {
   DetailedDryRunPreview,
   DraftServiceQuery,
   ExecutionPlan,
-  InfrastructureStateFile,
+  InfrastructureStateSnapshot,
   InfrastructureService,
   InfrastructureSpec,
   PlanStep,
@@ -33,6 +34,8 @@ import type {
   ReActStep,
   ReActReasoningOutput,
   ValidatedQuery,
+  VerificationReport,
+  GuardTelemetry,
 } from '../domain/types.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import type { LlmProvider } from '../llm/provider.js';
@@ -40,11 +43,25 @@ import {
   loadState,
   saveState,
   type StateStoreOptions,
-} from '../state/file-state-store.js';
+} from '../state/sqlite-state-store.js';
 import {
   buildDependencyAwareExecutionSchedule,
   buildDetailedDryRunPreview,
 } from '../execution/dependency-schedule.js';
+import type { PlannerAgent, VerifierAgent } from './agent-interfaces.js';
+import { StandardPlannerAgent } from './standard-planner-agent.js';
+import { StandardVerifierAgent } from './standard-verifier-agent.js';
+import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
+import {
+  ReActLoopGuard,
+  ReActLoopGuardError,
+  loadLoopGuardConfig,
+  createLoopLogSink,
+  hashSpec,
+  countValidationIssues,
+  type LoopGuardConfig,
+  type LoopLogSink,
+} from './loop-guard.js';
 
 const DEPLOY_DETAILS_CLARIFICATION_QUESTION = [
   'Can ban noi ro hon truoc khi lap plan.',
@@ -154,14 +171,29 @@ function buildExecutionSteps(): PlanStep[] {
   ];
 }
 
+export interface ReActAgentLoopOptions {
+  config?: LoopGuardConfig;
+  logSink?: LoopLogSink;
+  logEnabled?: boolean;
+}
+
 export class ReActAgent {
   private readonly tools: AgentTool[];
+  private readonly loopGuardConfig: LoopGuardConfig;
+  private readonly loopOptions: ReActAgentLoopOptions;
+  private guard: ReActLoopGuard | null = null;
 
   constructor(
     private readonly provider: LlmProvider,
     private readonly reportProgress: ProgressReporter = noopProgress,
     private readonly stateStore: StateStoreOptions = {},
+    private readonly planner: PlannerAgent = new StandardPlannerAgent(provider),
+    private readonly verifier: VerifierAgent = new StandardVerifierAgent(),
+    private readonly dockerMcpClient?: DockerMcpGateway,
+    loopOptions: ReActAgentLoopOptions = {},
   ) {
+    this.loopGuardConfig = loopOptions.config ?? loadLoopGuardConfig();
+    this.loopOptions = loopOptions;
     this.tools = [
       createLoadStateTool(this.stateStore),
       createResolveImageReferenceTool(),
@@ -182,6 +214,10 @@ export class ReActAgent {
       name: tool.name,
       description: tool.description,
     }));
+  }
+
+  async verifyAfterApply(plan: ExecutionPlan, mcpClient: DockerMcpGateway): Promise<VerificationReport> {
+    return this.verifier.verify(plan.spec, mcpClient);
   }
 
   async run(query: ValidatedQuery): Promise<AgentRunResult> {
@@ -261,6 +297,17 @@ export class ReActAgent {
     );
     const draftProposal = draftProposalResult.data as DraftSpecProposal;
 
+    try {
+    // --- Bounded self-repair loop (Sprint C.1) with ReActLoopGuard (Sprint D) ---
+    // propose -> validate -> (repair -> re-validate)* until the spec passes or the
+    // guard stops the loop. The guard is created per run() and shared with runTool()
+    // so the per-tool cap counts every tool call.
+    this.guard = new ReActLoopGuard(
+      this.loopGuardConfig,
+      this.loopOptions.logSink ?? createLoopLogSink({ enabled: this.loopOptions.logEnabled ?? true }),
+    );
+    this.guard.beginRun();
+
     let specValidationResult = await this.runTool(
       'validate_infra_spec',
       draftProposal.spec,
@@ -270,7 +317,15 @@ export class ReActAgent {
     );
 
     let proposal = draftProposal;
-    if (!specValidationResult.ok) {
+    let repairAssumptions = 0;
+
+    while (!specValidationResult.ok) {
+      this.guard.tickIteration();
+
+      const validateStepHash = this.guard.observeStep(
+        `validate:${hashSpec(proposal.spec)}`,
+      );
+
       recordStep(
         trace,
         observations,
@@ -286,7 +341,7 @@ export class ReActAgent {
       const repairResult = await this.runTool(
         'repair_infra_spec',
         {
-          spec: draftProposal.spec,
+          spec: proposal.spec,
           rawPrompt: validatedQuery.raw,
           validationIssue: specValidationResult.observation,
         } satisfies SpecRepairInput,
@@ -308,20 +363,35 @@ export class ReActAgent {
           this.reportProgress,
         );
 
+        const telemetry = this.guard.converge();
         return {
           status: 'clarification',
           clarificationQuestion:
             'Draft spec validation failed and the agent could not repair it automatically. Please restate the desired services, dependencies, and volume layout in more concrete terms.',
           observations,
           trace,
+          guardTelemetry: telemetry,
         };
       }
 
+      const repairedSpec = repairResult.data as InfrastructureSpec;
+      const previousIssueCount = countValidationIssues(specValidationResult.observation);
+      const specChanged = hashSpec(repairedSpec) !== hashSpec(proposal.spec);
+      this.guard.recordProgress(
+        specChanged,
+        hashSpec(repairedSpec),
+        previousIssueCount,
+        validateStepHash,
+      );
+
+      repairAssumptions += 1;
       proposal = {
-        spec: repairResult.data as InfrastructureSpec,
+        spec: repairedSpec,
         assumptions: [
-          ...draftProposal.assumptions,
-          'Draft spec required automatic repair before validation could pass.',
+          ...proposal.assumptions,
+          repairAssumptions === 1
+            ? 'Draft spec required automatic repair before validation could pass.'
+            : `Draft spec required ${repairAssumptions} automatic repair attempts before validation could pass.`,
         ],
       };
 
@@ -334,29 +404,8 @@ export class ReActAgent {
       );
     }
 
-    if (!specValidationResult.ok) {
-      recordStep(
-        trace,
-        observations,
-        {
-          phase: 'observe',
-          message:
-            'Draft spec validation still failed after repair, so ask the user for clarification.',
-          toolName: 'ask_user',
-        },
-        this.reportProgress,
-      );
-
-      return {
-        status: 'clarification',
-        clarificationQuestion:
-          'The generated infrastructure spec is still invalid after repair. Please confirm the service names, dependencies, and volume declarations.',
-        observations,
-        trace,
-      };
-    }
-
     const validatedSpec = specValidationResult.data as InfrastructureSpec;
+    const guardTelemetry: GuardTelemetry = this.guard.converge();
 
     recordStep(
       trace,
@@ -482,8 +531,25 @@ export class ReActAgent {
       plan,
       observations,
       trace,
+      guardTelemetry,
     };
+  } catch (error) {
+    if (error instanceof ReActLoopGuardError) {
+      return {
+        status: 'blocked',
+        blockReason: error.blockReason,
+        iterations: error.iterations,
+        guardTelemetry: error.telemetry,
+        observations,
+        trace,
+      };
+    }
+    throw error;
+  } finally {
+    this.guard?.close();
+    this.guard = null;
   }
+}
 
   private async observeStructuredReasoning(
     query: ValidatedQuery,
@@ -630,6 +696,8 @@ export class ReActAgent {
     if (!tool) {
       throw new Error(`Unknown agent tool: ${toolName}`);
     }
+
+    this.guard?.checkToolCap(toolName);
 
     recordStep(trace, observations, {
       phase: 'act',
@@ -953,7 +1021,7 @@ function createSaveStateTool(stateStore: StateStoreOptions): AgentTool {
       'Persist a validated desired-state snapshot after the approval/execution phase allows state writes.',
     async invoke(input: unknown): Promise<AgentToolResult> {
       try {
-        const snapshot = validateInfrastructureStateFile(input);
+        const snapshot = validateInfrastructureStateSnapshot(input);
         await saveState(snapshot, stateStore);
 
         return {
@@ -972,7 +1040,7 @@ function createSaveStateTool(stateStore: StateStoreOptions): AgentTool {
   };
 }
 
-function formatStateMemoryObservation(snapshot: InfrastructureStateFile): string {
+function formatStateMemoryObservation(snapshot: InfrastructureStateSnapshot): string {
   const currentText = snapshot.current
     ? `current verified project "${snapshot.current.desired.projectName}" with actual source "${snapshot.current.actual.source}"`
     : 'no verified current runtime state';
@@ -1407,6 +1475,10 @@ function getDefaultImage(image: string): string {
   return DEFAULT_IMAGE_BY_BASE.get(imageBase) ?? image;
 }
 
+function generateDefaultSecret(): string {
+  return 'pw-' + randomBytes(8).toString('hex');
+}
+
 function getDefaultEnvironment(
   imageBase: string,
 ): { environment: Record<string, string> } | Record<string, never> {
@@ -1415,7 +1487,7 @@ function getDefaultEnvironment(
       environment: {
         POSTGRES_DB: 'app',
         POSTGRES_USER: 'app',
-        POSTGRES_PASSWORD: 'app',
+        POSTGRES_PASSWORD: generateDefaultSecret(),
       },
     };
   }
@@ -1427,14 +1499,14 @@ function getDefaultEnvironment(
           ? {
               MYSQL_DATABASE: 'app',
               MYSQL_USER: 'app',
-              MYSQL_PASSWORD: 'app',
-              MYSQL_ROOT_PASSWORD: 'app',
+              MYSQL_PASSWORD: generateDefaultSecret(),
+              MYSQL_ROOT_PASSWORD: generateDefaultSecret(),
             }
           : {
               MARIADB_DATABASE: 'app',
               MARIADB_USER: 'app',
-              MARIADB_PASSWORD: 'app',
-              MARIADB_ROOT_PASSWORD: 'app',
+              MARIADB_PASSWORD: generateDefaultSecret(),
+              MARIADB_ROOT_PASSWORD: generateDefaultSecret(),
             }),
       },
     };
@@ -1444,7 +1516,7 @@ function getDefaultEnvironment(
     return {
       environment: {
         MONGO_INITDB_ROOT_USERNAME: 'app',
-        MONGO_INITDB_ROOT_PASSWORD: 'app',
+        MONGO_INITDB_ROOT_PASSWORD: generateDefaultSecret(),
       },
     };
   }
@@ -1453,7 +1525,7 @@ function getDefaultEnvironment(
     return {
       environment: {
         RABBITMQ_DEFAULT_USER: 'app',
-        RABBITMQ_DEFAULT_PASS: 'app',
+        RABBITMQ_DEFAULT_PASS: generateDefaultSecret(),
       },
     };
   }
@@ -1485,7 +1557,7 @@ function getDefaultEnvironment(
     return {
       environment: {
         KEYCLOAK_ADMIN: 'admin',
-        KEYCLOAK_ADMIN_PASSWORD: 'admin',
+        KEYCLOAK_ADMIN_PASSWORD: generateDefaultSecret(),
       },
     };
   }
