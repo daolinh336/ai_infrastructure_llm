@@ -1,12 +1,10 @@
 import type {
-  DriftFinding,
   DriftReport,
   RepairAction,
   RepairPlan,
 } from '../domain/types.js';
 
 function action(
-  finding: DriftFinding,
   kind: RepairAction['kind'],
   risk: RepairAction['risk'],
   resourceName: string,
@@ -21,23 +19,26 @@ export function buildRepairPlan(report: DriftReport): RepairPlan {
   for (const finding of report.findings) {
     switch (finding.kind) {
       case 'stopped-container':
-        actions.push(action(finding, 'start-container', 'safe', finding.resourceName, finding.message));
+        actions.push(action('start-container', 'safe', finding.resourceName, finding.message));
+        break;
+      case 'running-container':
+        actions.push(action('stop-container', 'approval-required', finding.resourceName, finding.message));
         break;
       case 'missing-container':
-        actions.push(action(finding, 'recreate-container', 'approval-required', finding.resourceName, finding.message));
+        actions.push(action('recreate-container', 'approval-required', finding.resourceName, finding.message));
         break;
       case 'missing-image':
-        actions.push(action(finding, 'pull-image', 'safe', finding.resourceName, finding.message));
+        actions.push(action('pull-image', 'safe', finding.resourceName, finding.message));
         break;
       case 'missing-network':
-        actions.push(action(finding, 'create-network', 'safe', finding.resourceName, finding.message));
+        actions.push(action('create-network', 'safe', finding.resourceName, finding.message));
         break;
       case 'missing-volume':
-        actions.push(action(finding, 'create-volume', 'approval-required', finding.resourceName, finding.message));
+        actions.push(action('create-volume', 'approval-required', finding.resourceName, finding.message));
         break;
       case 'image-mismatch':
       case 'port-mismatch':
-        actions.push(action(finding, 'recreate-container', 'approval-required', finding.resourceName, finding.message));
+        actions.push(action('recreate-container', 'approval-required', finding.resourceName, finding.message));
         break;
       default:
         break;

@@ -3,6 +3,8 @@ import type {
   InfrastructureStateSnapshot,
   ValidatedQuery,
   VerificationReport,
+  PlannerRevisionRequest,
+  PlannerRevisionResult,
 } from '../domain/types.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 
@@ -18,6 +20,10 @@ export interface PlannerAgent {
     issues: string[],
     dockerMcpClient?: DockerMcpGateway,
   ): Promise<InfrastructureSpec>;
+
+  reviseFromFeedback(
+    request: PlannerRevisionRequest,
+  ): Promise<PlannerRevisionResult>;
 }
 
 export interface VerifierAgent {

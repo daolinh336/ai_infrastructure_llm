@@ -9,11 +9,14 @@
  * The public API surface is identical to the original DockerMcpClient so all
  * consumers can migrate by changing only their import.
  */
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { McpConnectionPlug, type McpConnectionPlugOptions, type McpToolDefinition } from './mcp-connection-plug.js';
 import { McpRoutingTable, DOCKER_MCP_ROUTES, type McpRouteDefinition } from './mcp-routing-table.js';
 import {
   parseContainerList,
   parseInspectResult,
+  hasInspectTool,
   parseImageList,
   parseNamedResourceList,
   extractContainerIdFromRunResult,
@@ -24,6 +27,9 @@ import type {
   RuntimeNamedResourceObservation,
 } from '../domain/types.js';
 import { DockerMutationSafetyError, type ContainerCreateSpec } from '../domain/types.js';
+import { evaluateToolPolicy } from './tool-policy.js';
+
+const execFileAsync = promisify(execFile);
 
 // --- Options ---
 
@@ -111,8 +117,45 @@ export class DockerMcpGateway {
   }
 
   async inspectContainer(containerName: string): Promise<RuntimeContainerObservation | null> {
-    const result = await this.executeRoute('inspectContainer', { container: containerName });
-    return parseInspectResult(result, containerName);
+    if (!(await this.supportsInspect())) {
+      return inspectContainerWithDockerCli(containerName);
+    }
+    try {
+      const result = await this.executeRoute('inspectContainer', { container_id: containerName });
+      return parseInspectResult(result, containerName);
+    } catch (error) {
+      console.warn(
+        'MCP inspect_container failed for "' + containerName + '": ' + inspectErrorMessage(error) + '. Falling back to Docker CLI inspect.',
+      );
+      return inspectContainerWithDockerCli(containerName);
+    }
+  }
+
+  async readContainerLogs(containerName: string, tailLines = 80): Promise<string | null> {
+    return readContainerLogsWithDockerCli(containerName, tailLines);
+  }
+
+  async listUsedHostPorts(): Promise<Array<{ hostPort: string; containerName: string }>> {
+    const containers = await this.listContainers(true);
+    return containers.flatMap((container) =>
+      (container.ports ?? [])
+        .map((port) => port.split(':')[0]?.trim() ?? '')
+        .filter((hostPort) => /^\d+$/.test(hostPort))
+        .map((hostPort) => ({ hostPort, containerName: container.name })),
+    );
+  }
+
+  /**
+   * Whether the connected MCP server exposes an inspect-capable tool.
+   * Returns false until the server has been queried via listServerTools().
+   */
+  async supportsInspect(): Promise<boolean> {
+    try {
+      const tools = await this.listServerTools();
+      return hasInspectTool(tools);
+    } catch {
+      return false;
+    }
   }
 
   async listImages(): Promise<RuntimeImageObservation[]> {
@@ -141,10 +184,12 @@ export class DockerMcpGateway {
       image: spec.image,
       name: spec.name,
     };
+    if (spec.command && spec.command.length > 0) args.command = spec.command.join(' ');
     if (spec.ports && spec.ports.length > 0) args.ports = mapPortBindings(spec.ports);
     if (spec.environment) args.environment = spec.environment;
     if (spec.volumes && spec.volumes.length > 0) args.volumes = spec.volumes;
     if (spec.networks && spec.networks.length > 0) args.network = spec.networks[0];
+    if (spec.labels && Object.keys(spec.labels).length > 0) args.labels = spec.labels;
     const result = await this.executeRoute('createContainer', args);
     return extractContainerIdFromRunResult(result, spec.name);
   }
@@ -169,16 +214,20 @@ export class DockerMcpGateway {
     await this.executeRoute('removeImage', { image: ref });
   }
 
-  async createNetwork(name: string): Promise<void> {
-    await this.executeRoute('createNetwork', { name });
+  async createNetwork(name: string, labels?: Record<string, string>): Promise<void> {
+    const args: Record<string, unknown> = { name };
+    if (labels && Object.keys(labels).length > 0) args.labels = labels;
+    await this.executeRoute('createNetwork', args);
   }
 
   async removeNetwork(name: string): Promise<void> {
     await this.executeRoute('removeNetwork', { network_id: name });
   }
 
-  async createVolume(name: string): Promise<void> {
-    await this.executeRoute('createVolume', { name });
+  async createVolume(name: string, labels?: Record<string, string>): Promise<void> {
+    const args: Record<string, unknown> = { name };
+    if (labels && Object.keys(labels).length > 0) args.labels = labels;
+    await this.executeRoute('createVolume', args);
   }
 
   async observeActualState(): Promise<import('../domain/types.js').RuntimeActualState> {
@@ -198,6 +247,56 @@ export class DockerMcpGateway {
     };
   }
 
+  /**
+   * Observe actual runtime state, enriching each container with detailed
+   * inspect data (image, status, ports, environment) when the MCP server
+   * exposes an inspect tool.
+   *
+   * When inspect is unavailable, containers fall back to list-only data.
+   * In that case environment remains undefined, which lets drift detection
+   * mark runtime evidence as uncertain instead of reporting a false OK.
+   */
+  async observeActualStateWithInspect(
+    options: { containerNames?: string[] } = {},
+  ): Promise<import('../domain/types.js').RuntimeActualState> {
+    const [containers, networks, volumes, images] = await Promise.all([
+      this.listContainers(true),
+      this.listNetworks(),
+      this.listVolumes(),
+      this.listImages(),
+    ]);
+
+    let enrichedContainers = containers;
+
+    const candidateNames = (options.containerNames?.length ? options.containerNames : containers.map((c) => c.name));
+    const inspected = await Promise.all(
+      candidateNames.map(async (name) => {
+        try {
+          return await this.inspectContainer(name);
+        } catch (error) {
+          console.warn(
+            'Container inspect failed for "' + name + '": ' + inspectErrorMessage(error) + '. Keeping list-only observation.',
+          );
+          return null;
+        }
+      }),
+    );
+    const inspectedMap = new Map(inspected.filter((c): c is RuntimeContainerObservation => c !== null).map((c) => [c.name, c]));
+    enrichedContainers = containers.map((container) => {
+      const inspectedContainer = inspectedMap.get(container.name);
+      return inspectedContainer ?? container;
+    });
+
+    return {
+      source: 'mcp-readonly',
+      containers: enrichedContainers,
+      networks,
+      volumes,
+      images,
+      lastObservedAt: new Date().toISOString(),
+    };
+  }
+
   async removeVolume(name: string): Promise<void> {
     await this.executeRoute('removeVolume', { volume_name: name, force: true });
   }
@@ -210,12 +309,20 @@ export class DockerMcpGateway {
     }
     const route = this.routes.resolve(operation);
 
-    if (route.category === 'mutate' && !this.allowMutationsInternal) {
+    const policy = evaluateToolPolicy(route.destructive ? 'destructive' : route.category, {
+      dryRun: !this.allowMutationsInternal,
+      approved: this.allowMutationsInternal,
+    });
+    if (!policy.allowed) {
       throw new DockerMutationSafetyError(route.mcpToolName);
     }
 
     return this.plug.callTool(route.mcpToolName, args);
   }
+}
+
+function inspectErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 
@@ -235,4 +342,36 @@ function mapPortBindings(ports: string[]): Record<string, number> {
     bindings[container + '/tcp'] = Number(host);
   }
   return bindings;
+}
+
+async function inspectContainerWithDockerCli(
+  containerName: string,
+): Promise<RuntimeContainerObservation | null> {
+  try {
+    const { stdout } = await execFileAsync('docker', ['inspect', containerName], {
+      windowsHide: true,
+      timeout: 15_000,
+    });
+    return parseInspectResult(stdout, containerName);
+  } catch {
+    return null;
+  }
+}
+
+async function readContainerLogsWithDockerCli(
+  containerName: string,
+  tailLines: number,
+): Promise<string | null> {
+  try {
+    const safeTail = String(Math.max(1, Math.min(500, Math.trunc(tailLines))));
+    const { stdout, stderr } = await execFileAsync('docker', ['logs', '--tail', safeTail, containerName], {
+      windowsHide: true,
+      timeout: 15_000,
+      maxBuffer: 128 * 1024,
+    });
+    const combined = [stdout, stderr].filter((part) => part.trim().length > 0).join('\n');
+    return combined.length > 4_000 ? combined.slice(-4_000) : combined;
+  } catch {
+    return null;
+  }
 }

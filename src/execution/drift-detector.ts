@@ -14,6 +14,26 @@ function toContainerName(projectName: string, serviceName: string): string {
 function imageBase(image: string): string {
   return (image.split(':')[0] ?? '').split('/').pop() ?? image.toLowerCase();
 }
+function stripProjectPrefix(name: string, projectName: string): string {
+  const prefix = projectName + '-';
+  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+}
+
+function stripComposeReplicaSuffix(name: string): string {
+  return name.replace(/[-_][1-9][0-9]*$/, '');
+}
+
+function normalizeObservedResourceName(name: string, projectName: string): string {
+  return stripComposeReplicaSuffix(stripProjectPrefix(name, projectName));
+}
+
+function isRunningStatus(status: string | null): boolean {
+  return status === 'running';
+}
+
+function desiredServiceStatus(service: InfrastructureSpec['services'][number]): 'running' | 'stopped' {
+  return service.desiredStatus ?? 'running';
+}
 
 function finding(
   kind: DriftFinding['kind'],
@@ -58,7 +78,25 @@ export function buildDriftReport(
     }
 
     const container = matches[0] as RuntimeContainerObservation;
-    if (container.status !== null && container.status !== 'running') {
+    const desiredStatus = desiredServiceStatus(service);
+    const actualIsRunning = isRunningStatus(container.status);
+
+    if (container.environment === undefined) {
+      findings.push(
+        finding(
+          'uncertain-runtime-evidence',
+          'unknown',
+          'runtime',
+          container.name,
+          'Container "' + container.name + '" was observed via list only; inspect data is unavailable, so environment drift cannot be verified.',
+          null,
+          null,
+          false,
+        ),
+      );
+    }
+
+    if (desiredStatus === 'running' && container.status !== null && !actualIsRunning) {
       findings.push(
         finding(
           'stopped-container',
@@ -68,6 +106,21 @@ export function buildDriftReport(
           'Container "' + container.name + '" is not running (status: ' + container.status + ').',
           'running',
           container.status,
+          true,
+        ),
+      );
+    }
+
+    if (desiredStatus === 'stopped' && actualIsRunning) {
+      findings.push(
+        finding(
+          'running-container',
+          'minor',
+          'container',
+          container.name,
+          'Container "' + container.name + '" is running but desired lifecycle is stopped.',
+          'stopped',
+          'running',
           true,
         ),
       );
@@ -88,7 +141,7 @@ export function buildDriftReport(
       );
     }
 
-    if (service.ports && service.ports.length > 0) {
+    if (desiredStatus === 'running' && service.ports && service.ports.length > 0 && actualIsRunning) {
       const actualPorts = container.ports ?? [];
       const missingPorts = service.ports.filter(
         (port) => !actualPorts.some((actualPort) => actualPort.includes(port.split(':')[0] ?? '')),
@@ -108,10 +161,42 @@ export function buildDriftReport(
         );
       }
     }
+
+    if (service.environment && Object.keys(service.environment).length > 0 && container.environment) {
+      for (const [key, value] of Object.entries(service.environment)) {
+        if (!(key in container.environment)) {
+          findings.push(
+            finding(
+              'env-mismatch',
+              'major',
+              'container',
+              container.name,
+              'Container "' + container.name + '" missing environment variable "' + key + '".',
+              key + '=' + value,
+              null,
+              true,
+            ),
+          );
+        } else if (container.environment[key] !== value) {
+          findings.push(
+            finding(
+              'env-mismatch',
+              'risky',
+              'container',
+              container.name,
+              'Container "' + container.name + '" environment variable "' + key + '" has a different value.',
+              key + '=' + value,
+              key + '=' + container.environment[key],
+              true,
+            ),
+          );
+        }
+      }
+    }
   }
 
   for (const network of desired.networks) {
-    if (!actual.networks.some((entry) => entry.name === network)) {
+    if (!actual.networks.some((entry) => normalizeObservedResourceName(entry.name, desired.projectName) === network)) {
       findings.push(
         finding(
           'missing-network',
@@ -130,7 +215,7 @@ export function buildDriftReport(
   for (const service of desired.services) {
     for (const volume of service.volumes ?? []) {
       const volumeName = volume.split(':')[0] ?? '';
-      if (volumeName && !actual.volumes.some((entry) => entry.name === volumeName)) {
+      if (volumeName && !actual.volumes.some((entry) => normalizeObservedResourceName(entry.name, desired.projectName) === volumeName)) {
         findings.push(
           finding(
             'missing-volume',
@@ -165,7 +250,13 @@ export function buildDriftReport(
   }
 
   const status: DriftReport['status'] =
-    findings.length === 0 ? 'none' : findings.some((entry) => entry.severity === 'unknown') ? 'uncertain' : 'drifted';
+    findings.length === 0
+      ? 'none'
+      : findings.some((entry) => entry.kind === 'uncertain-runtime-evidence')
+        ? 'uncertain'
+        : findings.some((entry) => entry.severity === 'unknown')
+          ? 'uncertain'
+          : 'drifted';
   const summary =
     findings.length === 0
       ? 'No drift detected: desired spec matches observed runtime.'
@@ -179,3 +270,4 @@ export function buildDriftReport(
     summary,
   };
 }
+

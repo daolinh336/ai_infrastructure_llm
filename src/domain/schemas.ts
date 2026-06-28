@@ -12,7 +12,6 @@ import type {
   InfrastructureStateSnapshot,
   InfrastructureSpec,
   IntentClassification,
-  LegacyStateSnapshot,
   PreflightReport,
   ReActReasoningOutput,
   TopologyIssue,
@@ -21,12 +20,13 @@ import type {
   VerificationReport,
   ContainerCreateSpec,
   DockerDeployResult,
+  PlannerRevisionRequest,
+  ClarificationAnswer,
+  PlanningClarificationContext,
+  PlanningUncertainty,
+  UserFeedback,
+  RevisionObservation,
 } from './types.js';
-import {
-  SUPPORTED_IMAGE_BASES,
-  isSupportedImageReference,
-} from './supported-images.js';
-
 const identifierSchema = z
   .string()
   .min(1, 'Must not be empty.')
@@ -146,11 +146,61 @@ export const reactReasoningOutputSchema = z
   })
   .strict();
 
+export const clarificationChoiceSchema = z
+  .object({
+    id: z.string().min(1),
+    label: z.string().min(1),
+    description: z.string().min(1),
+    value: z.string().min(1),
+  })
+  .strict();
+
+export const planningUncertaintySchema = z
+  .object({
+    id: z.string().min(1),
+    severity: z.enum(['info', 'warning', 'blocking']),
+    field: z.enum(['services[].dependsOn', 'services[].ports', 'services[].image', 'services[].volumes', 'topology']),
+    message: z.string().min(1),
+    reason: z.string().min(1),
+    affectedServices: z.array(identifierSchema),
+    choices: z.array(clarificationChoiceSchema),
+    allowOther: z.boolean(),
+  })
+  .strict();
+
+export const clarificationAnswerSchema = z
+  .object({
+    uncertaintyId: z.string().min(1),
+    selectedChoiceId: z.string().min(1).nullable(),
+    otherText: z.string().min(1).nullable(),
+    submittedAt: timestampSchema,
+  })
+  .strict()
+  .superRefine((answer, context) => {
+    if (answer.selectedChoiceId === null && answer.otherText === null) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['root'],
+        message: 'Clarification answer must include a selected choice or other text.',
+      });
+    }
+  });
+
+export const planningClarificationContextSchema = z
+  .object({
+    query: validatedQuerySchema,
+    spec: z.lazy(() => infrastructureSpecSchema),
+    assumptions: z.array(z.string().min(1)),
+    uncertainties: z.array(planningUncertaintySchema).min(1),
+  })
+  .strict();
+
 export const infrastructureServiceSchema = z
   .object({
     kind: z.enum(['reverse-proxy', 'backend', 'database']),
     name: identifierSchema,
     image: z.string().min(1, 'Image must not be empty.'),
+    desiredStatus: z.enum(['running', 'stopped']).optional(),
     replicas: z.number().int('Replicas must be an integer.').min(1).max(50).optional(),
     ports: z.array(portMappingSchema).min(1).optional(),
     environment: z.record(environmentKeySchema, z.string().min(1, 'Environment values must not be empty.')).optional(),
@@ -226,7 +276,7 @@ export function validateTopologyGraph(spec: {
 export const infrastructureSpecSchema = z
   .object({
     projectName: identifierSchema,
-    services: z.array(infrastructureServiceSchema).min(1, 'At least one service is required.'),
+    services: z.array(infrastructureServiceSchema),
     networks: z.array(identifierSchema).min(1, 'At least one network is required.'),
     volumes: z.array(identifierSchema),
   })
@@ -251,14 +301,6 @@ export const infrastructureSpecSchema = z
     const volumeNames = new Set(spec.volumes);
 
     spec.services.forEach((service, serviceIndex) => {
-      if (!isSupportedImageReference(service.image)) {
-        context.addIssue({
-          code: z.ZodIssueCode.custom,
-          path: ['services', serviceIndex, 'image'],
-          message: `Image "${service.image}" is not supported. Supported images: ${SUPPORTED_IMAGE_BASES.join(', ')}.`,
-        });
-      }
-
       service.dependsOn?.forEach((dependency, dependencyIndex) => {
         if (dependency === service.name) {
           context.addIssue({
@@ -476,12 +518,54 @@ export const actionClassificationSchema = z
   })
   .strict();
 
+export const findingCodeSchema = z.enum([
+  'HOST_PORT_CONFLICT',
+  'CONTAINER_NAME_CONFLICT',
+  'NETWORK_NAME_CONFLICT',
+  'VOLUME_NAME_CONFLICT',
+  'MISSING_CONTAINER',
+  'CONTAINER_NOT_RUNNING',
+  'CONTAINER_UNHEALTHY',
+  'IMAGE_MISMATCH',
+  'IMAGE_NOT_FOUND',
+  'PORT_MISMATCH',
+  'NETWORK_MISMATCH',
+  'VOLUME_MISMATCH',
+  'DEPENDENCY_NOT_READY',
+  'RUNTIME_DRIFT',
+  'RUNTIME_OBSERVATION_UNCERTAIN',
+]);
+
+export const suggestedResolutionSchema = z
+  .object({
+    action: z.enum(['auto-revise', 'ask-user', 'repair-runtime', 'retry-observe', 'manual-check']),
+    summary: z.string().min(1),
+    choices: z.array(clarificationChoiceSchema).min(1).optional(),
+  })
+  .strict();
+
+export const verificationFindingSchema = z
+  .object({
+    code: findingCodeSchema,
+    severity: z.enum(['info', 'warning', 'error', 'blocker']),
+    resourceKind: z.enum(['container', 'service', 'image', 'network', 'volume', 'port', 'runtime']),
+    resourceName: z.string().min(1).nullable(),
+    expected: z.string().min(1).nullable(),
+    actual: z.string().min(1).nullable(),
+    evidence: z.array(z.string().min(1)),
+    confidence: z.number().min(0).max(1),
+    suggestedAction: suggestedResolutionSchema.nullable(),
+    requiresUserInput: z.boolean(),
+  })
+  .strict();
+
 export const verificationReportSchema = z
   .object({
     status: z.enum(['passed', 'failed', 'uncertain']),
     scope: z.enum(['meta-preflight', 'tool-runtime']),
     checkedAt: timestampSchema,
     issues: z.array(z.string().min(1)),
+    findings: z.array(verificationFindingSchema).optional(),
     evidence: z.array(z.string().min(1)),
     errorReason: z.string().min(1).nullable(),
     revisionHint: z.string().min(1).nullable(),
@@ -505,6 +589,29 @@ export const verificationReportSchema = z
       });
     }
   });
+export const plannerRevisionDecisionSchema = z.enum([
+  'auto-revised',
+  'needs-user-input',
+  'no-safe-resolution',
+]);
+
+export const revisionHistoryRecordSchema = z
+  .object({
+    attemptIndex: z.number().int().min(0),
+    revisionDecision: plannerRevisionDecisionSchema,
+    revisionSummary: z.string().min(1),
+    findings: z.array(verificationFindingSchema),
+    userFeedback: z
+      .object({
+        message: z.string().min(1, 'User feedback message must not be empty.'),
+        submittedAt: timestampSchema,
+      })
+      .strict()
+      .nullable(),
+    createdAt: timestampSchema,
+  })
+  .strict();
+
 
 export const preflightReportSchema = z
   .object({
@@ -685,6 +792,7 @@ export const containerCreateSpecSchema = z
   .object({
     name: identifierSchema,
     image: z.string().min(1),
+    command: z.array(z.string().min(1)).optional(),
     ports: z.array(portMappingSchema).optional(),
     environment: z.record(environmentKeySchema, z.string()).optional(),
     volumes: z.array(volumeMountSchema).optional(),
@@ -766,6 +874,10 @@ export const clarificationAgentRunResultSchema = z
   .object({
     status: z.literal('clarification'),
     clarificationQuestion: z.string().min(1, 'Clarification question must not be empty.'),
+    clarificationChoices: z.array(clarificationChoiceSchema).optional(),
+    allowOther: z.boolean().optional(),
+    uncertainties: z.array(planningUncertaintySchema).optional(),
+    clarificationContext: planningClarificationContextSchema.optional(),
     observations: z.array(agentObservationSchema).min(1, 'At least one observation is required.'),
     trace: z.array(reactStepSchema).min(1).optional(),
     guardTelemetry: guardTelemetrySchema.optional(),
@@ -793,7 +905,6 @@ const runtimeObservationSourceSchema = z.enum([
   'not-observed',
   'mcp-readonly',
   'runtime-adapter',
-  'legacy-placeholder',
 ]);
 
 export const runtimeContainerObservationSchema = z
@@ -802,6 +913,11 @@ export const runtimeContainerObservationSchema = z
     image: z.string().min(1).nullable(),
     status: z.string().min(1).nullable(),
     ports: z.array(z.string().min(1)),
+    environment: z.record(z.string(), z.string()).nullable().optional(),
+    healthStatus: z.string().min(1).nullable().optional(),
+    restartCount: z.number().int().min(0).nullable().optional(),
+    exitCode: z.number().int().nullable().optional(),
+    logSnippet: z.string().nullable().optional(),
   })
   .strict();
 
@@ -827,8 +943,10 @@ export const driftFindingSchema = z
     kind: z.enum([
       'missing-container',
       'stopped-container',
+      'running-container',
       'image-mismatch',
       'port-mismatch',
+      'env-mismatch',
       'missing-network',
       'missing-volume',
       'missing-image',
@@ -857,7 +975,7 @@ export const driftReportSchema = z
 
 export const repairActionSchema = z
   .object({
-    kind: z.enum(['start-container', 'recreate-container', 'pull-image', 'create-network', 'create-volume']),
+    kind: z.enum(['start-container', 'stop-container', 'recreate-container', 'pull-image', 'create-network', 'create-volume']),
     resourceName: z.string().min(1),
     risk: z.enum(['safe', 'approval-required']),
     reason: z.string().min(1),
@@ -963,6 +1081,7 @@ export const verifiedRuntimeSnapshotSchema = z
     driftReport: driftReportSchema.nullable().optional(),
     repairReport: repairReportSchema.nullable().optional(),
     cleanupReport: cleanupReportSchema.nullable().optional(),
+    revisionHistory: z.array(revisionHistoryRecordSchema).optional(),
     observedAt: timestampSchema.nullable().optional(),
     operation: z.enum(['deploy', 'repair', 'destroy', 'sync']).optional(),
     approvedAt: timestampSchema.nullable(),
@@ -976,13 +1095,14 @@ export const stateOperationRecordSchema = z
     id: z.string().min(1),
     type: z.enum([
       'pending-preview-saved',
+      'legacy-state-migrated',
       'approval-rejected',
       'approved-action-created',
       'compose-artifact-written',
       'verified-runtime-saved',
-      'legacy-state-migrated',
-        'repair-rejected',
-        'drift-observed',
+      'repair-rejected',
+      'drift-observed',
+      'destroy-all-executed',
     ]),
     projectName: identifierSchema,
     request: requestMetadataSchema.nullable(),
@@ -1000,19 +1120,49 @@ export const infrastructureStateSnapshotSchema = z
   })
   .strict();
 
-export const legacyStateSnapshotSchema = z
+const userFeedbackSchema = z
   .object({
-    desired: infrastructureSpecSchema,
-    actual: z
-      .object({
-        containers: z.array(z.string().min(1, 'Container names must not be empty.')),
-        lastObservedAt: timestampSchema.nullable(),
-      })
-      .strict(),
-    desiredStateSavedAt: timestampSchema.nullable().optional(),
-    lastAppliedAt: timestampSchema.nullable(),
+    message: z.string().min(1, 'User feedback message must not be empty.'),
+    submittedAt: timestampSchema,
   })
   .strict();
+
+export const revisionObservationSchema = z
+  .object({
+    verificationReport: verificationReportSchema.nullable(),
+    userFeedback: userFeedbackSchema.nullable(),
+    driftSummary: z.string().min(1).nullable(),
+  })
+  .strict()
+  .superRefine((obs, context) => {
+    if (obs.verificationReport === null && obs.userFeedback === null) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['root'],
+        message: 'Revision observation must include at least a verification report or user feedback.',
+      });
+    }
+  });
+
+export const plannerRevisionRequestSchema = z
+  .object({
+    desiredSpec: infrastructureSpecSchema,
+    revisionObservation: revisionObservationSchema,
+    stateSnapshot: infrastructureStateSnapshotSchema.nullable(),
+    resourceRefs: z
+      .object({
+        projectName: z.string().min(1),
+        operationId: z.string().min(1).optional(),
+        containers: z.array(z.string().min(1)),
+        networks: z.array(z.string().min(1)),
+        volumes: z.array(z.string().min(1)),
+        images: z.array(z.string().min(1)),
+      })
+      .optional(),
+    attemptIndex: z.number().int().min(0),
+  })
+  .strict();
+
 
 export type CliInput = z.infer<typeof cliInputSchema>;
 
@@ -1092,6 +1242,33 @@ export function validateVerificationReport(value: unknown): VerificationReport {
   ) as VerificationReport;
 }
 
+export function validateUserFeedback(value: unknown): UserFeedback {
+  return parseWithSchema(userFeedbackSchema, value, 'user feedback') as UserFeedback;
+}
+
+export function validateRevisionObservation(value: unknown): RevisionObservation {
+  return parseWithSchema(revisionObservationSchema, value, 'revision observation') as RevisionObservation;
+}
+
+export function validatePlannerRevisionRequest(value: unknown): PlannerRevisionRequest {
+  return parseWithSchema(plannerRevisionRequestSchema, value, 'planner revision request') as PlannerRevisionRequest;
+}
+
+export function validatePlanningUncertainty(value: unknown): PlanningUncertainty {
+  return parseWithSchema(planningUncertaintySchema, value, 'planning uncertainty') as PlanningUncertainty;
+}
+
+export function validateClarificationAnswer(value: unknown): ClarificationAnswer {
+  return parseWithSchema(clarificationAnswerSchema, value, 'clarification answer') as ClarificationAnswer;
+}
+
+export function validatePlanningClarificationContext(value: unknown): PlanningClarificationContext {
+  return parseWithSchema(
+    planningClarificationContextSchema,
+    value,
+    'planning clarification context',
+  ) as PlanningClarificationContext;
+}
 export function validatePreflightReport(value: unknown): PreflightReport {
   return parseWithSchema(
     preflightReportSchema,
@@ -1151,14 +1328,6 @@ export function validateInfrastructureStateSnapshot(value: unknown): Infrastruct
   ) as InfrastructureStateSnapshot;
 }
 
-export function validateLegacyStateSnapshot(value: unknown): LegacyStateSnapshot {
-  return parseWithSchema(
-    legacyStateSnapshotSchema,
-    value,
-    'legacy state snapshot',
-  ) as LegacyStateSnapshot;
-}
-
 function parseWithSchema<T>(schema: z.ZodType<T>, value: unknown, label: string): T {
   const result = schema.safeParse(value);
 
@@ -1196,3 +1365,4 @@ function addDuplicateIssues(
     seen.add(value);
   });
 }
+

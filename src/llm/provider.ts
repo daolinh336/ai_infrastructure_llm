@@ -1,4 +1,3 @@
-/* eslint-disable no-irregular-whitespace -- Stub parser keeps legacy mojibake prompt fixtures working. */
 import OpenAI from 'openai';
 import type {
   DraftQuery,
@@ -509,7 +508,7 @@ function getErrorMessage(error: unknown): string {
 function classifyIntentForStub(prompt: string): IntentClassification {
   const normalizedPrompt = prompt.toLowerCase();
 
-  if (/\b(hack|exploit|malware|facebook)\b/i.test(prompt)) {
+  if (/\b(hack|exploit|malware|facebook)\b/i.test(prompt) || isHarmfulControlRequest(prompt)) {
     return {
       scope: 'unsafe',
       intent: null,
@@ -518,7 +517,7 @@ function classifyIntentForStub(prompt: string): IntentClassification {
   }
 
   if (
-    normalizedPrompt.includes('chuyá»‡n cÆ°á»i') ||
+    normalizedPrompt.includes('chuy\u1ec7n c\u01b0\u1eddi') ||
     normalizedPrompt.includes('cau chuyen cuoi') ||
     normalizedPrompt.includes('joke')
   ) {
@@ -534,7 +533,7 @@ function classifyIntentForStub(prompt: string): IntentClassification {
     /\b(create|deploy|docker|container|service|infra|web|app|nginx|node|python|postgres|postgresql|mysql|redis|port|replica|status|drift|destroy)\b/i.test(
       prompt,
     ) ||
-    /(táº¡o|xÃ³a|xoÃ¡|triá»ƒn khai|trang thÃ¡i|háº¡ táº§ng|á»©ng dá»¥ng)/i.test(
+    /(t\u1ea1o|x\u00f3a|xo\u00e1|tri\u1ec3n khai|tr\u1ea1ng th\u00e1i|h\u1ea1 t\u1ea7ng|\u1ee9ng d\u1ee5ng)/i.test(
       prompt,
     );
 
@@ -553,6 +552,11 @@ function classifyIntentForStub(prompt: string): IntentClassification {
   };
 }
 
+function isHarmfulControlRequest(prompt: string): boolean {
+  return /(chinh\s*phuc|thong\s*tri|kiem\s*soat|xam\s*chiem).{0,40}(the\s*gioi|con\s*nguoi|he\s*thong)/i.test(prompt) ||
+    /(world\s*domination|dominate\s+the\s+world|take\s+over\s+the\s+world)/i.test(prompt);
+}
+
 function parseDraftQueryForStub(rawInput: string): DraftQuery {
   const parsedInput = parseParserInput(rawInput);
   const raw = parsedInput.raw;
@@ -563,7 +567,7 @@ function parseDraftQueryForStub(rawInput: string): DraftQuery {
   if (
     intent === 'create' &&
     services.length === 0 &&
-    /(\bweb\b|\bapp\b|á»©ng dá»¥ng)/i.test(raw)
+    /(\bweb\b|\bapp\b|\u1ee9ng d\u1ee5ng)/i.test(raw)
   ) {
     services.push(createDraftService());
   }
@@ -609,11 +613,11 @@ function parseParserInput(rawInput: string): {
 }
 
 function detectIntent(prompt: string): InfrastructureIntent {
-  if (/(destroy|delete|remove|xÃ³a|xoÃ¡)/i.test(prompt)) {
+  if (/(destroy|delete|remove|x\u00f3a|xo\u00e1)/i.test(prompt)) {
     return 'destroy';
   }
 
-  if (/(status|tráº¡ng thÃ¡i)/i.test(prompt)) {
+  if (/(status|tr\u1ea1ng th\u00e1i)/i.test(prompt)) {
     return 'status';
   }
 
@@ -621,7 +625,7 @@ function detectIntent(prompt: string): InfrastructureIntent {
     return 'drift';
   }
 
-  if (/(update|cáº­p nháº­t)/i.test(prompt)) {
+  if (/(update|c\u1eadp nh\u1eadt)/i.test(prompt)) {
     return 'update';
   }
 
@@ -660,7 +664,7 @@ function extractServices(prompt: string): DraftServiceQuery[] {
 
   const port = extractNumber(
     prompt,
-    /\b(?:port|cá»•ng)\s*(?:lÃ |=|:)?\s*(-?\d+)/i,
+    /\b(?:port|c\u1ed5ng)\s*(?:l\u00e0|=|:)?\s*(-?\d+)/i,
   );
   if (port !== null) {
     ensureFirstService(services).port = port;
@@ -670,7 +674,7 @@ function extractServices(prompt: string): DraftServiceQuery[] {
     extractNumber(prompt, /\bs\S*\s+l\S*ng[^\d-]*(-?\d+)/i) ??
     extractNumber(
       prompt,
-      /\b(?:replica|replicas|sá»‘ lÆ°á»£ng|so luong)[^\d-]*(-?\d+)/i,
+      /\b(?:replica|replicas|s\u1ed1 l\u01b0\u1ee3ng|so luong)[^\d-]*(-?\d+)/i,
     ) ??
     extractNumber(prompt, /(-?\d+)\s*(?:instance|instances|replica|replicas)/i);
   if (replicas !== null) {
@@ -680,10 +684,10 @@ function extractServices(prompt: string): DraftServiceQuery[] {
     targetService.replicas = replicas;
   }
 
-  const cpu = extractNumber(prompt, /\b(?:cpu)\s*(?:lÃ |=|:)?\s*(-?\d+)/i);
+  const cpu = extractNumber(prompt, /\b(?:cpu)\s*(?:l\u00e0|=|:)?\s*(-?\d+)/i);
   const memoryGb = extractNumber(
     prompt,
-    /\b(?:ram|memory)\s*(?:lÃ |=|:)?\s*(-?\d+)\s*(?:gb)?/i,
+    /\b(?:ram|memory)\s*(?:l\u00e0|=|:)?\s*(-?\d+)\s*(?:gb)?/i,
   );
   const requestedMounts = extractRequestedMounts(prompt);
   const privileged = /privileged\s*:?\s*true/i.test(prompt) ? true : null;

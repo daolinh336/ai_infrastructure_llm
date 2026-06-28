@@ -1,7 +1,7 @@
 ﻿import type { InfrastructureSpec } from '../domain/types.js';
 
 /**
- * Secret resolution layer (roadmap: "Hệ thống quản lý Secret").
+ * Secret resolution layer (roadmap: "He thong quan ly Secret").
  *
  * The agent already injects temporary default secrets via `generateDefaultSecret()`
  * into the InfrastructureSpec. This module runs AFTER the agent returns and decides

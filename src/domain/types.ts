@@ -82,7 +82,7 @@ export interface StaticGatewayMetrics {
   reactInvocationsAfterStaticValidationFailure: number;
 }
 
-export type ProgressPhase = 'cli' | 'static' | 'plan' | 'acting' | 'observe' | 'execution';
+export type ProgressPhase = 'cli' | 'gate' | 'static' | 'plan' | 'acting' | 'observe' | 'execution';
 
 export interface ProgressEvent {
   phase: ProgressPhase;
@@ -96,6 +96,7 @@ export interface InfrastructureService {
   kind: 'reverse-proxy' | 'backend' | 'database';
   name: string;
   image: string;
+  desiredStatus?: 'running' | 'stopped';
   replicas?: number;
   ports?: string[];
   environment?: Record<string, string>;
@@ -226,11 +227,55 @@ export interface ActionClassification {
   callsMcp: boolean;
 }
 
+export type FindingCode =
+  | 'HOST_PORT_CONFLICT'
+  | 'CONTAINER_NAME_CONFLICT'
+  | 'NETWORK_NAME_CONFLICT'
+  | 'VOLUME_NAME_CONFLICT'
+  | 'MISSING_CONTAINER'
+  | 'CONTAINER_NOT_RUNNING'
+  | 'CONTAINER_UNHEALTHY'
+  | 'IMAGE_MISMATCH'
+  | 'IMAGE_NOT_FOUND'
+  | 'PORT_MISMATCH'
+  | 'NETWORK_MISMATCH'
+  | 'VOLUME_MISMATCH'
+  | 'DEPENDENCY_NOT_READY'
+  | 'RUNTIME_DRIFT'
+  | 'RUNTIME_OBSERVATION_UNCERTAIN';
+
+export type VerificationSeverity = 'info' | 'warning' | 'error' | 'blocker';
+
+export interface SuggestedResolution {
+  action: 'auto-revise' | 'ask-user' | 'repair-runtime' | 'retry-observe' | 'manual-check';
+  summary: string;
+  choices?: ClarificationChoice[];
+}
+
+export interface VerificationFinding {
+  code: FindingCode;
+  severity: VerificationSeverity;
+  resourceKind: 'container' | 'service' | 'image' | 'network' | 'volume' | 'port' | 'runtime';
+  resourceName: string | null;
+  expected: string | null;
+  actual: string | null;
+  evidence: string[];
+  confidence: number;
+  suggestedAction: SuggestedResolution | null;
+  requiresUserInput: boolean;
+}
+
+export type PlannerRevisionDecision =
+  | 'auto-revised'
+  | 'needs-user-input'
+  | 'no-safe-resolution';
+
 export interface VerificationReport {
   status: 'passed' | 'failed' | 'uncertain';
   scope: 'meta-preflight' | 'tool-runtime';
   checkedAt: string;
   issues: string[];
+  findings?: VerificationFinding[];
   evidence: string[];
   errorReason: string | null;
   revisionHint: string | null;
@@ -291,15 +336,18 @@ export interface ApprovedAction {
   dockerCalled: boolean;
   mcpCalled: boolean;
   runtimeMutation: boolean;
+  operationId?: string;
 }
 
 export interface ContainerCreateSpec {
   name: string;
   image: string;
+  command?: string[];
   ports: string[] | undefined;
   environment: Record<string, string> | undefined;
   volumes: string[] | undefined;
   networks: string[] | undefined;
+  labels?: Record<string, string>;
 }
 
 export interface DockerDeployResult {
@@ -311,6 +359,7 @@ export interface DockerDeployResult {
 
 export interface RuntimeResourceRefs {
   projectName: string;
+  operationId?: string;
   containers: string[];
   networks: string[];
   volumes: string[];
@@ -322,8 +371,10 @@ export type DriftSeverity = 'minor' | 'major' | 'risky' | 'unknown';
 export type DriftFindingKind =
   | 'missing-container'
   | 'stopped-container'
+  | 'running-container'
   | 'image-mismatch'
   | 'port-mismatch'
+  | 'env-mismatch'
   | 'missing-network'
   | 'missing-volume'
   | 'missing-image'
@@ -350,7 +401,7 @@ export interface DriftReport {
 }
 
 export interface RepairAction {
-  kind: 'start-container' | 'recreate-container' | 'pull-image' | 'create-network' | 'create-volume';
+  kind: 'start-container' | 'stop-container' | 'recreate-container' | 'pull-image' | 'create-network' | 'create-volume';
   resourceName: string;
   risk: 'safe' | 'approval-required';
   reason: string;
@@ -399,6 +450,98 @@ export interface ReActReasoningOutput {
   nextAction: 'continue_planning' | 'ask_user' | 'stop';
   rationale: string;
   safetyNotes: string[];
+}
+
+export interface UserFeedback {
+  message: string;
+  submittedAt: string;
+}
+
+export type PlanningUncertaintySeverity = 'info' | 'warning' | 'blocking';
+
+export type PlanningUncertaintyField =
+  | 'services[].dependsOn'
+  | 'services[].ports'
+  | 'services[].image'
+  | 'services[].volumes'
+  | 'topology';
+
+export interface ClarificationChoice {
+  id: string;
+  label: string;
+  description: string;
+  value: string;
+}
+
+export interface PlanningUncertainty {
+  id: string;
+  severity: PlanningUncertaintySeverity;
+  field: PlanningUncertaintyField;
+  message: string;
+  reason: string;
+  affectedServices: string[];
+  choices: ClarificationChoice[];
+  allowOther: boolean;
+}
+
+export interface ClarificationAnswer {
+  uncertaintyId: string;
+  selectedChoiceId: string | null;
+  otherText: string | null;
+  submittedAt: string;
+}
+
+export interface PlanningClarificationContext {
+  query: ValidatedQuery;
+  spec: InfrastructureSpec;
+  assumptions: string[];
+  uncertainties: PlanningUncertainty[];
+}
+
+export interface RevisionObservation {
+  verificationReport: VerificationReport | null;
+  userFeedback: UserFeedback | null;
+  driftSummary: string | null;
+}
+
+export interface PlannerRevisionRequest {
+  desiredSpec: InfrastructureSpec;
+  revisionObservation: RevisionObservation;
+  stateSnapshot: InfrastructureStateSnapshot | null;
+  resourceRefs?: RuntimeResourceRefs;
+  attemptIndex: number;
+}
+
+export interface PlannerRevisionResult {
+  revisedSpec: InfrastructureSpec;
+  revisionSummary: string;
+  assumptions: string[];
+  revisionDecision?: PlannerRevisionDecision;
+  clarificationContext?: PlanningUncertainty[];
+}
+
+export interface RevisionHistoryRecord {
+  attemptIndex: number;
+  revisionDecision: PlannerRevisionDecision;
+  revisionSummary: string;
+  findings: VerificationFinding[];
+  userFeedback: UserFeedback | null;
+  createdAt: string;
+}
+
+export interface AttemptScope {
+  operationId: string;
+  approvedActionId: string;
+  projectName: string;
+  attemptIndex: number;
+  createdAt: string;
+}
+
+export type ApprovalChoice = 'approved' | 'rejected' | 'other';
+
+export interface ApprovalDecision {
+  choice: ApprovalChoice;
+  userFeedback: UserFeedback | null;
 }
 
 export interface ReActStep {
@@ -455,6 +598,10 @@ export interface PlannedAgentRunResult {
 export interface ClarificationAgentRunResult {
   status: 'clarification';
   clarificationQuestion: string;
+  clarificationChoices?: ClarificationChoice[];
+  allowOther?: boolean;
+  uncertainties?: PlanningUncertainty[];
+  clarificationContext?: PlanningClarificationContext;
   observations: AgentObservation[];
   trace?: ReActStep[];
   guardTelemetry?: GuardTelemetry;
@@ -477,14 +624,18 @@ export type AgentRunResult =
 export type RuntimeObservationSource =
   | 'not-observed'
   | 'mcp-readonly'
-  | 'runtime-adapter'
-  | 'legacy-placeholder';
+  | 'runtime-adapter';
 
 export interface RuntimeContainerObservation {
   name: string;
   image: string | null;
   status: string | null;
   ports: string[];
+  environment?: Record<string, string> | null;
+  healthStatus?: string | null;
+  restartCount?: number | null;
+  exitCode?: number | null;
+  logSnippet?: string | null;
 }
 
 export interface RuntimeNamedResourceObservation {
@@ -552,6 +703,7 @@ export interface VerifiedRuntimeSnapshot {
   driftReport?: DriftReport | null;
   repairReport?: RepairReport | null;
   cleanupReport?: CleanupReport | null;
+  revisionHistory?: RevisionHistoryRecord[];
   resourceRefs?: RuntimeResourceRefs;
   observedAt?: string;
   operation?: 'deploy' | 'repair' | 'destroy' | 'sync';
@@ -564,13 +716,14 @@ export interface StateOperationRecord {
   id: string;
   type:
     | 'pending-preview-saved'
+    | 'legacy-state-migrated'
     | 'approval-rejected'
     | 'approved-action-created'
     | 'compose-artifact-written'
     | 'verified-runtime-saved'
-    | 'legacy-state-migrated'
     | 'repair-rejected'
-    | 'drift-observed';
+    | 'drift-observed'
+    | 'destroy-all-executed';
   projectName: string;
   request: RequestMetadata | null;
   summary: string;
@@ -584,15 +737,6 @@ export interface InfrastructureStateSnapshot {
   history: StateOperationRecord[];
 }
 
-export interface LegacyStateSnapshot {
-  desired: InfrastructureSpec;
-  actual: {
-    containers: string[];
-    lastObservedAt: string | null;
-  };
-  desiredStateSavedAt?: string | null;
-  lastAppliedAt: string | null;
-}
 
 export interface TopologyIssue {
   severity: 'error' | 'warning';
@@ -605,4 +749,3 @@ export interface TopologyValidationResult {
   valid: boolean;
   issues: TopologyIssue[];
 }
-

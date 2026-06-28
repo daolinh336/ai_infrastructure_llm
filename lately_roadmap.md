@@ -59,7 +59,7 @@ Mục tiêu: sau khi deploy + verify thành công, desired (neo `InfrastructureS
 
 - [ ] Thêm hàm `saveVerifiedRuntimeState(input)` trong `src/state/sqlite-state-store.ts`: nhận `desired: InfrastructureSpec` + `actual: RuntimeActualState` + `verification: VerificationReport`, gói thành `VerifiedRuntimeSnapshot`, ghi vào `current` của singleton state, đẩy 1 `StateOperationRecord` (type `verified-runtime`) vào `history`.
 - [ ] `desired` phải là `InfrastructureSpec` đã `validateInfrastructureSpec` (neo source-of-truth, không phải compose artifact).
-- [ ] `actual` phải đến từ Docker observation thật (qua `DockerMcpClient` read-only tools), không phải placeholder.
+- [ ] `actual` phải đến từ Docker observation thật (qua `DockerMcpClient` read-only tools).
 - [ ] Test: lưu → load → `current.desired` == spec, `current.actual.source` != 'not-observed', `current.verification.status` phản ánh report.
 
 ### Sprint A.2 — Tích hợp vào CLI deploy flow
@@ -86,7 +86,6 @@ Mục tiêu: sau khi deploy + verify thành công, desired (neo `InfrastructureS
 
 - [ ] `deployWithDocker()` (`src/execution/execution-engine.ts:211`): theo dõi resources đã tạo; khi lỗi giữa chừng, rollback theo thứ tự ngược (stop+remove containers đã start → remove networks đã tạo). Giữ `setAllowMutations(false)` trong `finally`.
 - [ ] Phân loại lỗi rõ: `DeploymentError` mang `phase` ∈ {`network`|`pull`|`create`|`start`} để CLI in gợi ý sửa.
-- [ ] Xoá biến placeholder `_dockerCalled` không dùng (`execution-engine.ts:213`).
 - [ ] Test (mock MCP): inject lỗi ở bước create container → assert containers/networks trước đó bị cleanup, gate bị khóa lại.
 
 ### Tiêu chí hoàn thành Giai đoạn A

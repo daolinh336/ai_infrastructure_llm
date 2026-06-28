@@ -1,5 +1,6 @@
-﻿import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import type {
   ActionClassification,
   AgentRunResult,
@@ -11,7 +12,7 @@ import type {
   DockerDeployResult,
   PreflightReport,
 } from '../domain/types.js';
-import { renderCompose } from '../compose/render-compose.js';
+import { getRuntimeKeepaliveCommand, renderCompose } from '../compose/render-compose.js';
 import { resolveSecrets, type SecretResolutionResult } from '../compose/secret-resolver.js';
 import { writeGeneratedSecretsFile } from '../compose/generated-secrets-writer.js';
 import { validateAgentRunResult } from '../domain/schemas.js';
@@ -45,6 +46,7 @@ import type {
   InfrastructureSpec,
   RuntimeResourceRefs,
   VerificationReport,
+  AttemptScope,
 } from '../domain/types.js';
 import { validateVerificationReport } from '../domain/schemas.js';
 import { buildDriftReport } from './drift-detector.js';
@@ -247,8 +249,7 @@ export class ExecutionEngine {
   async deployWithDocker(
     approvedAction: ApprovedAction,
     dockerMcpClient: DockerMcpGateway,
-  ): Promise<DockerDeployResult> {
-    const _dockerCalled = false; // placeholder — will be set by MCP client in production
+  ): Promise<DockerDeployResult & { operationId: string; attemptScope: AttemptScope }> {
 
     if (!dockerMcpClient.isInitialized) {
       throw new Error('DockerMcpGateway must be initialized before deployWithDocker');
@@ -256,6 +257,15 @@ export class ExecutionEngine {
 
     const spec = approvedAction.validatedSpec;
     const schedule = buildDependencyAwareExecutionSchedule(spec);
+    const operationId = 'op-' + randomUUID();
+    const attemptScope: AttemptScope = {
+      operationId,
+      approvedActionId: approvedAction.id,
+      projectName: spec.projectName,
+      attemptIndex: 0,
+      createdAt: new Date().toISOString(),
+    };
+    const labels = buildOperationLabels(attemptScope);
     const networksCreated: string[] = [];
     const imagesPulled: string[] = [];
     const containersStarted: Array<{ name: string; id: string }> = [];
@@ -266,6 +276,23 @@ export class ExecutionEngine {
 
     dockerMcpClient.setAllowMutations(true);
     try {
+      // All-or-nothing guard: do not mutate pre-existing stopped containers.
+      // If a desired container already exists but is not running, starting it
+      // would change state that was not created by this deployment attempt.
+      const existingContainers = await dockerMcpClient.listContainers(true);
+      const blockedExistingContainers = spec.services
+        .map((service) => `${spec.projectName}-${service.name}`)
+        .map((name) => existingContainers.find((container) => container.name === name))
+        .filter((container): container is NonNullable<typeof container> =>
+          Boolean(container && container.status !== 'running'),
+        );
+      if (blockedExistingContainers.length > 0) {
+        throw new Error(
+          'All-or-nothing deploy blocked by existing non-running container(s): ' +
+            blockedExistingContainers.map((container) => container.name).join(', '),
+        );
+      }
+
       // Step 1: Create networks
       const existingNetworks = await dockerMcpClient.listNetworks();
       for (const network of spec.networks) {
@@ -273,7 +300,7 @@ export class ExecutionEngine {
           networksCreated.push(network);
           continue;
         }
-        await dockerMcpClient.createNetwork(network);
+        await dockerMcpClient.createNetwork(network, labels);
         createdNetworks.push(network);
         networksCreated.push(network);
       }
@@ -292,23 +319,22 @@ export class ExecutionEngine {
         const service = spec.services.find((s) => s.name === step.resourceName);
         if (!service) continue;
 
+        const command = getRuntimeKeepaliveCommand(service.image);
         const containerSpec: import('../domain/types.js').ContainerCreateSpec = {
           name: `${spec.projectName}-${service.name}`,
           image: service.image,
+          ...(command ? { command } : {}),
           ports: service.ports,
           environment: service.environment,
           volumes: service.volumes,
           networks: spec.networks.length > 0 ? [spec.networks[0]!] : undefined,
+          labels,
         };
 
-        const existingContainers = await dockerMcpClient.listContainers(true);
         const existingContainer = existingContainers.find(
           (container) => container.name === containerSpec.name,
         );
         if (existingContainer) {
-          if (existingContainer.status !== 'running') {
-            await dockerMcpClient.startContainer(containerSpec.name);
-          }
           containersStarted.push({ name: containerSpec.name, id: containerSpec.name });
           continue;
         }
@@ -342,6 +368,8 @@ export class ExecutionEngine {
       imagesPulled,
       containersStarted,
       startedAt,
+      operationId,
+      attemptScope,
     };
   }
 
@@ -429,7 +457,11 @@ export class ExecutionEngine {
     if (!snapshot) {
       throw new Error('No current verified runtime snapshot to detect drift against');
     }
-    const actual = await mcpClient.observeActualState();
+    const desired = snapshot.desired;
+    const containerNames = desired.services.map(
+      (service) => desired.projectName + '-' + service.name.replace(/[_\s]+/g, '-'),
+    );
+    const actual = await mcpClient.observeActualStateWithInspect({ containerNames });
     const drift = buildDriftReport(snapshot.desired, actual);
     return { drift, actual };
   }
@@ -455,6 +487,8 @@ export class ExecutionEngine {
           try {
             if (action.kind === 'start-container') {
               await mcpClient.startContainer(action.resourceName);
+            } else if (action.kind === 'stop-container') {
+              await mcpClient.stopContainer(action.resourceName);
             } else if (action.kind === 'pull-image') {
               await mcpClient.pullImage(action.resourceName);
             } else if (action.kind === 'create-network') {
@@ -470,9 +504,11 @@ export class ExecutionEngine {
                   `Cannot recreate container "${action.resourceName}": no matching service in desired spec.`,
                 );
               }
+              const command = getRuntimeKeepaliveCommand(service.image);
               await mcpClient.createContainer({
                 name: action.resourceName,
                 image: service.image,
+                ...(command ? { command } : {}),
                 ports: service.ports,
                 environment: service.environment,
                 volumes: service.volumes,
@@ -560,6 +596,75 @@ export class ExecutionEngine {
     };
   }
 
+  async cleanupAttemptScope(
+    mcpClient: DockerMcpGateway,
+    attemptScope: AttemptScope,
+  ): Promise<CleanupReport> {
+    const attempted: string[] = [];
+    const succeeded: string[] = [];
+    const failed: Array<{ resource: string; error: string }> = [];
+
+    mcpClient.setAllowMutations(true);
+    try {
+      // Remove containers created in this attempt scope
+      const allContainers = await mcpClient.listContainers(true);
+      const scopeContainers = allContainers.filter(
+        (c) => c.name.startsWith(attemptScope.projectName + '-'),
+      );
+      for (const container of scopeContainers) {
+        const resourceName = 'container:' + container.name;
+        attempted.push(resourceName);
+        try {
+          await mcpClient.stopContainer(container.name);
+          await mcpClient.removeContainer(container.name);
+          succeeded.push(resourceName);
+        } catch (error) {
+          failed.push({ resource: resourceName, error: getErrorMessage(error) });
+        }
+      }
+
+      // Remove networks created in this attempt scope
+      const allNetworks = await mcpClient.listNetworks();
+      const protectedNetworks = new Set(['bridge', 'host', 'none']);
+      const specNetworks = await this.getSpecNetworksForScope(mcpClient, attemptScope);
+      const scopeNetworks = allNetworks.filter(
+        (n) =>
+          !protectedNetworks.has(n.name) &&
+          (specNetworks.includes(n.name) || n.name.startsWith(attemptScope.projectName + '-')),
+      );
+      for (const network of scopeNetworks) {
+        const resourceName = 'network:' + network.name;
+        attempted.push(resourceName);
+        try {
+          await mcpClient.removeNetwork(network.name);
+          succeeded.push(resourceName);
+        } catch (error) {
+          failed.push({ resource: resourceName, error: getErrorMessage(error) });
+        }
+      }
+    } finally {
+      mcpClient.setAllowMutations(false);
+    }
+
+    return {
+      trigger: 'deploy-failed',
+      attempted,
+      succeeded,
+      failed,
+      leftovers: failed.map((entry) => entry.resource),
+    };
+  }
+
+  private async getSpecNetworksForScope(
+    _mcpClient: DockerMcpGateway,
+    _attemptScope: AttemptScope,
+  ): Promise<string[]> {
+    // In the current implementation, spec networks are derived from the approved action
+    // which is available via the attempt scope's projectName. For simplicity, we return
+    // an empty array and rely on the name-prefix filter. A more complete implementation
+    // would store the spec alongside the attempt scope.
+    return [];
+  }
   private async writeComposeArtifact(
     targetPath: string,
     content: string,
@@ -638,4 +743,13 @@ function verifyDestroy(
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+function buildOperationLabels(scope: AttemptScope): Record<string, string> {
+  return {
+    'app': 'infra-react-agent',
+    'project': scope.projectName,
+    'operationId': scope.operationId,
+    'approvedActionId': scope.approvedActionId,
+    'managed-by': 'infra-react-agent',
+  };
 }

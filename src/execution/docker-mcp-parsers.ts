@@ -45,15 +45,29 @@ export function parseInspectResult(output: string, containerName: string): Runti
   try {
     const parsed = JSON.parse(output);
     const c = Array.isArray(parsed) ? parsed[0] : parsed;
+    const config = c.Config as Record<string, unknown> | undefined;
+    const rawName = typeof c.Name === 'string' ? c.Name.replace(/^\//, '') : containerName;
     return {
-      name: c.Name ?? containerName,
-      image: c.Image ?? null,
+      name: rawName,
+      image: normalizeImage(config?.Image ?? c.Image),
       status: c.State?.Status ?? c.Status ?? null,
       ports: extractPortsFromInspect(c),
+      environment: extractEnvironmentFromInspect(c),
+      healthStatus: extractHealthStatus(c),
+      restartCount: numberField(c, 'RestartCount'),
+      exitCode: isRecord(c.State) ? numberField(c.State, 'ExitCode') : null,
     };
   } catch {
-    return { name: containerName, image: null, status: null, ports: [] };
+    return { name: containerName, image: null, status: null, ports: [], environment: null };
   }
+}
+
+function extractHealthStatus(inspect: Record<string, unknown>): string | null {
+  const state = inspect.State;
+  if (!isRecord(state)) return null;
+  const health = state.Health;
+  if (!isRecord(health)) return null;
+  return stringField(health, 'Status');
 }
 
 /**
@@ -76,6 +90,40 @@ export function extractPortsFromInspect(inspect: Record<string, unknown>): strin
   } catch {
     return [];
   }
+}
+
+/**
+ * Extract environment variables from a Docker inspect result object.
+ * Docker stores Config.Env as an array of "KEY=VALUE" strings.
+ */
+export function extractEnvironmentFromInspect(inspect: Record<string, unknown>): Record<string, string> | null {
+  try {
+    const config = inspect.Config as Record<string, unknown> | undefined;
+    const env = config?.Env as unknown[] | undefined;
+    if (!Array.isArray(env)) {
+      return null;
+    }
+    const result: Record<string, string> = {};
+    for (const entry of env) {
+      if (typeof entry !== 'string') continue;
+      const eqIndex = entry.indexOf('=');
+      if (eqIndex <= 0) continue;
+      const key = entry.slice(0, eqIndex);
+      const value = entry.slice(eqIndex + 1);
+      result[key] = value;
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Check whether an MCP tool list includes an inspect-capable tool.
+ * Used to fall back gracefully when the MCP server does not expose inspect.
+ */
+export function hasInspectTool(tools: ReadonlyArray<{ name: string }>): boolean {
+  return tools.some((tool) => /inspect/i.test(tool.name));
 }
 
 /**
@@ -163,6 +211,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function stringField(record: Record<string, unknown>, key: string): string | null {
   const value = record[key];
   return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function numberField(record: Record<string, unknown>, key: string): number | null {
+  const value = record[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 function normalizePorts(value: unknown): string[] {

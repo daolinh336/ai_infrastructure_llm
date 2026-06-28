@@ -44,8 +44,9 @@ This baseline is the first milestone, not the final research direction.
 The current implementation is synced through the Phase 8 control boundary in the
 11-phase roadmap. It provides:
 - a TypeScript CLI entrypoint
-- a pre-ReAct Static Gateway for intent classification, structured query parsing,
-  static validation, and early rejection/clarification
+- a pre-ReAct Static Gateway for obvious unsafe/out-of-scope pre-screening,
+  full-prompt LLM intent classification, structured query parsing,
+  deterministic static validation, and early rejection/clarification
 - a structured ReAct agent loop with explicit reason/act/observe trace steps
 - provider-agnostic LLM interface with a stub provider and an OpenAI Responses
   API provider path
@@ -55,8 +56,7 @@ The current implementation is synced through the Phase 8 control boundary in the
 - deterministic Docker Compose YAML rendering as a preview artifact
 - dependency-aware detailed dry-run preview with policy/readiness observations
 - SQLite state storage with schema versioning, pending preview memory,
-  current verified runtime snapshot shape, history, validation, and read-only
-  legacy JSON compatibility
+  current verified runtime snapshot shape, history, and validation
 - Phase 8 approval/preflight boundary: `plan --apply` runs preflight, asks y/n,
   writes `docker-compose.yaml` only after approval, and creates an
   `ApprovedAction`
@@ -200,8 +200,3 @@ Provider variables:
   deterministic path for local dev/tests. Only OpenAI and Gemini are
   supported as real providers.
 - SQLite is the primary state storage at `state/infra-state.sqlite`.
-  `state/infra-state.json` is legacy-only input; when present beside a missing
-  SQLite database, read paths can translate it into pending preview memory
-  without writing the database. The next explicit state-write path persists
-  SQLite, and current verified runtime state remains empty until a future
-  approved runtime apply observes Docker.

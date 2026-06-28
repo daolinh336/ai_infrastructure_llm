@@ -1,15 +1,15 @@
 services:
-  nginx:
+  static-web:
     image: nginx:stable
     restart: unless-stopped
     ports:
       - 80:80
     environment: {}
     depends_on:
-      - api
+      - nodejs-backend
     networks: &a1
       - app-network
-  api:
+  nodejs-backend:
     image: node:20-alpine
     restart: unless-stopped
     environment: {}

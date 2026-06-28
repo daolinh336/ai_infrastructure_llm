@@ -75,6 +75,11 @@ const KEEPALIVE_COMMAND: Record<string, string[]> = {
   'eclipse-temurin': ['tail', '-f', '/dev/null'],
 };
 
+export function getRuntimeKeepaliveCommand(image: string): string[] | undefined {
+  const command = KEEPALIVE_COMMAND[getImageReferenceBase(image)];
+  return command ? [...command] : undefined;
+}
+
 export function renderCompose(spec: InfrastructureSpec): string {
   const validSpec = validateInfrastructureSpec(spec);
   const compose = {
@@ -82,7 +87,7 @@ export function renderCompose(spec: InfrastructureSpec): string {
       validSpec.services.map((service) => {
         const imageBase = getImageReferenceBase(service.image);
         const healthcheck = DATABASE_HEALTHCHECKS[imageBase];
-        const command = KEEPALIVE_COMMAND[imageBase];
+        const command = getRuntimeKeepaliveCommand(service.image);
 
         return [
           service.name,

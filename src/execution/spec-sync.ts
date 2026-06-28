@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   InfrastructureService,
   InfrastructureSpec,
   RuntimeActualState,
@@ -29,13 +29,25 @@ function sanitizeIdentifier(name: string): string {
   return anchored || 'service';
 }
 
+function stripProjectPrefix(name: string, projectName: string): string {
+  const prefix = projectName + '-';
+  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+}
+
+function stripComposeReplicaSuffix(name: string): string {
+  return name.replace(/[-_][1-9][0-9]*$/, '');
+}
+
+function normalizeRuntimeResourceName(name: string, projectName: string): string {
+  return sanitizeIdentifier(stripProjectPrefix(name, projectName));
+}
+
 function serviceFromContainer(
   container: RuntimeContainerObservation,
   projectName: string,
 ): InfrastructureService | null {
   const rawName = container.name;
-  const prefix = projectName + '-';
-  const serviceName = rawName.startsWith(prefix) ? rawName.slice(prefix.length) : rawName;
+  const serviceName = stripComposeReplicaSuffix(stripProjectPrefix(rawName, projectName));
   const name = sanitizeIdentifier(serviceName);
   const image = container.image;
   if (!image) return null;
@@ -45,6 +57,9 @@ function serviceFromContainer(
     name,
     image,
   };
+  if (container.status !== null && container.status !== 'running') {
+    service.desiredStatus = 'stopped';
+  }
   if (ports.length > 0) service.ports = ports;
   return service;
 }
@@ -70,8 +85,15 @@ export function deriveSpecFromRuntime(
         ...existing,
         image: container.image ?? existing.image,
       };
+      if (derived.desiredStatus) {
+        merged.desiredStatus = derived.desiredStatus;
+      } else {
+        delete merged.desiredStatus;
+      }
       if (derived.ports && derived.ports.length > 0) {
         merged.ports = derived.ports;
+      } else {
+        delete merged.ports;
       }
       services.push(merged);
     } else {
@@ -79,22 +101,43 @@ export function deriveSpecFromRuntime(
     }
   }
 
-  const finalServices = services.length > 0 ? services : sourceSpec.services;
+  const finalServices = services;
 
   const observedNetworks = actual.networks
-    .map((network) => network.name)
+    .map((network) => normalizeRuntimeResourceName(network.name, projectName))
     .filter((name) => IDENTIFIER_RE.test(name));
   const finalNetworks = observedNetworks.length > 0 ? observedNetworks : sourceSpec.networks;
 
   const observedVolumes = actual.volumes
-    .map((volume) => volume.name)
+    .map((volume) => normalizeRuntimeResourceName(volume.name, projectName))
     .filter((name) => IDENTIFIER_RE.test(name));
-  const finalVolumes = observedVolumes.length > 0 ? observedVolumes : sourceSpec.volumes;
+  const finalVolumes = observedVolumes;
+
+  const syncedServiceNames = new Set(finalServices.map((service) => service.name));
+  const syncedVolumeNames = new Set(finalVolumes);
+  const reconciledServices = finalServices.map((service) => {
+    const reconciled: InfrastructureService = { ...service };
+    if (reconciled.dependsOn) {
+      reconciled.dependsOn = reconciled.dependsOn.filter((dep) => syncedServiceNames.has(dep));
+      if (reconciled.dependsOn.length === 0) delete reconciled.dependsOn;
+    }
+    if (reconciled.volumes) {
+      reconciled.volumes = reconciled.volumes.filter((mount) => {
+        const [source] = mount.split(':');
+        return !source || syncedVolumeNames.has(source);
+      });
+      if (reconciled.volumes.length === 0) delete reconciled.volumes;
+    }
+    return reconciled;
+  });
 
   return {
     projectName,
-    services: finalServices,
+    services: reconciledServices,
     networks: finalNetworks,
     volumes: finalVolumes,
   };
 }
+
+
+

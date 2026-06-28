@@ -41,6 +41,10 @@ function toContainerName(projectName: string, serviceName: string): string {
   return projectName + '-' + serviceName.replace(/[_\s]+/g, '-');
 }
 
+function isRunningStatus(status: string | null): boolean {
+  return status === 'running';
+}
+
 function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string[] {
   const desired = current.desired;
   const containers = current.actual.containers;
@@ -58,8 +62,9 @@ function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string
     const label = service.name.padEnd(nameWidth);
 
     if (!container) {
+      const desiredStatus = service.desiredStatus ?? 'running';
       lines.push(
-        `  - ${label} | MISSING | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | status: absent (DRIFT)`,
+        `  - ${label} | MISSING | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | desired: ${desiredStatus} | status: absent (DRIFT)`,
       );
       continue;
     }
@@ -70,12 +75,18 @@ function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string
       service.image.startsWith(container.image);
     const desiredPorts = (service.ports ?? []).join(', ') || 'none';
     const actualPorts = (container.ports ?? []).join(', ') || 'none';
-    const portsOk = (service.ports ?? []).every((port) =>
+    const desiredStatus = service.desiredStatus ?? 'running';
+    const status = container.status ?? 'unknown';
+    const lifecycleOk = desiredStatus === 'running'
+      ? isRunningStatus(container.status)
+      : !isRunningStatus(container.status);
+    const shouldComparePorts = desiredStatus === 'running' && isRunningStatus(container.status);
+    const portsOk = !shouldComparePorts || (service.ports ?? []).every((port) =>
       (container.ports ?? []).some((actualPort) => actualPort.includes(port.split(':')[0] ?? '')),
     );
-    const status = container.status ?? 'unknown';
+    const portsMarker = shouldComparePorts ? (portsOk ? '(ok)' : '(DRIFT)') : '(not checked)';
     lines.push(
-      `  - ${label} | image: ${service.image} ${imageOk ? '==' : '!='} ${container.image ?? 'unknown'} ${imageOk ? '(ok)' : '(DRIFT)'} | ports: ${desiredPorts} ${portsOk ? '==' : '!='} ${actualPorts} ${portsOk ? '(ok)' : '(DRIFT)'} | status: ${status}`,
+      `  - ${label} | image: ${service.image} ${imageOk ? '==' : '!='} ${container.image ?? 'unknown'} ${imageOk ? '(ok)' : '(DRIFT)'} | lifecycle: ${desiredStatus} ${lifecycleOk ? '==' : '!='} ${status} ${lifecycleOk ? '(ok)' : '(DRIFT)'} | ports: ${desiredPorts} ${portsOk ? '==' : '!='} ${actualPorts} ${portsMarker}`,
     );
   }
 
@@ -112,6 +123,7 @@ function formatCurrentState(snapshot: InfrastructureStateSnapshot): string {
     `Observed containers: ${observedContainers || 'none'}`,
     `Last observed: ${current.actual.lastObservedAt ?? 'never'}`,
     `Verification status: ${current.verificationReport?.status ?? current.verification.status}`,
+    `Verification findings: ${formatVerificationFindings(current)}`,
     `Observed networks: ${current.actual.networks.map((n) => n.name).join(', ') || 'none'}`,
     `Observed volumes: ${current.actual.volumes.map((v) => v.name).join(', ') || 'none'}`,
     `Observed images: ${current.actual.images.map((i) => i.reference).join(', ') || 'none'}`,
@@ -123,6 +135,27 @@ function formatCurrentState(snapshot: InfrastructureStateSnapshot): string {
   ].join('\n');
 }
 
+function formatVerificationFindings(
+  current: NonNullable<InfrastructureStateSnapshot['current']>,
+): string {
+  const findings = current.verificationReport?.findings ?? [];
+  if (findings.length === 0) {
+    return current.verification.issues.length > 0 ? current.verification.issues.join('; ') : 'none';
+  }
+  return findings
+    .map((finding) => `${finding.code}/${finding.severity}${finding.resourceName ? `:${finding.resourceName}` : ''}`)
+    .join(', ');
+}
+
+function formatRevisionHistory(
+  current: NonNullable<InfrastructureStateSnapshot['current']>,
+): string {
+  const history = current.revisionHistory ?? [];
+  if (history.length === 0) return 'none';
+  return history
+    .map((entry) => `#${entry.attemptIndex}:${entry.revisionDecision}`)
+    .join(', ');
+}
 function formatPendingPreview(snapshot: InfrastructureStateSnapshot): string {
   if (!snapshot.pendingPreview) {
     return 'Pending preview: none';

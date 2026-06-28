@@ -1,14 +1,11 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdirSync } from 'node:fs';
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { renderCompose } from '../compose/render-compose.js';
 import {
   DomainValidationError,
   validateInfrastructureStateSnapshot,
-  validateLegacyStateSnapshot,
 } from '../domain/schemas.js';
 import type {
   AgentObservation,
@@ -18,13 +15,13 @@ import type {
   DetailedDryRunPreview,
   ExecutionPlan,
   InfrastructureStateSnapshot,
-  LegacyStateSnapshot,
   PendingPreviewState,
   InfrastructureSpec,
   ReActStep,
   RequestMetadata,
   RuntimeActualState,
   RuntimeResourceRefs,
+  RevisionHistoryRecord,
   DriftReport,
   RepairReport,
   CleanupReport,
@@ -36,10 +33,8 @@ import type {
 
 const STATE_DIR = path.resolve('state');
 const STATE_DATABASE = path.join(STATE_DIR, 'infra-state.sqlite');
-const LEGACY_JSON_STATE_FILE = path.join(STATE_DIR, 'infra-state.json');
 const STATE_SCHEMA_VERSION = 1;
 const SQLITE_USER_VERSION = 1;
-const COMPOSE_ARTIFACT_TARGET_PATH = 'docker-compose.yaml';
 const SINGLETON_STATE_ID = 1;
 
 export interface StateStoreOptions {
@@ -85,8 +80,7 @@ export async function loadState(
   const databasePath = getStateDatabasePath(options);
 
   if (databasePath !== ':memory:' && !existsSync(databasePath)) {
-    const migratedState = loadLegacyJsonStateIfPresent(databasePath);
-    return migratedState;
+    return null;
   }
 
   const database = openDatabase(databasePath);
@@ -273,6 +267,7 @@ export interface SaveVerifiedRuntimeSnapshotInput {
   driftReport?: DriftReport | null;
   repairReport?: RepairReport | null;
   cleanupReport?: CleanupReport | null;
+  revisionHistory?: RevisionHistoryRecord[];
   observedAt?: string;
   appliedAt?: string;
   savedAt?: string;
@@ -316,6 +311,7 @@ export async function saveVerifiedRuntimeSnapshot(
     driftReport: input.driftReport ?? null,
     repairReport: input.repairReport ?? null,
     cleanupReport: input.cleanupReport ?? null,
+    revisionHistory: input.revisionHistory ?? input.sourceSnapshot?.revisionHistory ?? [],
     observedAt,
     operation: input.operation,
     approvedAt,
@@ -326,7 +322,7 @@ export async function saveVerifiedRuntimeSnapshot(
     type: 'verified-runtime-saved',
     projectName: desired.projectName,
     request,
-    summary: `Saved verified runtime snapshot for project "${desired.projectName}" after ${input.operation}.`,
+    summary: `Saved verified runtime snapshot for project "${desired.projectName}" after ${input.operation}. Findings: ${formatFindingCodes(input.verificationReport)} Revision decisions: ${formatRevisionDecisions(input.revisionHistory ?? input.sourceSnapshot?.revisionHistory ?? [])}.`,
     createdAt: savedAt,
   });
   const nextState = validateInfrastructureStateSnapshot({
@@ -338,6 +334,19 @@ export async function saveVerifiedRuntimeSnapshot(
   return nextState;
 }
 
+
+function formatFindingCodes(report: VerificationReport): string {
+  const findings = report.findings ?? [];
+  return findings.length > 0
+    ? findings.map((finding) => finding.code + '/' + finding.severity).join(', ')
+    : 'none';
+}
+
+function formatRevisionDecisions(history: RevisionHistoryRecord[]): string {
+  return history.length > 0
+    ? history.map((entry) => '#' + String(entry.attemptIndex) + ':' + entry.revisionDecision).join(', ')
+    : 'none';
+}
 function toVerificationState(report: VerificationReport): VerificationState {
   return {
     status: report.status === 'passed' ? 'passed' : report.status === 'uncertain' ? 'uncertain' : 'failed',
@@ -374,6 +383,36 @@ export async function saveStateOperationRecord(
     ...existingState,
     current: existingState.current,
     pendingPreview: existingState.pendingPreview,
+    history: [...existingState.history, record],
+  });
+  await saveState(nextState, options);
+  return nextState;
+}
+
+export interface ClearManagedStateAfterDestroyAllInput {
+  projectName: string;
+  request: RequestMetadata | null;
+  summary: string;
+  createdAt?: string;
+}
+
+export async function clearManagedStateAfterDestroyAll(
+  input: ClearManagedStateAfterDestroyAllInput,
+  options: StateStoreOptions = {},
+): Promise<InfrastructureStateSnapshot> {
+  const existingState = (await loadState(options)) ?? createEmptyStateSnapshot();
+  const createdAt = input.createdAt ?? new Date().toISOString();
+  const record = createStateOperationRecord({
+    type: 'destroy-all-executed',
+    projectName: input.projectName,
+    request: input.request,
+    summary: input.summary,
+    createdAt,
+  });
+  const nextState = validateInfrastructureStateSnapshot({
+    ...existingState,
+    current: null,
+    pendingPreview: null,
     history: [...existingState.history, record],
   });
   await saveState(nextState, options);
@@ -463,86 +502,6 @@ export function getStateDatabasePath(options: StateStoreOptions = {}): string {
   return options.stateDatabasePath ?? STATE_DATABASE;
 }
 
-export function getLegacyJsonStatePath(): string {
-  return LEGACY_JSON_STATE_FILE;
-}
-
-export function migrateLegacyStateSnapshot(
-  legacySnapshot: LegacyStateSnapshot,
-): InfrastructureStateSnapshot {
-  const createdAt =
-    legacySnapshot.desiredStateSavedAt ??
-    legacySnapshot.lastAppliedAt ??
-    new Date().toISOString();
-  const request: RequestMetadata = {
-    raw: 'Legacy state imported from pre-SQLite state storage.',
-    normalizedPrompt: 'legacy-state-import',
-    intent: 'create',
-  };
-  const composeYaml = renderCompose(legacySnapshot.desired);
-  const legacyPlan: ExecutionPlan = {
-    summary: `Legacy imported state for project "${legacySnapshot.desired.projectName}".`,
-    spec: legacySnapshot.desired,
-    assumptions: [
-      'Imported from legacy pre-SQLite state during state migration.',
-      'Legacy actual runtime values are treated as placeholders, not verified runtime state.',
-    ],
-    steps: [
-      {
-        id: 'legacy-import',
-        description: 'Import legacy desired state as pending preview memory.',
-        action: 'write-state',
-      },
-    ],
-  };
-  const pendingPreview: PendingPreviewState = {
-    id: `legacy-preview-${toStableId(createdAt)}`,
-    request,
-    desired: legacySnapshot.desired,
-    plan: legacyPlan,
-    composeArtifact: createComposeArtifactRecord(
-      COMPOSE_ARTIFACT_TARGET_PATH,
-      composeYaml,
-      false,
-      null,
-    ),
-    dryRunPreview: null,
-    observations: [
-      {
-        source: 'state:migration',
-        message:
-          'Legacy pre-SQLite state was imported as pending preview memory; no verified runtime current state was created.',
-      },
-    ],
-    trace: [],
-    verification: createVerificationState(
-      'preview',
-      'Legacy state migration has not verified actual Docker runtime state.',
-      ['Current state remains null until a future approved apply observes runtime.'],
-    ),
-    createdAt,
-    acceptedAt: null,
-    approval: null,
-    approvedAction: null,
-  };
-
-  return {
-    schemaVersion: STATE_SCHEMA_VERSION,
-    current: null,
-    pendingPreview,
-    history: [
-      createStateOperationRecord({
-        type: 'legacy-state-migrated',
-        projectName: legacySnapshot.desired.projectName,
-        request,
-        summary:
-          'Imported legacy state as pending preview; verified current runtime state remains empty.',
-        createdAt,
-      }),
-    ],
-  };
-}
-
 function openDatabaseForWrite(options: StateStoreOptions): Database.Database {
   const databasePath = getStateDatabasePath(options);
 
@@ -551,43 +510,6 @@ function openDatabaseForWrite(options: StateStoreOptions): Database.Database {
   }
 
   return openDatabase(databasePath);
-}
-
-function loadLegacyJsonStateIfPresent(
-  databasePath: string,
-): InfrastructureStateSnapshot | null {
-  const legacyJsonPath = path.join(path.dirname(databasePath), 'infra-state.json');
-
-  if (!existsSync(legacyJsonPath)) {
-    return null;
-  }
-
-  let parsed: unknown;
-
-  try {
-    parsed = JSON.parse(readFileSync(legacyJsonPath, 'utf8'));
-  } catch (error) {
-    throw new StateStoreError(
-      `Legacy JSON state file is malformed and cannot be imported: ${getErrorMessage(error)}`,
-    );
-  }
-
-  try {
-    return validateInfrastructureStateSnapshot(parsed);
-  } catch (stateError) {
-    try {
-      return migrateLegacyStateSnapshot(validateLegacyStateSnapshot(parsed));
-    } catch (legacyError) {
-      throw new StateStoreError(
-        [
-          'Legacy JSON state file cannot be imported as a SQLite-compatible state snapshot.',
-          getValidationErrorMessage(stateError),
-          'Legacy v0 migration also failed.',
-          getValidationErrorMessage(legacyError),
-        ].join('\n'),
-      );
-    }
-  }
 }
 
 function openDatabase(databasePath: string): Database.Database {

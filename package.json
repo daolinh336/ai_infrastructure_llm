@@ -5,13 +5,13 @@
   "description": "Natural-language infrastructure management CLI using a ReAct-style agent",
   "type": "module",
   "bin": {
-    "aiagent": "./dist/cli.js",
-    "infra-react-agent": "./dist/cli.js"
+    "aiagent": "./dist/cli/index.js",
+    "infra-react-agent": "./dist/cli/index.js"
   },
   "scripts": {
-    "dev": "tsx src/cli.ts",
+    "dev": "tsx src/cli/index.ts",
     "build": "tsc -p tsconfig.build.json",
-    "start": "node dist/cli.js",
+    "start": "node dist/cli/index.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "eslint .",
     "test": "vitest run",

@@ -1,20 +1,18 @@
 import { randomBytes } from 'node:crypto';
 import {
-  validateDependencyAwareExecutionSchedule,
-  validateDetailedDryRunPreview,
+  validateClarificationAnswer,
   validateExecutionPlan,
-  validateInfrastructureStateSnapshot,
+  validatePlanningClarificationContext,
   validateInfrastructureSpec,
+  validatePlanningUncertainty,
   validateReactReasoningOutput,
   validateValidatedQuery,
 } from '../domain/schemas.js';
-import { renderCompose } from '../compose/render-compose.js';
 import { reactReasoningOutputJsonSchema } from '../domain/structured-output-schemas.js';
 import {
   SUPPORTED_IMAGE_BASES,
   getImageReferenceBase,
   isSupportedImageReference,
-  resolveImageReference,
   type ImageReferenceResolution,
 } from '../domain/supported-images.js';
 import type {
@@ -22,6 +20,8 @@ import type {
   AgentRunResult,
   AgentTool,
   AgentToolResult,
+  ClarificationAnswer,
+  ClarificationChoice,
   DependencyAwareExecutionSchedule,
   DetailedDryRunPreview,
   DraftServiceQuery,
@@ -30,24 +30,26 @@ import type {
   InfrastructureService,
   InfrastructureSpec,
   PlanStep,
+  PlanningUncertainty,
   ProgressReporter,
   ReActStep,
   ReActReasoningOutput,
   ValidatedQuery,
   VerificationReport,
   GuardTelemetry,
+  PlannerRevisionRequest,
+  PlannerRevisionResult,
+  PlanningClarificationContext,
 } from '../domain/types.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import type { LlmProvider } from '../llm/provider.js';
+import type { StateStoreOptions } from '../state/sqlite-state-store.js';
+import { AgentToolRegistry } from './tool-registry.js';
 import {
-  loadState,
-  saveState,
-  type StateStoreOptions,
-} from '../state/sqlite-state-store.js';
-import {
-  buildDependencyAwareExecutionSchedule,
-  buildDetailedDryRunPreview,
-} from '../execution/dependency-schedule.js';
+  createInternalAgentToolRegistry,
+  type DraftSpecProposal,
+  type PlanBuildInput,
+} from './internal-tools.js';
 import type { PlannerAgent, VerifierAgent } from './agent-interfaces.js';
 import { StandardPlannerAgent } from './standard-planner-agent.js';
 import { StandardVerifierAgent } from './standard-verifier-agent.js';
@@ -63,11 +65,6 @@ import {
   type LoopLogSink,
 } from './loop-guard.js';
 
-const DEPLOY_DETAILS_CLARIFICATION_QUESTION = [
-  'Can ban noi ro hon truoc khi lap plan.',
-  'Vui long cho biet: image/runtime nao se dung cho tung service/container, container nao deploy tu image nao, so luong/replicas mong muon, port nao can expose, network nao can tao/dung chung, volume nao can mount/persist, va env/secrets neu co.',
-  `Hien baseline chi ho tro image/runtime: ${SUPPORTED_IMAGE_BASES.join(', ')}.`,
-].join(' ');
 
 const DEFAULT_IMAGE_BY_BASE = new Map<string, string>([
   ['alpine', 'alpine:3.20'],
@@ -105,25 +102,14 @@ const STATEFUL_SERVICE_IMAGES = new Set([
   'kafka',
 ]);
 
-interface DraftSpecProposal {
-  spec: InfrastructureSpec;
-  assumptions: string[];
-}
-
-interface PlanBuildInput {
-  spec: InfrastructureSpec;
-  rawPrompt: string;
-  assumptions: string[];
+interface ImageReferenceResolutionInput {
+  image: string;
 }
 
 interface SpecRepairInput {
   spec: InfrastructureSpec;
   rawPrompt: string;
   validationIssue: string;
-}
-
-interface ImageReferenceResolutionInput {
-  image: string;
 }
 
 interface DetailedDryRunPreviewInput {
@@ -178,7 +164,7 @@ export interface ReActAgentLoopOptions {
 }
 
 export class ReActAgent {
-  private readonly tools: AgentTool[];
+  private readonly tools: AgentToolRegistry;
   private readonly loopGuardConfig: LoopGuardConfig;
   private readonly loopOptions: ReActAgentLoopOptions;
   private guard: ReActLoopGuard | null = null;
@@ -189,28 +175,21 @@ export class ReActAgent {
     private readonly stateStore: StateStoreOptions = {},
     private readonly planner: PlannerAgent = new StandardPlannerAgent(provider),
     private readonly verifier: VerifierAgent = new StandardVerifierAgent(),
-    private readonly dockerMcpClient?: DockerMcpGateway,
     loopOptions: ReActAgentLoopOptions = {},
   ) {
     this.loopGuardConfig = loopOptions.config ?? loadLoopGuardConfig();
     this.loopOptions = loopOptions;
-    this.tools = [
-      createLoadStateTool(this.stateStore),
-      createResolveImageReferenceTool(),
-      createProposeDraftSpecTool(),
-      createRepairInfrastructureSpecTool(),
-      createBuildExecutionPlanTool(),
-      createValidateInfrastructureSpecTool(),
-      createBuildDependencyAwareExecutionScheduleTool(),
-      createRenderComposePreviewTool(),
-      createBuildDetailedDryRunPreviewTool(),
-      createEvaluateDryRunPolicyTool(),
-      createSaveStateTool(this.stateStore),
-    ];
+    this.tools = createInternalAgentToolRegistry({
+      stateStore: this.stateStore,
+      formatStateMemoryObservation,
+      proposeDraftSpec,
+      repairInfrastructureSpec,
+      buildExecutionPlanFromSpec,
+    });
   }
 
   listTools(): Array<Pick<AgentTool, 'name' | 'description'>> {
-    return this.tools.map((tool) => ({
+    return this.tools.listTools().map((tool) => ({
       name: tool.name,
       description: tool.description,
     }));
@@ -218,6 +197,62 @@ export class ReActAgent {
 
   async verifyAfterApply(plan: ExecutionPlan, mcpClient: DockerMcpGateway): Promise<VerificationReport> {
     return this.verifier.verify(plan.spec, mcpClient);
+  }
+
+  async reviseFromFeedback(request: PlannerRevisionRequest): Promise<PlannerRevisionResult> {
+    return this.planner.reviseFromFeedback(request);
+  }
+
+  async continueFromClarification(
+    context: PlanningClarificationContext,
+    answer: ClarificationAnswer,
+  ): Promise<AgentRunResult> {
+    const validContext = validatePlanningClarificationContext(context);
+    const validAnswer = validateClarificationAnswer(answer);
+    const resolvedSpec = applyClarificationAnswer(validContext, validAnswer);
+    const remainingUncertainties = detectPlanningUncertainties(resolvedSpec).filter(
+      (uncertainty) => uncertainty.severity === 'blocking',
+    );
+
+    const observations: AgentObservation[] = [
+      {
+        source: 'observe:user_clarification',
+        message:
+          validAnswer.otherText !== null
+            ? `User clarification: ${validAnswer.otherText}`
+            : `User selected clarification choice ${validAnswer.selectedChoiceId}.`,
+      },
+    ];
+    const trace: ReActStep[] = [];
+
+    if (remainingUncertainties.length) {
+      const primaryUncertainty = remainingUncertainties[0]!;
+      return {
+        status: 'clarification',
+        clarificationQuestion: formatPlanningUncertaintyQuestion(primaryUncertainty),
+        clarificationChoices: primaryUncertainty.choices,
+        allowOther: primaryUncertainty.allowOther,
+        uncertainties: remainingUncertainties,
+        clarificationContext: {
+          ...validContext,
+          spec: resolvedSpec,
+          uncertainties: remainingUncertainties,
+        },
+        observations,
+        trace,
+      };
+    }
+
+    return this.buildPlannedResultFromValidatedSpec(
+      validContext.query,
+      resolvedSpec,
+      [
+        ...validContext.assumptions,
+        `User resolved planning uncertainty ${validAnswer.uncertaintyId} before final plan build.`,
+      ],
+      observations,
+      trace,
+    );
   }
 
   async run(query: ValidatedQuery): Promise<AgentRunResult> {
@@ -237,7 +272,7 @@ export class ReActAgent {
       this.reportProgress,
     );
 
-    await this.observeStructuredReasoning(validatedQuery, trace, observations);
+    const reasoning = await this.observeStructuredReasoning(validatedQuery, trace, observations);
 
     const imageResolution = await this.resolveDraftImageReferences(
       validatedQuery,
@@ -246,45 +281,20 @@ export class ReActAgent {
     );
 
     if (imageResolution.status === 'clarification') {
-      return {
-        status: 'clarification',
-        clarificationQuestion: imageResolution.question,
-        observations,
-        trace,
-      };
+      return imageResolution.result;
     }
 
     validatedQuery = imageResolution.query;
 
-    if (needsDeployDetailsClarification(validatedQuery)) {
-      recordStep(
-        trace,
-        observations,
-        {
-          phase: 'reason',
-          message:
-            'The request is infrastructure-related but not deployable yet because image/container/network/volume details are missing.',
-          toolName: null,
-        },
-        this.reportProgress,
-      );
-      recordStep(
-        trace,
-        observations,
-        {
-          phase: 'observe',
-          message: DEPLOY_DETAILS_CLARIFICATION_QUESTION,
-          toolName: 'ask_user',
-        },
-        this.reportProgress,
-      );
-
-      return {
-        status: 'clarification',
-        clarificationQuestion: DEPLOY_DETAILS_CLARIFICATION_QUESTION,
-        observations,
-        trace,
-      };
+    const imageSelectionClarification = buildImageSelectionClarification(
+      validatedQuery,
+      reasoning,
+      trace,
+      observations,
+      this.reportProgress,
+    );
+    if (imageSelectionClarification) {
+      return imageSelectionClarification;
     }
 
     await this.runTool('load_state', validatedQuery, trace, observations);
@@ -405,7 +415,80 @@ export class ReActAgent {
     }
 
     const validatedSpec = specValidationResult.data as InfrastructureSpec;
-    const guardTelemetry: GuardTelemetry = this.guard.converge();
+
+    const planningUncertainties = detectPlanningUncertainties(validatedSpec);
+    const blockingUncertainties = planningUncertainties.filter(
+      (uncertainty) => uncertainty.severity === 'blocking',
+    );
+
+    if (blockingUncertainties.length) {
+      const primaryUncertainty = blockingUncertainties[0]!;
+      const clarificationQuestion = formatPlanningUncertaintyQuestion(primaryUncertainty);
+      recordStep(
+        trace,
+        observations,
+        {
+          phase: 'observe',
+          message: [
+            'Planning uncertainty is blocking safe dependency inference.',
+            primaryUncertainty.message,
+            primaryUncertainty.reason,
+          ].join(' '),
+          toolName: 'ask_user',
+        },
+        this.reportProgress,
+      );
+
+      return {
+        status: 'clarification',
+        clarificationQuestion,
+        clarificationChoices: primaryUncertainty.choices,
+        allowOther: primaryUncertainty.allowOther,
+        uncertainties: blockingUncertainties,
+        clarificationContext: {
+          query: validatedQuery,
+          spec: validatedSpec,
+          assumptions: proposal.assumptions,
+          uncertainties: blockingUncertainties,
+        },
+        observations,
+        trace,
+        guardTelemetry: this.guard.converge(),
+      };
+    }
+    return this.buildPlannedResultFromValidatedSpec(
+      validatedQuery,
+      validatedSpec,
+      proposal.assumptions,
+      observations,
+      trace,
+    );
+  } catch (error) {
+    if (error instanceof ReActLoopGuardError) {
+      return {
+        status: 'blocked',
+        blockReason: error.blockReason,
+        iterations: error.iterations,
+        guardTelemetry: error.telemetry,
+        observations,
+        trace,
+      };
+    }
+    throw error;
+  } finally {
+    this.guard?.close();
+    this.guard = null;
+  }
+  }
+
+  private async buildPlannedResultFromValidatedSpec(
+    query: ValidatedQuery,
+    validatedSpec: InfrastructureSpec,
+    assumptions: string[],
+    observations: AgentObservation[],
+    trace: ReActStep[],
+  ): Promise<AgentRunResult> {
+    const guardTelemetry: GuardTelemetry | undefined = this.guard?.converge();
 
     recordStep(
       trace,
@@ -423,8 +506,8 @@ export class ReActAgent {
       'build_execution_plan',
       {
         spec: validatedSpec,
-        rawPrompt: validatedQuery.raw,
-        assumptions: proposal.assumptions,
+        rawPrompt: query.raw,
+        assumptions,
       } satisfies PlanBuildInput,
       trace,
       observations,
@@ -524,38 +607,21 @@ export class ReActAgent {
     return {
       status: 'planned',
       request: {
-        raw: validatedQuery.raw,
-        normalizedPrompt: validatedQuery.normalizedPrompt,
-        intent: validatedQuery.intent,
+        raw: query.raw,
+        normalizedPrompt: query.normalizedPrompt,
+        intent: query.intent,
       },
       plan,
       observations,
       trace,
-      guardTelemetry,
+      ...(guardTelemetry ? { guardTelemetry } : {}),
     };
-  } catch (error) {
-    if (error instanceof ReActLoopGuardError) {
-      return {
-        status: 'blocked',
-        blockReason: error.blockReason,
-        iterations: error.iterations,
-        guardTelemetry: error.telemetry,
-        observations,
-        trace,
-      };
-    }
-    throw error;
-  } finally {
-    this.guard?.close();
-    this.guard = null;
   }
-}
-
   private async observeStructuredReasoning(
     query: ValidatedQuery,
     trace: ReActStep[],
     observations: AgentObservation[],
-  ): Promise<void> {
+  ): Promise<ReActReasoningOutput | null> {
     try {
       this.reportProgress({
         phase: 'plan',
@@ -577,6 +643,7 @@ export class ReActAgent {
         message: formatReasoningObservation(reasoning),
         toolName: 'llm_reasoning',
       }, this.reportProgress);
+      return reasoning;
     } catch (error) {
       recordStep(trace, observations, {
         phase: 'observe',
@@ -587,6 +654,7 @@ export class ReActAgent {
         ].join(' '),
         toolName: 'llm_reasoning',
       }, this.reportProgress);
+      return null;
     }
   }
 
@@ -596,7 +664,7 @@ export class ReActAgent {
     observations: AgentObservation[],
   ): Promise<
     | { status: 'resolved'; query: ValidatedQuery }
-    | { status: 'clarification'; question: string }
+    | { status: 'clarification'; result: AgentRunResult }
   > {
     let changed = false;
     const services: DraftServiceQuery[] = [];
@@ -616,41 +684,45 @@ export class ReActAgent {
       );
 
       if (!result.ok) {
-        recordStep(
+        const fallbackResult = buildUnsupportedImageClarification(
+          query,
+          service,
+          {
+            raw: service.image,
+            resolved: null,
+            candidates: [],
+            confidence: 'none',
+            reason: 'unsupported',
+            needsClarification: true,
+          },
+          result.observation,
           trace,
           observations,
-          {
-            phase: 'observe',
-            message: result.observation,
-            toolName: 'ask_user',
-          },
           this.reportProgress,
         );
 
         return {
           status: 'clarification',
-          question: result.observation,
+          result: fallbackResult,
         };
       }
 
       const resolution = result.data as ImageReferenceResolution;
 
       if (resolution.confidence !== 'high' || resolution.resolved === null) {
-        const question = buildImageResolutionQuestion(resolution);
-        recordStep(
+        const result = buildUnsupportedImageClarification(
+          query,
+          service,
+          resolution,
+          buildImageResolutionQuestion(resolution),
           trace,
           observations,
-          {
-            phase: 'observe',
-            message: question,
-            toolName: 'ask_user',
-          },
           this.reportProgress,
         );
 
         return {
           status: 'clarification',
-          question,
+          result,
         };
       }
 
@@ -691,11 +763,7 @@ export class ReActAgent {
     observations: AgentObservation[],
     options: { throwOnFailure?: boolean } = {},
   ): Promise<AgentToolResult> {
-    const tool = this.tools.find((candidate) => candidate.name === toolName);
-
-    if (!tool) {
-      throw new Error(`Unknown agent tool: ${toolName}`);
-    }
+    const tool = this.tools.get(toolName);
 
     this.guard?.checkToolCap(toolName);
 
@@ -705,7 +773,7 @@ export class ReActAgent {
       toolName: tool.name,
     }, this.reportProgress);
 
-    const result = await tool.invoke(input);
+    const result = await this.tools.invoke(toolName, input);
 
     recordStep(trace, observations, {
       phase: 'observe',
@@ -719,325 +787,6 @@ export class ReActAgent {
 
     return result;
   }
-}
-
-function createLoadStateTool(stateStore: StateStoreOptions): AgentTool {
-  return {
-    name: 'load_state',
-    description: 'Read saved desired/actual state as ReAct memory without mutating runtime.',
-    async invoke(): Promise<AgentToolResult> {
-      const snapshot = await loadState(stateStore).catch((error: unknown) => ({
-        error: getErrorMessage(error),
-      }));
-
-      if (snapshot !== null && 'error' in snapshot) {
-        return {
-          ok: true,
-          observation: `Saved state could not be loaded: ${snapshot.error}`,
-          data: null,
-        };
-      }
-
-      if (snapshot === null) {
-        return {
-          ok: true,
-          observation: 'No saved infrastructure state found.',
-          data: null,
-        };
-      }
-
-      return {
-        ok: true,
-        observation: formatStateMemoryObservation(snapshot),
-        data: snapshot,
-      };
-    },
-  };
-}
-
-function createResolveImageReferenceTool(): AgentTool {
-  return {
-    name: 'resolve_image_reference',
-    description:
-      'Resolve one image/runtime reference against the supported image catalog before spec generation.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const imageInput = parseImageReferenceResolutionInput(input);
-        const resolution = resolveImageReference(imageInput.image);
-
-        return {
-          ok: true,
-          observation: formatImageResolutionObservation(resolution),
-          data: resolution,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
-}
-
-function createProposeDraftSpecTool(): AgentTool {
-  return {
-    name: 'propose_draft_spec',
-    description:
-      'Normalize the ValidatedQuery draft into a candidate InfrastructureSpec before validation.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const query = validateValidatedQuery(input);
-        const proposal = proposeDraftSpec(query);
-
-        return {
-          ok: true,
-          observation: [
-            `Proposed draft spec with ${proposal.spec.services.length} service(s).`,
-            `Assumptions: ${proposal.assumptions.join('; ')}.`,
-          ].join(' '),
-          data: proposal,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
-}
-
-function createRepairInfrastructureSpecTool(): AgentTool {
-  return {
-    name: 'repair_infra_spec',
-    description:
-      'Repair a candidate InfrastructureSpec after validation returns an observation.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const repairInput = parseSpecRepairInput(input);
-        const repairedSpec = repairInfrastructureSpec(repairInput.spec);
-        const validSpec = validateInfrastructureSpec(repairedSpec);
-
-        return {
-          ok: true,
-          observation: [
-            'Repaired draft spec and validation can be retried.',
-            `Original validation issue: ${repairInput.validationIssue}`,
-          ].join(' '),
-          data: validSpec,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
-}
-
-function createBuildExecutionPlanTool(): AgentTool {
-  return {
-    name: 'build_execution_plan',
-    description: 'Build an execution plan from a validated InfrastructureSpec.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const planInput = parsePlanBuildInput(input);
-        const plan = buildExecutionPlanFromSpec(planInput);
-
-        return {
-          ok: true,
-          observation: [
-            `Built execution plan from validated spec with ${plan.spec.services.length} service(s).`,
-            `Assumptions: ${plan.assumptions.join('; ')}.`,
-          ].join(' '),
-          data: plan,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
-}
-
-function createValidateInfrastructureSpecTool(): AgentTool {
-  return {
-    name: 'validate_infra_spec',
-    description: 'Validate the infrastructure spec before returning a plan.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const spec = validateInfrastructureSpec(input);
-
-        return {
-          ok: true,
-          observation: `Validated infrastructure spec for project "${spec.projectName}".`,
-          data: spec,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
-}
-
-function createBuildDependencyAwareExecutionScheduleTool(): AgentTool {
-  return {
-    name: 'build_dependency_aware_execution_schedule',
-    description:
-      'Build a dependency-aware dry-run execution schedule without mutating runtime.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const spec = validateInfrastructureSpec(input);
-        const schedule = buildDependencyAwareExecutionSchedule(spec);
-
-        return {
-          ok: true,
-          observation: [
-            `Built dependency-aware execution schedule with ${schedule.steps.length} step(s).`,
-            `Service start order: ${schedule.serviceStartOrder.join(' -> ')}.`,
-            `Destroy order preview: ${schedule.destroyOrder.join(' -> ')}.`,
-            `Readiness warnings: ${schedule.warnings.length}.`,
-          ].join(' '),
-          data: schedule,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
-}
-
-function createRenderComposePreviewTool(): AgentTool {
-  return {
-    name: 'render_compose_preview',
-    description: 'Render Docker Compose YAML from a validated infrastructure spec.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const spec = validateInfrastructureSpec(input);
-        const composeYaml = renderCompose(spec);
-        const lineCount = composeYaml.trim().split(/\r?\n/).length;
-
-        return {
-          ok: true,
-          observation: `Rendered Docker Compose preview with ${lineCount} line(s).`,
-          data: composeYaml,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
-}
-
-function createBuildDetailedDryRunPreviewTool(): AgentTool {
-  return {
-    name: 'build_detailed_dry_run_preview',
-    description:
-      'Build a detailed dependency-aware dry-run report without Docker, MCP, artifact writes, or state writes.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const previewInput = parseDetailedDryRunPreviewInput(input);
-        const preview = buildDetailedDryRunPreview(
-          previewInput.plan,
-          previewInput.composeYaml,
-          previewInput.schedule,
-        );
-
-        return {
-          ok: true,
-          observation: [
-            `Built detailed dry-run preview for ${preview.totalServices} service(s) and ${preview.totalContainers} container(s).`,
-            `Artifact target "${preview.artifactTargetPath}" was not written.`,
-            'Docker not called; MCP not called; state not saved.',
-          ].join(' '),
-          data: preview,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
-}
-
-function createEvaluateDryRunPolicyTool(): AgentTool {
-  return {
-    name: 'evaluate_dry_run_policy',
-    description:
-      'Evaluate detailed dry-run policy warnings such as exposed ports, default secrets, volumes, and preview-only readiness gates.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const preview = validateDetailedDryRunPreview(input);
-        const findings = preview.policyFindings;
-        const warningCount = findings.filter((finding) => finding.severity === 'warning').length;
-        const blockerCount = findings.filter((finding) => finding.severity === 'blocker').length;
-
-        return {
-          ok: blockerCount === 0,
-          observation: [
-            `Evaluated dry-run policy with ${findings.length} finding(s).`,
-            `Warnings: ${warningCount}. Blockers: ${blockerCount}.`,
-          ].join(' '),
-          data: findings,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
-}
-
-function createSaveStateTool(stateStore: StateStoreOptions): AgentTool {
-  return {
-    name: 'save_state',
-    description:
-      'Persist a validated desired-state snapshot after the approval/execution phase allows state writes.',
-    async invoke(input: unknown): Promise<AgentToolResult> {
-      try {
-        const snapshot = validateInfrastructureStateSnapshot(input);
-        await saveState(snapshot, stateStore);
-
-        return {
-          ok: true,
-          observation: 'Saved infrastructure state memory file.',
-          data: snapshot,
-        };
-      } catch (error) {
-        return {
-          ok: false,
-          observation: getErrorMessage(error),
-          data: null,
-        };
-      }
-    },
-  };
 }
 
 function formatStateMemoryObservation(snapshot: InfrastructureStateSnapshot): string {
@@ -1114,61 +863,257 @@ function formatReasoningObservation(reasoning: ReActReasoningOutput): string {
   ].join(' ');
 }
 
-function needsDeployDetailsClarification(query: ValidatedQuery): boolean {
+function buildImageSelectionClarification(
+  query: ValidatedQuery,
+  reasoning: ReActReasoningOutput | null,
+  trace: ReActStep[],
+  observations: AgentObservation[],
+  reportProgress: ProgressReporter,
+): AgentRunResult | null {
   if (query.intent !== 'create') {
-    return false;
+    return null;
   }
 
-  return (
-    !query.draft.services.length ||
-    query.draft.services.every((service) => service.image === null)
+  const hasNullImageService = query.draft.services.some((service) => service.image === null);
+  if (!hasNullImageService || !hasGenericDeployTargetSignal(query)) {
+    return null;
+  }
+
+  const recommendedImage = inferRecommendedImage(query, reasoning);
+  const provisionalQuery: ValidatedQuery = {
+    ...query,
+    draft: {
+      ...query.draft,
+      services: query.draft.services.map((service) =>
+        service.image === null
+          ? { ...service, image: recommendedImage, name: service.name ?? 'web' }
+          : service,
+      ),
+    },
+  };
+
+  const provisionalSpec = buildSpecFromDraft(provisionalQuery);
+  const targetService =
+    provisionalSpec.services.find((service) => service.image === recommendedImage) ??
+    provisionalSpec.services[0];
+
+  if (!targetService) {
+    return null;
+  }
+
+  const uncertainty = validatePlanningUncertainty({
+    id: `select-image:${targetService.name}`,
+    severity: 'blocking',
+    field: 'services[].image',
+    message: `ReAct reasoning interpreted the request "${query.normalizedPrompt}" but no image/runtime was specified. Choose the default image to create the preview.`,
+    reason: `LLM reasoning: ${reasoning ? reasoning.summary : 'none'}. You can confirm it or choose another option; you can still revise after the dry run if needed.`,
+    affectedServices: [targetService.name],
+    choices: buildImageSelectionCandidates(targetService.name, recommendedImage),
+    allowOther: true,
+  });
+
+  recordStep(
+    trace,
+    observations,
+    {
+      phase: 'reason',
+      message: `The request has no explicit image/runtime; ReAct reasoning proposes "${recommendedImage}" and asks the user to confirm before planning.`,
+      toolName: null,
+    },
+    reportProgress,
+  );
+
+  recordStep(
+    trace,
+    observations,
+    {
+      phase: 'observe',
+      message: formatPlanningUncertaintyQuestion(uncertainty),
+      toolName: 'ask_user',
+    },
+    reportProgress,
+  );
+
+  return {
+    status: 'clarification',
+    clarificationQuestion: formatPlanningUncertaintyQuestion(uncertainty),
+    clarificationChoices: uncertainty.choices,
+    allowOther: uncertainty.allowOther,
+    uncertainties: [uncertainty],
+    clarificationContext: {
+      query,
+      spec: provisionalSpec,
+      assumptions: inferPlanAssumptions(query, provisionalSpec),
+      uncertainties: [uncertainty],
+    },
+    observations,
+    trace,
+  };
+}
+
+function hasGenericDeployTargetSignal(query: ValidatedQuery): boolean {
+  return /\b(web|website|trang web|app|ung dung|service|container|containers|image|images)\b/i.test(
+    query.normalizedPrompt,
   );
 }
 
-function parseImageReferenceResolutionInput(input: unknown): ImageReferenceResolutionInput {
-  if (!isRecord(input)) {
-    throw new Error('Image resolution input must be an object.');
+function inferRecommendedImage(
+  query: ValidatedQuery,
+  reasoning: ReActReasoningOutput | null,
+): string {
+  const text = [reasoning?.summary ?? '', reasoning?.rationale ?? '', query.normalizedPrompt]
+    .join(' ')
+    .toLowerCase();
+
+  if (/\b(static|tinh|website|web)\b/.test(text)) {
+    return 'nginx:stable';
   }
 
-  const image = input.image;
-
-  if (typeof image !== 'string' || image.trim() === '') {
-    throw new Error('Image resolution input requires image.');
+  if (/\b(backend|api|node|server|ung dung)\b/.test(text)) {
+    return 'node:20-alpine';
   }
+
+  return 'nginx:stable';
+}
+
+function buildImageSelectionCandidates(
+  serviceName: string,
+  recommendedImage: string,
+): ClarificationChoice[] {
+  const all = [
+    {
+      image: 'nginx:stable',
+      label: 'nginx - static web server',
+      description: 'Serves a static website (HTML/CSS/JS). Suitable for a static web request.',
+    },
+    {
+      image: 'httpd:2.4',
+      label: 'httpd - static web server',
+      description: 'Apache httpd, another static web server option.',
+    },
+    {
+      image: 'node:20-alpine',
+      label: 'node - backend app server',
+      description: 'Node.js for a backend/API application.',
+    },
+  ];
+
+  const ordered = [
+    ...all.filter((candidate) => candidate.image === recommendedImage),
+    ...all.filter((candidate) => candidate.image !== recommendedImage),
+  ];
+
+  return ordered.map((candidate, index) => ({
+    id: String(index + 1),
+    label: candidate.label,
+    description: candidate.description,
+    value: `setServiceImage:${serviceName}:${candidate.image}`,
+  }));
+}
+
+function buildUnsupportedImageClarification(
+  query: ValidatedQuery,
+  targetService: DraftServiceQuery,
+  resolution: ImageReferenceResolution,
+  question: string,
+  trace: ReActStep[],
+  observations: AgentObservation[],
+  reportProgress: ProgressReporter,
+): AgentRunResult {
+  const serviceName =
+    targetService.name ??
+    getImageReferenceBase(resolution.candidates[0] ?? resolution.raw) ??
+    'service';
+  const suggestedImages = buildSuggestedImageReferences(resolution);
+  const defaultImage = suggestedImages[0] ?? 'nginx:stable';
+  const provisionalQuery = validateValidatedQuery({
+    ...query,
+    draft: {
+      ...query.draft,
+      services: query.draft.services.map((service) =>
+        service === targetService
+          ? {
+              ...service,
+              image: defaultImage,
+              name: service.name ?? serviceName,
+            }
+          : service,
+      ),
+    },
+  });
+  const provisionalSpec = buildSpecFromDraft(provisionalQuery);
+  const resolvedServiceName =
+    provisionalSpec.services.find((service) => service.image === defaultImage)?.name ?? serviceName;
+  const uncertainty = validatePlanningUncertainty({
+    id: `unsupported-image:${resolvedServiceName}`,
+    severity: 'blocking',
+    field: 'services[].image',
+    message: `The requested image/runtime "${resolution.raw}" is not currently supported by the catalog. Choose one of the suggested images to continue planning, or select Other to keep a custom value.`,
+    reason: question,
+    affectedServices: [resolvedServiceName],
+    choices: suggestedImages.map((image, index) => ({
+      id: String(index + 1),
+      label: image,
+      description:
+        index === 0
+          ? 'Recommended closest supported image/runtime.'
+          : 'Alternative supported image/runtime suggestion.',
+      value: `setServiceImage:${resolvedServiceName}:${image}`,
+    })),
+    allowOther: true,
+  });
+
+  recordStep(
+    trace,
+    observations,
+    {
+      phase: 'observe',
+      message: formatPlanningUncertaintyQuestion(uncertainty),
+      toolName: 'ask_user',
+    },
+    reportProgress,
+  );
 
   return {
-    image,
+    status: 'clarification',
+    clarificationQuestion: formatPlanningUncertaintyQuestion(uncertainty),
+    clarificationChoices: uncertainty.choices,
+    allowOther: true,
+    uncertainties: [uncertainty],
+    clarificationContext: {
+      query,
+      spec: provisionalSpec,
+      assumptions: [
+        ...inferPlanAssumptions(provisionalQuery, provisionalSpec),
+        `The original requested image/runtime was "${resolution.raw}" and requires user confirmation before final planning.`,
+      ],
+      uncertainties: [uncertainty],
+    },
+    observations,
+    trace,
   };
 }
 
-function parseDetailedDryRunPreviewInput(input: unknown): DetailedDryRunPreviewInput {
-  if (!isRecord(input)) {
-    throw new Error('Detailed dry-run preview input must be an object.');
+function buildSuggestedImageReferences(resolution: ImageReferenceResolution): string[] {
+  const suggested = resolution.candidates.map(
+    (candidate) => DEFAULT_IMAGE_BY_BASE.get(candidate) ?? candidate,
+  );
+
+  if (!suggested.length) {
+    return ['nginx:stable', 'httpd:2.4', 'node:20-alpine'];
   }
 
-  const composeYaml = input.composeYaml;
+  const fallbacks = ['nginx:stable', 'httpd:2.4', 'node:20-alpine'];
+  const unique = new Set<string>();
 
-  if (typeof composeYaml !== 'string' || composeYaml.trim() === '') {
-    throw new Error('Detailed dry-run preview input requires composeYaml.');
+  for (const image of [...suggested, ...fallbacks]) {
+    unique.add(image);
+    if (unique.size >= 3) {
+      break;
+    }
   }
 
-  return {
-    plan: validateExecutionPlan(input.plan),
-    composeYaml,
-    schedule: validateDependencyAwareExecutionSchedule(input.schedule),
-  };
-}
-
-function formatImageResolutionObservation(resolution: ImageReferenceResolution): string {
-  if (resolution.confidence === 'high' && resolution.resolved !== null) {
-    return [
-      `Resolved image reference "${resolution.raw}" to "${resolution.resolved}".`,
-      `Confidence: ${resolution.confidence}.`,
-      `Reason: ${resolution.reason}.`,
-    ].join(' ');
-  }
-
-  return buildImageResolutionQuestion(resolution);
+  return [...unique];
 }
 
 function buildImageResolutionQuestion(resolution: ImageReferenceResolution): string {
@@ -1177,63 +1122,13 @@ function buildImageResolutionQuestion(resolution: ImageReferenceResolution): str
     : '';
 
   return [
-    `Can ban xac nhan image/runtime "${resolution.raw}" truoc khi lap plan.`,
+    `Please confirm image/runtime "${resolution.raw}" before planning.`,
     resolution.reason === 'ambiguous'
-      ? 'He thong thay ten nay gan voi mot vai image supported nhung chua du chac de tu sua.'
-      : 'Image/runtime nay chua nam trong supported image list.',
+      ? 'The system found multiple supported images that may match this name, but not enough confidence to auto-correct it.'
+      : 'This image/runtime is not in the supported image list.',
     candidateText,
-    `Supported images hien tai: ${SUPPORTED_IMAGE_BASES.join(', ')}.`,
+    `Currently supported images: ${SUPPORTED_IMAGE_BASES.join(', ')}.`,
   ].join(' ');
-}
-
-function parsePlanBuildInput(input: unknown): PlanBuildInput {
-  if (!isRecord(input)) {
-    throw new Error('Plan build input must be an object.');
-  }
-
-  const rawPrompt = input.rawPrompt;
-  const assumptions = input.assumptions;
-
-  if (typeof rawPrompt !== 'string' || rawPrompt.trim() === '') {
-    throw new Error('Plan build input requires rawPrompt.');
-  }
-
-  if (
-    !Array.isArray(assumptions) ||
-    assumptions.length === 0 ||
-    !assumptions.every((assumption) => typeof assumption === 'string' && assumption.trim() !== '')
-  ) {
-    throw new Error('Plan build input requires at least one assumption.');
-  }
-
-  return {
-    spec: validateInfrastructureSpec(input.spec),
-    rawPrompt,
-    assumptions,
-  };
-}
-
-function parseSpecRepairInput(input: unknown): SpecRepairInput {
-  if (!isRecord(input)) {
-    throw new Error('Spec repair input must be an object.');
-  }
-
-  const rawPrompt = input.rawPrompt;
-  const validationIssue = input.validationIssue;
-
-  if (typeof rawPrompt !== 'string' || rawPrompt.trim() === '') {
-    throw new Error('Spec repair input requires rawPrompt.');
-  }
-
-  if (typeof validationIssue !== 'string' || validationIssue.trim() === '') {
-    throw new Error('Spec repair input requires validationIssue.');
-  }
-
-  return {
-    spec: input.spec as InfrastructureSpec,
-    rawPrompt,
-    validationIssue,
-  };
 }
 
 function proposeDraftSpec(query: ValidatedQuery): DraftSpecProposal {
@@ -1361,6 +1256,286 @@ function inferPlanAssumptions(query: ValidatedQuery, spec: InfrastructureSpec): 
   }
 
   return assumptions;
+}
+
+function detectPlanningUncertainties(spec: InfrastructureSpec): PlanningUncertainty[] {
+  const servicesByName = new Map(spec.services.map((service) => [service.name, service]));
+  const backendNames = spec.services
+    .filter((service) => service.kind === 'backend')
+    .map((service) => service.name);
+  const databaseNames = spec.services
+    .filter((service) => service.kind === 'database')
+    .map((service) => service.name);
+  const uncertainties: PlanningUncertainty[] = [];
+
+  for (const service of spec.services) {
+    const dependencyNames = service.dependsOn ?? [];
+    const backendDependencies = dependencyNames.filter(
+      (dependencyName) => servicesByName.get(dependencyName)?.kind === 'backend',
+    );
+    const databaseDependencies = dependencyNames.filter(
+      (dependencyName) => servicesByName.get(dependencyName)?.kind === 'database',
+    );
+
+    if (
+      service.kind === 'reverse-proxy' &&
+      backendNames.length > 1 &&
+      backendDependencies.length !== 1
+    ) {
+      uncertainties.push(
+        validatePlanningUncertainty({
+          id: `depends-on:${service.name}:backend-target`,
+          severity: 'blocking',
+          field: 'services[].dependsOn',
+          message: `Reverse proxy service "${service.name}" has multiple possible backend targets.`,
+          reason:
+            'Choosing the wrong backend changes routing and startup order, so the planner must not silently infer this dependency.',
+          affectedServices: [service.name, ...backendNames],
+          choices: backendNames.map((backendName, index) => ({
+            id: String(index + 1),
+            label: `Route to ${backendName}`,
+            description: `Set ${service.name}.dependsOn to ${backendName}.`,
+            value: `dependsOn:${service.name}:${backendName}`,
+          })),
+          allowOther: true,
+        }),
+      );
+    }
+
+    if (
+      service.kind === 'backend' &&
+      databaseNames.length > 1 &&
+      databaseDependencies.length !== 1
+    ) {
+      uncertainties.push(
+        validatePlanningUncertainty({
+          id: `depends-on:${service.name}:database-target`,
+          severity: 'blocking',
+          field: 'services[].dependsOn',
+          message: `Backend service "${service.name}" has multiple possible database dependencies.`,
+          reason:
+            'Choosing the wrong database changes app state and readiness order, so the planner must ask user before finalizing dependsOn.',
+          affectedServices: [service.name, ...databaseNames],
+          choices: [
+            ...databaseNames.map((databaseName, index) => ({
+              id: String(index + 1),
+              label: `Use ${databaseName}`,
+              description: `Set ${service.name}.dependsOn to ${databaseName}.`,
+              value: `dependsOn:${service.name}:${databaseName}`,
+            })),
+            {
+              id: String(databaseNames.length + 1),
+              label: 'No database dependency',
+              description: `Leave ${service.name}.dependsOn without a database dependency.`,
+              value: `noDatabase:${service.name}`,
+            },
+          ],
+          allowOther: true,
+        }),
+      );
+    }
+  }
+
+  const cyclePath = findDependencyCycle(spec.services);
+  if (cyclePath.length) {
+    uncertainties.push(
+      validatePlanningUncertainty({
+        id: 'depends-on:cycle',
+        severity: 'blocking',
+        field: 'services[].dependsOn',
+        message: `Dependency cycle detected: ${cyclePath.join(' -> ')}.`,
+        reason:
+          'Cyclic dependsOn cannot produce a safe startup order; user must choose which dependency edge to remove or revise.',
+        affectedServices: uniqueIdentifiers(cyclePath),
+        choices: cyclePath.slice(0, -1).map((serviceName, index) => {
+          const nextServiceName = cyclePath[index + 1]!;
+          return {
+            id: String(index + 1),
+            label: `Remove ${serviceName} -> ${nextServiceName}`,
+            description: `Remove ${nextServiceName} from ${serviceName}.dependsOn.`,
+            value: `removeEdge:${serviceName}:${nextServiceName}`,
+          };
+        }),
+        allowOther: true,
+      }),
+    );
+  }
+
+  return uncertainties;
+}
+
+function applyClarificationAnswer(
+  context: PlanningClarificationContext,
+  answer: ClarificationAnswer,
+): InfrastructureSpec {
+  const uncertainty = context.uncertainties.find(
+    (candidate) => candidate.id === answer.uncertaintyId,
+  );
+
+  if (!uncertainty) {
+    throw new Error(`Unknown planning uncertainty: ${answer.uncertaintyId}`);
+  }
+
+  const choiceValue = answer.selectedChoiceId !== null
+    ? uncertainty.choices.find((choice) => choice.id === answer.selectedChoiceId)?.value ?? null
+    : null;
+  const resolvedValue = choiceValue ?? inferChoiceValueFromOtherText(uncertainty, answer.otherText);
+
+  if (resolvedValue === null) {
+    throw new Error('Clarification answer did not resolve to a supported planning change.');
+  }
+
+  const services = context.spec.services.map((service) => ({
+    ...service,
+    dependsOn: service.dependsOn ? [...service.dependsOn] : undefined,
+  }));
+
+  if (resolvedValue.startsWith('dependsOn:')) {
+    const [, serviceName, dependencyName] = resolvedValue.split(':');
+    const service = services.find((candidate) => candidate.name === serviceName);
+    if (!service || !dependencyName) {
+      throw new Error(`Invalid clarification dependency value: ${resolvedValue}`);
+    }
+    service.dependsOn = [dependencyName];
+  } else if (resolvedValue.startsWith('noDatabase:')) {
+    const [, serviceName] = resolvedValue.split(':');
+    const databaseNames = new Set(
+      context.spec.services
+        .filter((service) => service.kind === 'database')
+        .map((service) => service.name),
+    );
+    const service = services.find((candidate) => candidate.name === serviceName);
+    if (!service) {
+      throw new Error(`Invalid clarification no-database value: ${resolvedValue}`);
+    }
+    const remainingDependencies = (service.dependsOn ?? []).filter(
+      (dependencyName) => !databaseNames.has(dependencyName),
+    );
+    service.dependsOn = remainingDependencies.length ? remainingDependencies : undefined;
+  } else if (resolvedValue.startsWith('removeEdge:')) {
+    const [, serviceName, dependencyName] = resolvedValue.split(':');
+    const service = services.find((candidate) => candidate.name === serviceName);
+    if (!service || !dependencyName) {
+      throw new Error(`Invalid clarification remove-edge value: ${resolvedValue}`);
+    }
+    const remainingDependencies = (service.dependsOn ?? []).filter(
+      (candidate) => candidate !== dependencyName,
+    );
+    service.dependsOn = remainingDependencies.length ? remainingDependencies : undefined;
+  } else if (resolvedValue.startsWith('setServiceImage:')) {
+    const [, serviceName, ...imageParts] = resolvedValue.split(':');
+    const imageRef = imageParts.join(':');
+    const service = services.find((candidate) => candidate.name === serviceName);
+    if (!service || !imageRef) {
+      throw new Error(`Invalid clarification setServiceImage value: ${resolvedValue}`);
+    }
+    service.image = imageRef;
+  } else {
+    throw new Error(`Unsupported clarification value: ${resolvedValue}`);
+  }
+
+  return validateInfrastructureSpec({
+    ...context.spec,
+    services,
+  });
+}
+
+function inferChoiceValueFromOtherText(
+  uncertainty: PlanningUncertainty,
+  otherText: string | null,
+): string | null {
+  if (otherText === null) {
+    return null;
+  }
+
+  const normalized = otherText.toLowerCase();
+  const matchedChoice = uncertainty.choices.find((choice) => {
+    const [, , dependencyName] = choice.value.split(':');
+    return dependencyName !== undefined && normalized.includes(dependencyName.toLowerCase());
+  });
+
+  if (matchedChoice) {
+    return matchedChoice.value;
+  }
+
+  if (uncertainty.field === 'services[].image') {
+    const serviceName = uncertainty.affectedServices[0];
+    if (serviceName !== undefined) {
+      return `setServiceImage:${serviceName}:${otherText}`;
+    }
+  }
+
+  if (
+    uncertainty.id.includes(':database-target') &&
+    /\b(no|none|khong|kh\u00f4ng)\b/i.test(otherText)
+  ) {
+    return uncertainty.choices.find((choice) => choice.value.startsWith('noDatabase:'))?.value ?? null;
+  }
+
+  return null;
+}
+
+function formatPlanningUncertaintyQuestion(uncertainty: PlanningUncertainty): string {
+  const choices = uncertainty.choices.map(
+    (choice) => `${choice.id}. ${choice.label} - ${choice.description}`,
+  );
+  if (uncertainty.allowOther) {
+    choices.push('Other. Enter a custom choice if the options above are not correct.');
+  }
+
+  return [
+    uncertainty.message,
+    uncertainty.reason,
+    'Choose one option so ReAct can use the answer as an observation and continue planning:',
+    ...choices,
+  ].join('\n');
+}
+
+function findDependencyCycle(services: InfrastructureService[]): string[] {
+  const servicesByName = new Map(services.map((service) => [service.name, service]));
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const path: string[] = [];
+
+  function visit(serviceName: string): string[] | null {
+    if (visiting.has(serviceName)) {
+      const startIndex = path.indexOf(serviceName);
+      return [...path.slice(Math.max(startIndex, 0)), serviceName];
+    }
+
+    if (visited.has(serviceName)) {
+      return null;
+    }
+
+    const service = servicesByName.get(serviceName);
+    if (!service) {
+      return null;
+    }
+
+    visiting.add(serviceName);
+    path.push(serviceName);
+
+    for (const dependencyName of service.dependsOn ?? []) {
+      const cycle = visit(dependencyName);
+      if (cycle !== null) {
+        return cycle;
+      }
+    }
+
+    path.pop();
+    visiting.delete(serviceName);
+    visited.add(serviceName);
+    return null;
+  }
+
+  for (const service of services) {
+    const cycle = visit(service.name);
+    if (cycle !== null) {
+      return cycle;
+    }
+  }
+
+  return [];
 }
 
 function repairInfrastructureSpec(spec: InfrastructureSpec): InfrastructureSpec {
@@ -1710,10 +1885,6 @@ function sanitizeIdentifier(value: string): string {
   return sanitized || '';
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
 function getErrorMessage(error: unknown): string {
   if (error instanceof Error) {
     return error.message;
@@ -1725,3 +1896,5 @@ function getErrorMessage(error: unknown): string {
 function noopProgress(): void {
   return undefined;
 }
+
+

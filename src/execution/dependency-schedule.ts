@@ -239,7 +239,7 @@ export function evaluateDryRunPolicy(
     findings.push({
       severity: 'warning',
       code: 'readiness-not-enforced-in-dry-run',
-      message: `Service "${service.name}" has a planned wait gate (${inferWaitCondition(service)}), but no explicit healthcheck/readiness rule is enforced in Phase 6 dry-run.`,
+      message: `Service "${service.name}" has a planned wait gate (${inferWaitCondition(service)}), but this dry-run preview does not enforce runtime healthchecks yet.`,
       resourceName: service.name,
       resourceType: 'service',
     });
@@ -399,7 +399,7 @@ function buildScheduleWarnings(
     }
 
     warnings.push(
-      `Service "${service.name}" has planned wait condition "${inferWaitCondition(service)}", but Phase 6 does not enforce runtime healthchecks.`,
+      `Service "${service.name}" has planned wait condition "${inferWaitCondition(service)}", but this preview does not enforce runtime healthchecks yet.`,
     );
   }
 
@@ -408,7 +408,7 @@ function buildScheduleWarnings(
 
 function buildServiceWarnings(service: InfrastructureService): string[] {
   return [
-    `Readiness gate is preview-only in Phase 6: ${inferWaitCondition(service)}.`,
+    `Readiness gate is preview-only in this dry-run: ${inferWaitCondition(service)}.`,
   ];
 }
 

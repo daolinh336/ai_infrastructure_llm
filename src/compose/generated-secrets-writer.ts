@@ -24,8 +24,8 @@ export async function writeGeneratedSecretsFile(
     `# Project: ${projectName}`,
     `# Generated at: ${generatedAt}`,
     '# ----------------------------------------------------------------',
-    '# File này chỉ để ĐỌC — không chỉnh sửa.',
-    '# Muốn dùng mật khẩu riêng? Điền vào .env rồi chạy lại plan.',
+    '# Read-only reference file — do not edit.',
+    '# Want custom passwords? Put them in .env, then run plan again.',
     '# ================================================================',
     '',
   ];
