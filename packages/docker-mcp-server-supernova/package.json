@@ -13,10 +13,7 @@
     "start": "node dist/index.js",
     "dev": "tsc && node dist/index.js",
     "test": "vitest run",
-    "prepublishOnly": "npm run build",
-    "cf:dev": "wrangler dev src/cf-worker/index.ts",
-    "cf:deploy": "wrangler deploy src/cf-worker/index.ts",
-    "cf:typecheck": "tsc --noEmit src/cf-worker/*.ts"
+    "prepublishOnly": "npm run build"
   },
   "keywords": [
     "agent",
@@ -87,12 +84,10 @@
     "zod": "^3.24.0"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260613.1",
     "@types/dockerode": "^3.3.31",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.1.0",
-    "wrangler": "^4.100.0"
+    "vitest": "^3.1.0"
   },
   "homepage": "https://github.com/friendlygeorge/docker-mcp-server#readme",
   "bugs": {

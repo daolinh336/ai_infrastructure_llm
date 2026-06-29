@@ -229,20 +229,29 @@ export interface ActionClassification {
 
 export type FindingCode =
   | 'HOST_PORT_CONFLICT'
+  | 'REPLICA_PORT_BIND_CONFLICT'
   | 'CONTAINER_NAME_CONFLICT'
+  | 'PROJECT_NAME_CONFLICT'
   | 'NETWORK_NAME_CONFLICT'
   | 'VOLUME_NAME_CONFLICT'
+  | 'MOUNT_DENIED'
+  | 'ENV_INVALID'
   | 'MISSING_CONTAINER'
   | 'CONTAINER_NOT_RUNNING'
   | 'CONTAINER_UNHEALTHY'
+  | 'HEALTHCHECK_FAILED'
   | 'IMAGE_MISMATCH'
   | 'IMAGE_NOT_FOUND'
+  | 'IMAGE_PULL_FAILED'
   | 'PORT_MISMATCH'
   | 'NETWORK_MISMATCH'
   | 'VOLUME_MISMATCH'
   | 'DEPENDENCY_NOT_READY'
+  | 'DOCKER_PERMISSION_DENIED'
+  | 'MCP_TOOL_ERROR'
   | 'RUNTIME_DRIFT'
-  | 'RUNTIME_OBSERVATION_UNCERTAIN';
+  | 'RUNTIME_OBSERVATION_UNCERTAIN'
+  | 'UNKNOWN_RUNTIME_ERROR';
 
 export type VerificationSeverity = 'info' | 'warning' | 'error' | 'blocker';
 
@@ -504,6 +513,72 @@ export interface RevisionObservation {
   driftSummary: string | null;
 }
 
+export interface RuntimeIssueReport {
+  status: 'failed' | 'blocked' | 'error' | 'drift';
+  phase:
+    | 'pre-deploy'
+    | 'deploy'
+    | 'start-container'
+    | 'post-deploy-verify'
+    | 'observe'
+    | 'cleanup';
+  checkedAt: string;
+  projectName: string;
+  attemptIndex: number;
+  desiredSpec: InfrastructureSpec;
+  issues: VerificationFinding[];
+  rawError?: {
+    message: string;
+    source: 'docker-mcp' | 'docker-engine' | 'verifier' | 'cli' | 'unknown';
+    code?: string;
+  };
+  actualState?: RuntimeActualState | null;
+  composePreview?: {
+    yaml: string;
+    sha256: string;
+  };
+  cleanup?: CleanupReport | null;
+}
+
+export type FeedbackIntentName =
+  | 'change-port'
+  | 'change-name'
+  | 'change-replicas'
+  | 'change-image'
+  | 'change-env'
+  | 'change-volume'
+  | 'change-network'
+  | 'remove-exposure'
+  | 'yaml-edit-intent'
+  | 'retry-as-is'
+  | 'cancel'
+  | 'unknown';
+
+export interface FeedbackIntent {
+  source: 'user-other-feedback';
+  rawText: string;
+  intent: FeedbackIntentName;
+  target?: {
+    resourceKind?: 'project' | 'service' | 'container' | 'port' | 'image' | 'volume' | 'network' | 'environment';
+    serviceSelector?: ServiceSelector;
+    currentValue?: string;
+  };
+  desiredChange?: {
+    hostPort?: number;
+    containerPort?: number;
+    name?: string;
+    replicas?: number;
+    image?: string;
+    environment?: Record<string, string>;
+    volumes?: string[];
+    networks?: string[];
+    yamlFragment?: string;
+  };
+  confidence: number;
+  ambiguities: string[];
+  requiresUserInput: boolean;
+}
+
 export interface ServiceSelector {
   name?: string;
   nameLike?: string;
@@ -640,6 +715,9 @@ export interface ResolvedSpecPatchResult {
 
 export interface PlannerRevisionRequest {
   desiredSpec: InfrastructureSpec;
+  currentPlan?: ExecutionPlan;
+  runtimeIssueReport?: RuntimeIssueReport;
+  feedbackIntent?: FeedbackIntent | null;
   revisionObservation: RevisionObservation;
   stateSnapshot: InfrastructureStateSnapshot | null;
   resourceRefs?: RuntimeResourceRefs;

@@ -1,6 +1,7 @@
 import type { InfrastructureSpec } from '../domain/types.js';
 import { validateInfrastructureSpec } from '../domain/schemas.js';
 import { getImageReferenceBase } from '../domain/supported-images.js';
+import { normalizeStatefulDatabaseReplicaVolumes } from '../domain/stateful-database-volumes.js';
 import YAML from 'yaml';
 
 /**
@@ -81,22 +82,22 @@ export function getRuntimeKeepaliveCommand(image: string): string[] | undefined 
 }
 
 export function renderCompose(spec: InfrastructureSpec): string {
-  const validSpec = validateInfrastructureSpec(spec);
+  const validSpec = normalizeStatefulDatabaseReplicaVolumes(
+    validateInfrastructureSpec(spec),
+  );
   const compose = {
     services: Object.fromEntries(
       validSpec.services.map((service) => {
         const imageBase = getImageReferenceBase(service.image);
         const healthcheck = DATABASE_HEALTHCHECKS[imageBase];
         const command = getRuntimeKeepaliveCommand(service.image);
-
+        const replicas = service.replicas ?? 1;
         return [
           service.name,
           {
             image: service.image,
             restart: 'unless-stopped',
-            ...(service.replicas && service.replicas > 1
-              ? { deploy: { replicas: service.replicas } }
-              : {}),
+            deploy: { replicas },
             ...(service.ports?.length ? { ports: service.ports } : {}),
             ...(service.environment ? { environment: service.environment } : {}),
             ...(service.dependsOn?.length ? { depends_on: service.dependsOn } : {}),
@@ -105,12 +106,12 @@ export function renderCompose(spec: InfrastructureSpec): string {
             ...(healthcheck ? { healthcheck } : {}),
             networks: validSpec.networks,
           },
-        ];
+        ] as const;
       }),
     ),
     networks: Object.fromEntries(validSpec.networks.map((name) => [name, {}])),
     volumes: Object.fromEntries(validSpec.volumes.map((name) => [name, {}])),
   };
 
-  return YAML.stringify(compose);
+  return YAML.stringify(compose, { aliasDuplicateObjects: false });
 }

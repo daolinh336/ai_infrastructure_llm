@@ -1,5 +1,6 @@
 import type { Command } from 'commander';
 import chalk from 'chalk';
+import type { InfrastructureSpec } from '../domain/types.js';
 import { ReActAgent } from '../agent/react-agent.js';
 import {
   ClosedLoopGuard,
@@ -69,13 +70,19 @@ export function registerPlanCommand(program: Command): void {
     .option(
       '--provider <provider>',
       'LLM provider to use (stub|openai|gemini)',
-      process.env.INFRA_AGENT_PROVIDER ?? 'stub',
+      process.env.INFRA_AGENT_PROVIDER ?? 'openai',
     )
     .action(async (prompt, options) => {
       const reportProgress = createProgressPrinter();
       const applyRequested = Boolean(options.apply);
       const saveStateRequested = Boolean(options.saveState);
       const deployRequested = Boolean(options.deploy);
+      if (deployRequested && !applyRequested) {
+        console.error(chalk.red('CLI failed.'));
+        console.error('--deploy requires --apply so the plan is approved before Docker deployment.');
+        process.exitCode = 1;
+        return;
+      }
       const input = cliInputSchema.parse({
         prompt,
         dryRun:
@@ -508,6 +515,14 @@ export function registerPlanCommand(program: Command): void {
                   'Saved verified runtime state to SQLite after deploy.',
                 ),
               );
+              if (deployLoopResult.successfulDeployResult) {
+                printDockerDeploySummary(
+                  deployLoopResult.currentApprovedAction.validatedSpec,
+                  deployLoopResult.successfulDeployResult,
+                  deployLoopResult.attempts,
+                  deployLoopResult.revisionHistory.length,
+                );
+              }
             } else {
               console.log(
                 chalk.red(
@@ -556,3 +571,36 @@ export function registerPlanCommand(program: Command): void {
       );
     });
 }
+
+function printDockerDeploySummary(
+  spec: InfrastructureSpec,
+  deployResult: NonNullable<Awaited<ReturnType<typeof runClosedLoopDeploy>>['successfulDeployResult']>,
+  attempts: number,
+  revisionCount: number,
+): void {
+  console.log(chalk.green('Docker deployment completed.'));
+  console.log(`- project: ${spec.projectName}`);
+  console.log(`- attempts: ${attempts}${revisionCount > 0 ? ` (${revisionCount} revision${revisionCount === 1 ? '' : 's'} before success)` : ''}`);
+  console.log(`- services: ${formatServiceSummary(spec)}`);
+  console.log(`- containers: ${formatList(deployResult.containersStarted.map((container) => container.name))}`);
+  console.log(`- images: ${formatList(deployResult.imagesPulled)}`);
+  console.log(`- networks: ${formatList(deployResult.networksCreated)}`);
+}
+
+function formatServiceSummary(spec: InfrastructureSpec): string {
+  if (spec.services.length === 0) {
+    return 'none';
+  }
+  return spec.services
+    .map((service) => {
+      const replicas = service.replicas && service.replicas > 1 ? ` x${service.replicas}` : '';
+      const ports = service.ports?.length ? ` ports ${service.ports.join(',')}` : '';
+      return `${service.kind}/${service.name}${replicas} (${service.image}${ports})`;
+    })
+    .join('; ');
+}
+
+function formatList(values: string[]): string {
+  return values.length > 0 ? values.join(', ') : 'none';
+}
+

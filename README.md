@@ -41,7 +41,7 @@ This baseline is the first milestone, not the final research direction.
 
 ## Current scope
 
-The current implementation is synced through the Phase 8 control boundary in the
+The current implementation is synced through the Phase 9+10 Docker MCP runtime milestone in the
 11-phase roadmap. It provides:
 - a TypeScript CLI entrypoint
 - a pre-ReAct Static Gateway for obvious unsafe/out-of-scope pre-screening,
@@ -90,11 +90,7 @@ The current data boundary is:
   separately from future verified desired/actual runtime state
 - compose text is stored only as artifact metadata/content and must not become the primary domain object
 
-The current implementation intentionally stops short of real Docker deployment,
-runtime observation, and full drift detection. Those behaviors belong to Phase
-9+ after MCP and Docker runtime boundaries are implemented.
-
-For the first real Docker milestone, keep the demo intentionally basic, but define the custom/wrapper MCP contract before exposing runtime tools to the agent. Existing Docker MCP servers may be used for prototyping behind an adapter, but the agent should only see the project's narrow, policy-controlled tool surface.
+The current implementation includes a guarded Docker MCP deploy path through the vendored Supernova server. Full drift reconciliation and a project-owned custom MCP server remain future hardening work. The agent should continue to see only the project's narrow, policy-controlled tool surface.
 
 ## Runtime safety layers for MCP + Docker Engine API
 
@@ -167,13 +163,13 @@ Docker deploys use the local Supernova MCP server by default. The runtime path i
 Before a real deploy or the opt-in E2E smoke test, build the server:
 
 ```bash
-npm --prefix .worktrees/docker-mcp-server-supernova install
+npm --prefix packages/docker-mcp-server-supernova install
 npm run build:supernova-mcp
 npm run test:e2e:docker-mcp
 npm run test:e2e:docker-mcp:all-tools
 ```
 
-The default profile is `supernova-local` and runs `node .worktrees/docker-mcp-server-supernova/dist/index.js`. `INFRA_DOCKER_MCP_PROFILE=legacy-uvx` and `INFRA_DOCKER_MCP_PROFILE=official` remain explicit debug overrides only.
+The default profile is `supernova-local` and runs `node packages/docker-mcp-server-supernova/dist/index.js`. `INFRA_DOCKER_MCP_PROFILE=official` remains an explicit debug override for Docker Desktop MCP Gateway experiments.
 
 ## LLM provider setup
 
@@ -206,6 +202,36 @@ Provider variables:
   (defaults to the direct Google endpoint), `GEMINI_REACT_MODEL`, `GEMINI_AUX_MODEL`.
 - `OPENAI_BASE_URL` only affects the OpenAI provider; Gemini always uses its own
   direct Google endpoint via `GEMINI_BASE_URL`.
+
+## Runtime limits in `.env`
+
+The CLI loads `.env` at startup, so loop guards and runtime safety limits can be
+changed without editing TypeScript code:
+
+```bash
+# Agent loop guard limits
+INFRA_AGENT_MAX_REACT_ITERATIONS=14
+INFRA_AGENT_REPEAT_TOLERANCE=3
+INFRA_AGENT_MAX_CALLS_PER_TOOL=5
+INFRA_AGENT_NO_PROGRESS_TOLERANCE=3
+INFRA_AGENT_MAX_VERIFY_REVISE_ITERATIONS=3
+INFRA_AGENT_SPEC_STAGNATION_TOLERANCE=2
+INFRA_AGENT_REPEATED_FAILURE_TOLERANCE=2
+
+# Static resource safety limits
+INFRA_MAX_TOTAL_CONTAINERS=10
+INFRA_MAX_SERVICE_REPLICAS=50
+INFRA_MAX_ABSURD_REPLICAS=100000
+INFRA_MAX_CPU=4
+INFRA_MAX_MEMORY_GB=8
+
+# Docker MCP and image pull retry limits
+INFRA_DOCKER_MCP_REQUEST_TIMEOUT_MS=120000
+INFRA_DOCKER_PULL_MAX_ATTEMPTS=3
+INFRA_DOCKER_PULL_RETRY_INITIAL_DELAY_MS=1000
+INFRA_DOCKER_PULL_RETRY_MAX_DELAY_MS=5000
+INFRA_DOCKER_PULL_RETRY_BACKOFF_FACTOR=2
+```
 
 ## Notes
 

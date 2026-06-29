@@ -254,88 +254,97 @@ async function runServiceChecks(
     evidence.push('Service "' + service.name + '" has ' + String(service.replicas) + ' replica(s) as expected.');
   }
 
-  const container = matchingContainers[0]!;
-  if (container.image && !container.image.includes(service.image.split(':')[0]!)) {
-    findings.push(createFinding({
-      code: 'IMAGE_MISMATCH',
-      severity: 'error',
-      resourceKind: 'image',
-      resourceName: service.name,
-      expected: service.image,
-      actual: container.image,
-      evidence: ['Service "' + service.name + '" image mismatch: expected "' + service.image + '", running "' + container.image + '".'],
-      confidence: 0.8,
-      suggestedAction: { action: 'auto-revise', summary: 'Revise the service image or recreate the container with the desired image.' },
-    }));
-  } else if (container.image) {
-    evidence.push('Service "' + service.name + '" running expected image.');
-  } else {
-    findings.push(createFinding({
-      code: 'RUNTIME_OBSERVATION_UNCERTAIN',
-      severity: 'warning',
-      resourceKind: 'image',
-      resourceName: service.name,
-      expected: service.image,
-      actual: 'unknown',
-      evidence: ['Runtime did not return inspected image for service "' + service.name + '".'],
-      confidence: 0.35,
-      suggestedAction: { action: 'retry-observe', summary: 'Retry with inspect-capable Docker observation.' },
-    }));
-  }
-
-  addReadinessFindings(service, container, findings);
-
-  if ((container.status ?? '').toLowerCase() !== 'running') {
-    const logs = await runtimeReader.readLogs(container.name, 80);
-    const evidenceItems = ['Container "' + container.name + '" is not running (status: ' + String(container.status ?? 'unknown') + ').'];
-    if (logs) evidenceItems.push('Log tail: ' + logs.replace(/\s+/g, ' ').slice(0, 500));
-    findings.push(createFinding({
-      code: 'CONTAINER_NOT_RUNNING',
-      severity: 'error',
-      resourceKind: 'container',
-      resourceName: container.name,
-      expected: 'running',
-      actual: container.status ?? 'unknown',
-      evidence: evidenceItems,
-      confidence: container.status ? 0.9 : 0.45,
-      suggestedAction: { action: logs ? 'ask-user' : 'retry-observe', summary: logs ? 'Review logs and choose a safe revision.' : 'Retry runtime observation with inspect/log support.' },
-      requiresUserInput: true,
-    }));
-  }
-
-  if (service.ports && service.ports.length > 0) {
-    const actualPorts = container.ports ?? [];
-    const missingPorts = service.ports.filter((port) => !actualPorts.some((actualPort) => actualPort.includes(port.split(':')[0]!)));
-    if (missingPorts.length > 0) {
+  for (const container of matchingContainers) {
+    if (container.image && !container.image.includes(service.image.split(':')[0]!)) {
       findings.push(createFinding({
-        code: 'PORT_MISMATCH',
+        code: 'IMAGE_MISMATCH',
         severity: 'error',
-        resourceKind: 'port',
-        resourceName: service.name,
-        expected: service.ports.join(', '),
-        actual: actualPorts.join(', ') || 'none',
-        evidence: ['Service "' + service.name + '" missing port mappings: ' + missingPorts.join(', ') + '.'],
+        resourceKind: 'image',
+        resourceName: container.name,
+        expected: service.image,
+        actual: container.image,
+        evidence: ['Container "' + container.name + '" image mismatch: expected "' + service.image + '", running "' + container.image + '".'],
         confidence: 0.8,
-        suggestedAction: { action: 'auto-revise', summary: 'Revise or recreate the container port mappings.' },
+        suggestedAction: { action: 'auto-revise', summary: 'Revise the service image or recreate the container with the desired image.' },
       }));
+    } else if (container.image) {
+      evidence.push('Container "' + container.name + '" running expected image.');
     } else {
-      evidence.push('Service "' + service.name + '" has expected port mappings.');
+      findings.push(createFinding({
+        code: 'RUNTIME_OBSERVATION_UNCERTAIN',
+        severity: 'warning',
+        resourceKind: 'image',
+        resourceName: container.name,
+        expected: service.image,
+        actual: 'unknown',
+        evidence: ['Runtime did not return inspected image for container "' + container.name + '".'],
+        confidence: 0.35,
+        suggestedAction: { action: 'retry-observe', summary: 'Retry with inspect-capable Docker observation.' },
+      }));
+    }
+
+    addReadinessFindings(service, container, findings);
+
+    if ((container.status ?? '').toLowerCase() !== 'running') {
+      const logs = await runtimeReader.readLogs(container.name, 80);
+      const evidenceItems = ['Container "' + container.name + '" is not running (status: ' + String(container.status ?? 'unknown') + ').'];
+      if (logs) evidenceItems.push('Log tail: ' + logs.replace(/\s+/g, ' ').slice(0, 500));
+      findings.push(createFinding({
+        code: 'CONTAINER_NOT_RUNNING',
+        severity: 'error',
+        resourceKind: 'container',
+        resourceName: container.name,
+        expected: 'running',
+        actual: container.status ?? 'unknown',
+        evidence: evidenceItems,
+        confidence: container.status ? 0.9 : 0.45,
+        suggestedAction: { action: logs ? 'ask-user' : 'retry-observe', summary: logs ? 'Review logs and choose a safe revision.' : 'Retry runtime observation with inspect/log support.' },
+        requiresUserInput: true,
+      }));
+    }
+
+    if (service.ports && service.ports.length > 0) {
+      const actualPorts = container.ports ?? [];
+      const missingPorts = service.ports.filter((port) => !actualPorts.some((actualPort) => actualPort.includes(port.split(':')[0]!)));
+      if (missingPorts.length > 0) {
+        findings.push(createFinding({
+          code: 'PORT_MISMATCH',
+          severity: 'error',
+          resourceKind: 'port',
+          resourceName: container.name,
+          expected: service.ports.join(', '),
+          actual: actualPorts.join(', ') || 'none',
+          evidence: ['Container "' + container.name + '" missing port mappings: ' + missingPorts.join(', ') + '.'],
+          confidence: 0.8,
+          suggestedAction: { action: 'auto-revise', summary: 'Revise or recreate the container port mappings.' },
+        }));
+      } else {
+        evidence.push('Container "' + container.name + '" has expected port mappings.');
+      }
     }
   }
 
   for (const dependencyName of service.dependsOn ?? []) {
-    const dependencyContainerName = toContainerName(desiredSpec.projectName, dependencyName);
-    const dependency = actual.containers.find((candidate) => candidate.name === dependencyContainerName || candidate.name.includes(dependencyName));
-    const dependencyReady = dependency !== undefined && (dependency.status ?? '').toLowerCase() === 'running' && dependency.healthStatus !== 'unhealthy';
+    const dependencyService = desiredSpec.services.find((candidate) => candidate.name === dependencyName);
+    const dependencyNames = dependencyService
+      ? toReplicaContainerNames(desiredSpec.projectName, dependencyService)
+      : [toContainerName(desiredSpec.projectName, dependencyName)];
+    const dependencies = actual.containers.filter((candidate) =>
+      dependencyNames.includes(candidate.name) || (dependencyService === undefined && candidate.name.includes(dependencyName)),
+    );
+    const dependencyReady = dependencies.length === dependencyNames.length && dependencies.every((dependency) =>
+      (dependency.status ?? '').toLowerCase() === 'running' && dependency.healthStatus !== 'unhealthy',
+    );
     if (!dependencyReady) {
+      const dependency = dependencies[0];
       findings.push(createFinding({
         code: 'DEPENDENCY_NOT_READY',
         severity: 'warning',
         resourceKind: 'service',
         resourceName: service.name,
         expected: 'dependency ' + dependencyName + ' running/healthy before ' + service.name,
-        actual: dependency ? 'status=' + String(dependency.status ?? 'unknown') + ', health=' + String(dependency.healthStatus ?? 'unknown') : 'missing',
-        evidence: ['Service "' + service.name + '" depends on "' + dependencyName + '" but dependency is not ready.'],
+        actual: dependencies.length > 0 ? dependencies.map((entry) => entry.name + ':status=' + String(entry.status ?? 'unknown') + ',health=' + String(entry.healthStatus ?? 'unknown')).join('; ') : 'missing',
+        evidence: ['Service "' + service.name + '" depends on "' + dependencyName + '" but not all dependency replicas are ready (expected: ' + dependencyNames.join(', ') + ').'],
         confidence: dependency ? 0.75 : 0.9,
         suggestedAction: { action: 'auto-revise', summary: 'Add or repair dependency readiness ordering.' },
       }));

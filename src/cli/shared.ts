@@ -1,4 +1,5 @@
 import { stdin as input, stdout as output } from 'node:process';
+import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import chalk from 'chalk';
 import type { ReActAgent } from '../agent/react-agent.js';
@@ -139,6 +140,9 @@ export function printDetailedDryRunPreview(
   console.log(`Services: ${preview.totalServices}`);
   console.log(`Container count if applied: ${preview.totalContainers}`);
   console.log(`Compose artifact target: ${preview.artifactTargetPath} (not written)`);
+  console.log(
+    `Compose artifact path if approved: ${path.resolve(preview.artifactTargetPath)}`,
+  );
   console.log(
     `Runtime side effects: Docker called=${preview.dockerCalled}, MCP called=${preview.mcpCalled}, state saved=${preview.stateSaved}`,
   );
@@ -770,14 +774,6 @@ export function isMissingDockerResourceError(error: unknown): boolean {
 
 export function isNodeError(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && 'code' in error;
-}
-
-export function isCommanderExcessArgumentsError(error: unknown): boolean {
-  return (
-    error instanceof Error &&
-    'code' in error &&
-    error.code === 'commander.excessArguments'
-  );
 }
 
 export function isCommanderDisplayExitError(error: unknown): boolean {

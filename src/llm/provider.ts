@@ -74,8 +74,24 @@ export interface OpenAiResponseCreateInput {
 
 export interface OpenAiResponsesClient {
   responses: {
-    create(input: OpenAiResponseCreateInput): Promise<{ output_text?: string }>;
+    create(input: OpenAiResponseCreateInput): Promise<OpenAiResponse>;
   };
+}
+
+export interface OpenAiResponse {
+  output_text?: unknown;
+  output?: Array<{
+    type?: unknown;
+    content?: Array<{
+      type?: unknown;
+      text?: unknown;
+    }>;
+  }>;
+  choices?: Array<{
+    message?: {
+      content?: unknown;
+    };
+  }>;
 }
 
 export interface GeminiGenerateContentInput {
@@ -157,6 +173,12 @@ export class StubLlmProvider implements LlmProvider {
     if (input.schemaName === 'spec_patch_plan') {
       return {
         text: JSON.stringify(createSpecPatchPlanForStub(input.user)),
+      };
+    }
+
+    if (input.schemaName === 'feedback_intent') {
+      return {
+        text: JSON.stringify(createFeedbackIntentForStub(input.user)),
       };
     }
 
@@ -368,15 +390,9 @@ function createSingleProvider(
 }
 
 export function getDefaultProviderName(
-  env: NodeJS.ProcessEnv = process.env,
+  _env: NodeJS.ProcessEnv = process.env,
 ): ProviderName {
-  const configuredProvider = env.INFRA_AGENT_PROVIDER;
-
-  if (configuredProvider === undefined || configuredProvider.trim() === '') {
-    return 'stub';
-  }
-
-  return parseProviderName(configuredProvider);
+  return 'openai';
 }
 
 export function createOpenAiConfig(
@@ -433,7 +449,7 @@ export function getFallbackProviderName(
   const configuredProvider = env.INFRA_AGENT_FALLBACK_PROVIDER;
 
   if (configuredProvider === undefined || configuredProvider.trim() === '') {
-    return null;
+    return env.GEMINI_API_KEY?.trim() || env.GOOGLE_API_KEY?.trim() ? 'gemini' : null;
   }
 
   return parseProviderName(configuredProvider);
@@ -449,7 +465,7 @@ function parseProviderName(value: string): ProviderName {
   );
 }
 
-function getOpenAiOutputText(response: { output_text?: string }): string {
+function getOpenAiOutputText(response: OpenAiResponse): string {
   if (
     typeof response.output_text === 'string' &&
     response.output_text.trim() !== ''
@@ -457,7 +473,33 @@ function getOpenAiOutputText(response: { output_text?: string }): string {
     return response.output_text;
   }
 
-  throw new Error('OpenAI response did not include output_text.');
+  const textParts = response.output
+    ?.flatMap((outputItem) => outputItem.content ?? [])
+    .filter(
+      (contentItem) =>
+        contentItem.type === 'output_text' &&
+        typeof contentItem.text === 'string' &&
+        contentItem.text.trim() !== '',
+    )
+    .map((contentItem) => contentItem.text as string);
+
+  if (textParts !== undefined && textParts.length > 0) {
+    return textParts.join('\n');
+  }
+
+  const choiceTextParts = response.choices
+    ?.map((choice) => choice.message?.content)
+    .filter((content): content is string => {
+      return typeof content === 'string' && content.trim() !== '';
+    });
+
+  if (choiceTextParts !== undefined && choiceTextParts.length > 0) {
+    return choiceTextParts.join('\n');
+  }
+
+  throw new Error(
+    'OpenAI response did not include output_text, output message text, or chat completion message content.',
+  );
 }
 
 class GeminiHttpGenerateContentClient implements GeminiGenerateContentClient {
@@ -601,128 +643,27 @@ function createReActReasoningForStub(): ReActReasoningOutput {
   };
 }
 
-function createSpecPatchPlanForStub(rawInput: string): SpecPatchPlan {
-  let issuesText = rawInput;
-  let existingReverseProxyPort: string | null = null;
-  let firstExposedServiceName: string | null = null;
-  try {
-    const parsed = JSON.parse(rawInput) as { issues?: unknown; services?: unknown };
-    if (Array.isArray(parsed.issues)) {
-      const issues = parsed.issues.filter((issue): issue is string => typeof issue === 'string');
-      const userIssues = issues.filter((issue) => issue.startsWith('User feedback:'));
-      issuesText = (userIssues.length > 0 ? userIssues : []).join('\n');
-    }
-    if (Array.isArray(parsed.services)) {
-      const exposedReverseProxy = parsed.services.find((service) => {
-        if (typeof service !== 'object' || service === null) return false;
-        const candidate = service as { kind?: unknown; ports?: unknown };
-        return candidate.kind === 'reverse-proxy' && Array.isArray(candidate.ports) && candidate.ports.some((port) => typeof port === 'string');
-      }) as { ports?: string[] } | undefined;
-      const firstExposedService = parsed.services.find((service) => {
-        if (typeof service !== 'object' || service === null) return false;
-        const candidate = service as { ports?: unknown };
-        return Array.isArray(candidate.ports) && candidate.ports.some((port) => typeof port === 'string');
-      }) as { name?: string; ports?: string[] } | undefined;
-      existingReverseProxyPort = exposedReverseProxy?.ports?.find((port) => typeof port === 'string') ?? null;
-      firstExposedServiceName = typeof firstExposedService?.name === 'string' ? firstExposedService.name : null;
-      existingReverseProxyPort ??= firstExposedService?.ports?.find((port) => typeof port === 'string') ?? null;
-    }
-  } catch {
-    // Use the raw structured prompt as the fallback issue text.
-  }
-
-  const portMapping = [...issuesText.matchAll(/(\d{1,5})\s*:\s*(\d{1,5})/g)].at(-1);
-  if (portMapping) {
-    return {
-      patches: [
-        {
-          op: 'replace-service-port',
-          target: { nameLike: 'nginx', exposesHostPort: true },
-          to: `${portMapping[1]}:${portMapping[2]}`,
-          reason: 'Stub planner converted user feedback into a port mapping patch.',
-        },
-      ],
-      explanation: 'Apply requested port mapping change.',
-      assumptions: ['Target the matching exposed reverse-proxy service.'],
-      ambiguities: [],
-      requiresUserInput: false,
-      confidence: 0.8,
-    };
-  }
-
-  const requestedHostPort = /\bport\b[\s\S]*?\b(?:to|->|=>)\s*(\d{1,5})(?!\s*:)/i.exec(issuesText)?.[1]
-    ?? /\b(?:host\s+)?port\b[\s\S]*?(\d{1,5})(?!\s*:)/i.exec(issuesText)?.[1];
-  if (requestedHostPort) {
-    const containerPort = /\bnginx\b/i.test(issuesText)
-      ? '80'
-      : existingReverseProxyPort?.split(':')[1]?.trim() || requestedHostPort;
-    const target = { nameLike: firstExposedServiceName ?? 'nginx', exposesHostPort: true };
-    return {
-      patches: [
-        ...(/\bnginx\b/i.test(issuesText)
-          ? [{ op: 'set-service-image' as const, target, image: 'nginx:stable', reason: 'Stub planner converted user feedback into an image patch.' }]
-          : []),
-        {
-          op: 'replace-service-port',
-          target,
-          to: `${requestedHostPort}:${containerPort}`,
-          reason: 'Stub planner converted user feedback into a host port patch.',
-        },
-      ],
-      explanation: 'Apply requested host port change.',
-      assumptions: ['Target the matching exposed reverse-proxy service and preserve the existing container port.'],
-      ambiguities: [],
-      requiresUserInput: false,
-      confidence: 0.75,
-    };
-  }
-
-  const replicas = /(?:replicas?|instance|instances|bản|ban|con|lên|len|scale)[^\d]*(\d{1,2})/i.exec(issuesText)?.[1];
-  if (replicas) {
-    return {
-      patches: [
-        {
-          op: 'set-service-replicas',
-          target: { kind: 'backend' },
-          replicas: Number(replicas),
-          reason: 'Stub planner converted user feedback into a replica count patch.',
-        },
-      ],
-      explanation: 'Apply requested backend replica count.',
-      assumptions: ['Target the backend service when the request mentions application replicas.'],
-      ambiguities: [],
-      requiresUserInput: false,
-      confidence: 0.75,
-    };
-  }
-
-  if (/\b(redis|cache)\b/i.test(issuesText)) {
-    return {
-      patches: [
-        {
-          op: 'add-service',
-          service: { kind: 'database', name: 'redis', image: 'redis:7-alpine' },
-          reason: 'Stub planner converted user feedback into an added Redis cache service.',
-        },
-      ],
-      explanation: 'Add a Redis cache service requested by the user.',
-      assumptions: ['Redis is represented as a database/cache infrastructure service.'],
-      ambiguities: [],
-      requiresUserInput: false,
-      confidence: 0.75,
-    };
-  }
-
+function createSpecPatchPlanForStub(_rawInput: string): SpecPatchPlan {
   return {
     patches: [],
-    explanation: 'No safe structured patch recognized by the stub planner.',
-    assumptions: [],
-    ambiguities: ['Feedback requires clarification or a real LLM provider.'],
+    explanation: 'Stub provider does not synthesize revision patches. Configure a real LLM provider for natural-language revision.',
+    assumptions: ['No regex or hard-coded stub mapping is used for spec patch planning.'],
+    ambiguities: ['A real LLM provider is required to convert feedback into a schema-valid SpecPatchPlan.'],
     requiresUserInput: true,
-    confidence: 0.2,
+    confidence: 0,
   };
 }
 
+function createFeedbackIntentForStub(rawInput: string): import('../domain/types.js').FeedbackIntent {
+  return {
+    source: 'user-other-feedback',
+    rawText: rawInput,
+    intent: 'unknown',
+    confidence: 0,
+    ambiguities: ['A real LLM provider is required to parse free-form other feedback into a FeedbackIntent.'],
+    requiresUserInput: true,
+  };
+}
 function parseParserInput(rawInput: string): {
   raw: string;
   intent: InfrastructureIntent | null;

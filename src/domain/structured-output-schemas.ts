@@ -151,6 +151,60 @@ const patchBaseProperties = {
   reason: { type: 'string', minLength: 1 },
 };
 
+export const feedbackIntentJsonSchema = {
+  type: 'object',
+  properties: {
+    source: { type: 'string', enum: ['user-other-feedback'] },
+    rawText: { type: 'string', minLength: 1 },
+    intent: {
+      type: 'string',
+      enum: [
+        'change-port',
+        'change-name',
+        'change-replicas',
+        'change-image',
+        'change-env',
+        'change-volume',
+        'change-network',
+        'remove-exposure',
+        'yaml-edit-intent',
+        'retry-as-is',
+        'cancel',
+        'unknown',
+      ],
+    },
+    target: {
+      type: 'object',
+      properties: {
+        resourceKind: {
+          type: 'string',
+          enum: ['project', 'service', 'container', 'port', 'image', 'volume', 'network', 'environment'],
+        },
+        serviceSelector: serviceSelectorJsonSchema,
+        currentValue: { type: 'string', minLength: 1 },
+      },
+    },
+    desiredChange: {
+      type: 'object',
+      properties: {
+        hostPort: { type: 'integer', minimum: 1, maximum: 65535 },
+        containerPort: { type: 'integer', minimum: 1, maximum: 65535 },
+        name: { type: 'string', minLength: 1 },
+        replicas: { type: 'integer', minimum: 1, maximum: 50 },
+        image: { type: 'string', minLength: 1 },
+        environment: { type: 'object', additionalProperties: { type: 'string' } },
+        volumes: { type: 'array', items: { type: 'string', minLength: 1 } },
+        networks: { type: 'array', items: { type: 'string', minLength: 1 } },
+        yamlFragment: { type: 'string', minLength: 1 },
+      },
+    },
+    confidence: { type: 'number', minimum: 0, maximum: 1 },
+    ambiguities: { type: 'array', items: { type: 'string', minLength: 1 } },
+    requiresUserInput: { type: 'boolean' },
+  },
+  required: ['source', 'rawText', 'intent', 'confidence', 'ambiguities', 'requiresUserInput'],
+} satisfies JsonSchema;
+
 const infrastructureServiceJsonSchema = {
   type: 'object',
   properties: {

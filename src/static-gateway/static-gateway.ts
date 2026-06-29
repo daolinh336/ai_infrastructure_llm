@@ -20,6 +20,7 @@ import {
   canonicalizeImageBase,
   isSupportedImageReference,
 } from '../domain/supported-images.js';
+import { loadStaticResourceLimitConfig } from '../config/runtime-limits.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import type { LlmProvider } from '../llm/provider.js';
 
@@ -41,10 +42,6 @@ const STRUCTURED_QUERY_PARSER_SYSTEM_PROMPT = [
 ].join('\n');
 
 const DOCKER_RESOURCE_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
-const MAX_TOTAL_CONTAINERS = 10;
-const MAX_ABSURD_REPLICAS = 100_000;
-const MAX_CPU = 4;
-const MAX_MEMORY_GB = 8;
 
 export type StaticGatewayResult =
   | {
@@ -304,8 +301,123 @@ export class StaticGateway {
       schema: draftQueryJsonSchema,
     });
 
-    return validateDraftQuery(parseJsonResponse(completion.text));
+    return validateDraftQuery(
+      normalizeDraftQueryCandidate(
+        parseJsonResponse(completion.text),
+        prompt,
+        classification,
+      ),
+    );
   }
+}
+
+function normalizeDraftQueryCandidate(
+  value: unknown,
+  prompt: string,
+  classification: IntentClassification,
+): unknown {
+  if (!isRecord(value)) {
+    return value;
+  }
+
+  const servicesCandidate = Array.isArray(value.services)
+    ? value.services
+    : Array.isArray(value.components)
+      ? value.components
+      : null;
+
+  if (servicesCandidate === null) {
+    return value;
+  }
+
+  return {
+    raw: typeof value.raw === 'string' ? value.raw : prompt,
+    normalizedPrompt:
+      typeof value.normalizedPrompt === 'string' ? value.normalizedPrompt : prompt,
+    intent:
+      isStaticIntent(value.intent) || value.intent === null
+        ? value.intent
+        : classification.intent,
+    services: servicesCandidate.map(normalizeDraftServiceCandidate),
+    destructive:
+      typeof value.destructive === 'boolean' ? value.destructive : false,
+    missingInformation: Array.isArray(value.missingInformation)
+      ? value.missingInformation.filter(
+          (item): item is string => typeof item === 'string' && item.trim() !== '',
+        )
+      : [],
+  };
+}
+
+function normalizeDraftServiceCandidate(value: unknown): DraftServiceQuery {
+  const record = isRecord(value) ? value : {};
+  const image = getNullableString(record.image ?? record.technology);
+
+  return {
+    name: getNullableString(record.name),
+    image,
+    port: getNullableInteger(record.port ?? getFirstPortCandidate(record.ports)),
+    replicas: getNullableInteger(record.replicas),
+    requestedMounts: Array.isArray(record.requestedMounts)
+      ? record.requestedMounts.filter(
+          (item): item is string => typeof item === 'string' && item.trim() !== '',
+        )
+      : [],
+    privileged: getNullableBoolean(record.privileged),
+    networkMode: getNullableString(record.networkMode),
+    pidMode: getNullableString(record.pidMode),
+    ipcMode: getNullableString(record.ipcMode),
+    cpu: getNullableNumber(record.cpu),
+    memoryGb: getNullableNumber(record.memoryGb),
+  };
+}
+
+function getFirstPortCandidate(value: unknown): unknown {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+
+  return value.find(
+    (item) => typeof item === 'number' || typeof item === 'string',
+  );
+}
+
+function getNullableString(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() !== '' ? value : null;
+}
+
+function getNullableInteger(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isInteger(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string' && /^\d+$/.test(value)) {
+    return Number(value);
+  }
+
+  return null;
+}
+
+function getNullableNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function getNullableBoolean(value: unknown): boolean | null {
+  return typeof value === 'boolean' ? value : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isStaticIntent(value: unknown): value is IntentClassification['intent'] {
+  return (
+    value === 'create' ||
+    value === 'update' ||
+    value === 'status' ||
+    value === 'destroy' ||
+    value === 'drift'
+  );
 }
 
 function normalizeDraftQueryImageAliases(draft: DraftQuery): {
@@ -424,6 +536,7 @@ function normalizeImageBase(base: string): string {
 }
 
 function validateStaticRules(draft: DraftQuery): StaticValidationOutcome {
+  const limits = loadStaticResourceLimitConfig();
   const issues: string[] = [];
   const riskFlags: string[] = [];
   const securityFindings: string[] = [];
@@ -446,7 +559,7 @@ function validateStaticRules(draft: DraftQuery): StaticValidationOutcome {
   for (const [index, service] of draft.services.entries()) {
     const serviceLabel = `services.${index}`;
 
-    validateStaticService(service, serviceLabel, issues, securityFindings, {
+    validateStaticService(service, serviceLabel, issues, securityFindings, limits, {
       markUnresolvedImageReference: (image) => {
         riskFlags.push(`${serviceLabel}.unresolved-image-reference:${image}`);
       },
@@ -462,17 +575,17 @@ function validateStaticRules(draft: DraftQuery): StaticValidationOutcome {
   const resourceEstimate = estimateResources(draft.services);
   const explicitContainerCount = extractExplicitContainerCount(draft.raw);
 
-  if (resourceEstimate.totalContainers > MAX_TOTAL_CONTAINERS) {
+  if (resourceEstimate.totalContainers > limits.maxTotalContainers) {
     blockedByResourceLimit = true;
     issues.push(
-      `Total requested containers must be <= ${MAX_TOTAL_CONTAINERS}; got ${resourceEstimate.totalContainers}.`,
+      `Total requested containers must be <= ${limits.maxTotalContainers}; got ${resourceEstimate.totalContainers}.`,
     );
   }
 
-  if (explicitContainerCount !== null && explicitContainerCount > MAX_TOTAL_CONTAINERS) {
+  if (explicitContainerCount !== null && explicitContainerCount > limits.maxTotalContainers) {
     blockedByResourceLimit = true;
     issues.push(
-      `Explicit container count must be <= ${MAX_TOTAL_CONTAINERS}; got ${explicitContainerCount}.`,
+      `Explicit container count must be <= ${limits.maxTotalContainers}; got ${explicitContainerCount}.`,
     );
   }
 
@@ -495,6 +608,7 @@ function validateStaticService(
   serviceLabel: string,
   issues: string[],
   securityFindings: string[],
+  limits: ReturnType<typeof loadStaticResourceLimitConfig>,
   markers: {
     markUnresolvedImageReference(image: string): void;
     markSecurityBlocked(): void;
@@ -519,15 +633,15 @@ function validateStaticService(
     issues.push(`${serviceLabel}.replicas must be >= 1.`);
   }
 
-  if (service.replicas !== null && service.replicas > MAX_TOTAL_CONTAINERS) {
+  if (service.replicas !== null && service.replicas > limits.maxTotalContainers) {
     markers.markResourceLimitBlocked();
-    issues.push(`${serviceLabel}.replicas must be <= ${MAX_TOTAL_CONTAINERS}.`);
+    issues.push(`${serviceLabel}.replicas must be <= ${limits.maxTotalContainers}.`);
   }
 
   if (
     service.replicas !== null &&
     service.image === null &&
-    service.replicas > MAX_ABSURD_REPLICAS
+    service.replicas > limits.maxAbsurdReplicas
   ) {
     issues.push(`${serviceLabel}.replicas is too large to be a valid static request.`);
   }
@@ -561,14 +675,14 @@ function validateStaticService(
     }
   }
 
-  if (service.cpu !== null && service.cpu > MAX_CPU) {
+  if (service.cpu !== null && service.cpu > limits.maxCpu) {
     markers.markResourceLimitBlocked();
-    issues.push(`${serviceLabel}.cpu must be <= ${MAX_CPU}.`);
+    issues.push(`${serviceLabel}.cpu must be <= ${limits.maxCpu}.`);
   }
 
-  if (service.memoryGb !== null && service.memoryGb > MAX_MEMORY_GB) {
+  if (service.memoryGb !== null && service.memoryGb > limits.maxMemoryGb) {
     markers.markResourceLimitBlocked();
-    issues.push(`${serviceLabel}.memoryGb must be <= ${MAX_MEMORY_GB}.`);
+    issues.push(`${serviceLabel}.memoryGb must be <= ${limits.maxMemoryGb}.`);
   }
 }
 

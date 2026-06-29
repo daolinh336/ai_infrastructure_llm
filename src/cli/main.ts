@@ -20,7 +20,6 @@ import {
   getErrorMessage,
   isMissingDockerResourceError,
   isCommanderDisplayExitError,
-  isCommanderExcessArgumentsError,
   loadDockerPullRetryPolicyFromEnv,
   loadLocalEnvFile,
   printDockerDoctorReport,
@@ -383,7 +382,7 @@ program
 program
   .command('destroy')
   .description('Destroy Docker resources belonging to the current verified project via MCP')
-  .option('--project <name>', 'Project name override (defaults to current verified state)')
+  .option('-p, --project <name>', 'Project name override (defaults to current verified state)')
   .option('--remove-volumes', 'Also remove project volumes', false)
   .option('--yes', 'Skip interactive approval', false)
   .action(async (options) => {
@@ -427,10 +426,16 @@ program
     try {
       await mcpClient.initialize();
       const result = await engine.destroyWithDocker(state.current, mcpClient, { projectName: project, removeVolumes: Boolean(options.removeVolumes) });
-      console.log(chalk.green('Destroy completed via MCP.'));
+      console.log(result.removalErrors.length === 0 ? chalk.green('Destroy completed via MCP.') : chalk.yellow('Destroy partially completed via MCP.'));
       console.log('- Containers removed: ' + (result.containersRemoved.join(', ') || 'none'));
       console.log('- Networks removed: ' + (result.networksRemoved.join(', ') || 'none'));
       console.log('- Volumes removed: ' + (result.volumesRemoved.join(', ') || 'none'));
+      if (result.removalErrors.length > 0) {
+        console.log(chalk.yellow('- Resources not removed:'));
+        for (const issue of result.removalErrors) {
+          console.log('  - ' + issue);
+        }
+      }
 
 
       // Post-destroy: verify and persist state
@@ -542,13 +547,8 @@ program.parseAsync(process.argv).catch((error: unknown) => {
     return;
   }
 
-  if (isCommanderExcessArgumentsError(error)) {
-    console.error(chalk.red('CLI failed.'));
-    console.error(
-      'The plan command accepts exactly one prompt string. Put the full request inside quotes.',
-    );
-    console.error(chalk.cyan('Example: aiagent plan "Tao nginx port 80"'));
-    process.exitCode = 1;
+  if (isCommanderRuntimeError(error)) {
+    process.exitCode = getCommanderExitCode(error);
     return;
   }
 
@@ -558,3 +558,20 @@ program.parseAsync(process.argv).catch((error: unknown) => {
   }
   process.exitCode = 1;
 });
+
+function isCommanderRuntimeError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    'code' in error &&
+    typeof error.code === 'string' &&
+    error.code.startsWith('commander.')
+  );
+}
+
+function getCommanderExitCode(error: unknown): number {
+  if (error instanceof Error && 'exitCode' in error && typeof error.exitCode === 'number') {
+    return error.exitCode;
+  }
+  return 1;
+}
+

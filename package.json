@@ -21,7 +21,9 @@
     "build:supernova-mcp": "npm --prefix packages/docker-mcp-server-supernova run build",
     "test:e2e:docker-mcp": "vitest run tests/e2e/docker-mcp-supernova.e2e.test.ts",
     "test:e2e:docker-mcp:all-tools": "vitest run tests/e2e/docker-mcp-supernova-all-tools.e2e.test.ts",
-    "test:supernova-mcp": "npm --prefix packages/docker-mcp-server-supernova test"
+    "test:supernova-mcp": "npm --prefix packages/docker-mcp-server-supernova test",
+    "test:chaos": "vitest run tests/three-tier-chaos-pipeline.test.ts",
+    "test:pipeline": "npm run test:chaos && npm run test:e2e:docker-mcp"
   },
   "engines": {
     "node": ">=20"

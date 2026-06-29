@@ -9,10 +9,13 @@ import type {
   PlannerRevisionRequest,
   RevisionHistoryRecord,
   RevisionObservation,
+  RuntimeIssueReport,
   RuntimeActualState,
   UserFeedback,
+  VerificationFinding,
   VerificationReport,
 } from '../domain/types.js';
+import { validateVerificationReport } from '../domain/schemas.js';
 import type { ExecutionEngine } from '../execution/execution-engine.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 import { buildDriftReport } from '../execution/drift-detector.js';
@@ -71,6 +74,7 @@ export interface ClosedLoopDeployResult {
   revisionHistory: RevisionHistoryRecord[];
   currentApprovedAction: ApprovedAction;
   currentPlan: ExecutionPlan;
+  successfulDeployResult?: Awaited<ReturnType<ClosedLoopEnginePort['deployWithDocker']>>;
 }
 
 export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Promise<ClosedLoopDeployResult> {
@@ -145,7 +149,67 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       continue;
     }
 
-    const deployResult = await options.engine.deployWithDocker(currentApprovedAction, options.mcpClient);
+    let deployResult: Awaited<ReturnType<ClosedLoopEnginePort['deployWithDocker']>>;
+    try {
+      deployResult = await options.engine.deployWithDocker(currentApprovedAction, options.mcpClient);
+    } catch (error) {
+      attemptIndex += 1;
+      const runtimeIssueReport = createDeployErrorRuntimeIssueReport(
+        error,
+        currentApprovedAction.validatedSpec,
+        preDeployActual,
+        attemptIndex,
+      );
+      const verificationReport = runtimeIssueReportToVerificationReport(runtimeIssueReport);
+      const guardOutcome = tickGuard(options.closedLoopGuard, currentApprovedAction, verificationReport);
+      if (guardOutcome === 'guard-stopped') {
+        return { status: 'guard-stopped', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+      }
+
+      const runtimeDecision = await options.requestRuntimeApproval(verificationReport, attemptIndex);
+      if (runtimeDecision.choice === 'rejected') {
+        return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+      }
+
+      let revisionObservation: RevisionObservation = {
+        verificationReport,
+        userFeedback: runtimeDecision.userFeedback,
+        driftSummary: null,
+      };
+      const revisionRequest: PlannerRevisionRequest = {
+        desiredSpec: currentApprovedAction.validatedSpec,
+        currentPlan,
+        runtimeIssueReport,
+        revisionObservation,
+        stateSnapshot: null,
+        resourceRefs: buildResourceRefs(currentApprovedAction.validatedSpec.projectName, preDeployActual, currentApprovedAction.validatedSpec),
+        attemptIndex,
+      };
+      let revisionResult = await options.agent.reviseFromFeedback(revisionRequest);
+      if (revisionResult.revisionDecision === 'needs-user-input') {
+        const clarificationFeedback = await options.requestRevisionClarification(revisionResult);
+        if (clarificationFeedback) {
+          revisionObservation = { ...revisionObservation, userFeedback: clarificationFeedback };
+          revisionResult = await options.agent.reviseFromFeedback({ ...revisionRequest, revisionObservation });
+        }
+      }
+      revisionHistory.push({
+        attemptIndex,
+        revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
+        revisionSummary: revisionResult.revisionSummary,
+        findings: verificationReport.findings ?? [],
+        userFeedback: revisionObservation.userFeedback,
+        createdAt: new Date().toISOString(),
+      });
+      currentPlan = {
+        ...currentPlan,
+        spec: revisionResult.revisedSpec,
+        assumptions: [...currentPlan.assumptions, ...revisionResult.assumptions],
+      };
+      currentApprovedAction = { ...currentApprovedAction, validatedSpec: revisionResult.revisedSpec };
+      log('Deploy error normalized into runtime issue report; revised before redeploy.');
+      continue;
+    }
     const verificationReport = await options.agent.verifyAfterApply(currentPlan, options.mcpClient);
     const containerNames = currentApprovedAction.validatedSpec.services.flatMap((service) =>
       toReplicaContainerNames(currentApprovedAction.validatedSpec.projectName, service),
@@ -164,7 +228,14 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         driftReport,
         revisionHistory,
       });
-      return { status: 'passed', attempts: attemptIndex + 1, revisionHistory, currentApprovedAction, currentPlan };
+      return {
+        status: 'passed',
+        attempts: attemptIndex + 1,
+        revisionHistory,
+        currentApprovedAction,
+        currentPlan,
+        successfulDeployResult: deployResult,
+      };
     }
 
     attemptIndex += 1;
@@ -193,7 +264,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       attemptIndex,
     };
     let revisionResult = await options.agent.reviseFromFeedback(revisionRequest);
-    if (revisionResult.revisionDecision === 'needs-user-input' && runtimeDecision.userFeedback === null) {
+    if (revisionResult.revisionDecision === 'needs-user-input') {
       const clarificationFeedback = await options.requestRevisionClarification(revisionResult);
       if (clarificationFeedback) {
         revisionObservation = { ...revisionObservation, userFeedback: clarificationFeedback };
@@ -215,7 +286,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       assumptions: [...currentPlan.assumptions, ...revisionResult.assumptions],
     };
     currentApprovedAction = { ...currentApprovedAction, validatedSpec: revisionResult.revisedSpec };
-    log('Post-deploy verification failed; cleaned up and revised before redeploy.');
+    log(`Attempt ${attemptIndex} post-deploy verification failed; cleaned up and revised before redeploy.`);
   }
 }
 
@@ -234,4 +305,139 @@ function tickGuard(
     if (error instanceof ClosedLoopGuardError) return 'guard-stopped';
     throw error;
   }
+}
+
+function createDeployErrorRuntimeIssueReport(
+  error: unknown,
+  desiredSpec: ApprovedAction['validatedSpec'],
+  actualState: RuntimeActualState,
+  attemptIndex: number,
+): RuntimeIssueReport {
+  const message = getErrorMessage(error);
+  const checkedAt = new Date().toISOString();
+  const finding = classifyDeployError(message, desiredSpec);
+  return {
+    status: 'error',
+    phase: 'deploy',
+    checkedAt,
+    projectName: desiredSpec.projectName,
+    attemptIndex,
+    desiredSpec,
+    issues: [finding],
+    rawError: {
+      message,
+      source: message.includes('MCP tool error') ? 'docker-mcp' : message.includes('HTTP code') ? 'docker-engine' : 'unknown',
+    },
+    actualState,
+    cleanup: null,
+  };
+}
+
+function runtimeIssueReportToVerificationReport(report: RuntimeIssueReport): VerificationReport {
+  return validateVerificationReport({
+    status: 'failed',
+    scope: 'tool-runtime',
+    checkedAt: report.checkedAt,
+    issues: report.issues.map((finding) => finding.evidence[0] ?? `${finding.code}: runtime issue detected.`),
+    findings: report.issues,
+    evidence: [
+      `Runtime ${report.phase} produced a non-success result and was normalized for planner revision.`,
+      ...(report.rawError ? [`Raw runtime error: ${report.rawError.message}`] : []),
+    ],
+    errorReason: 'Runtime deploy failed before successful verification.',
+    revisionHint: 'Revise desired spec from runtime report or provide other feedback, then redeploy.',
+    confidence: 0.92,
+  });
+}
+
+function classifyDeployError(
+  message: string,
+  desiredSpec: ApprovedAction['validatedSpec'],
+): VerificationFinding {
+  const bindMatch = /Bind for [^:]+:(\d+) failed: port is already allocated/i.exec(message)
+    ?? /port (\d+) is already allocated/i.exec(message);
+  if (bindMatch) {
+    const hostPort = bindMatch[1]!;
+    const service = desiredSpec.services.find((candidate) =>
+      (candidate.ports ?? []).some((port) => port.split(':')[0]?.trim() === hostPort),
+    ) ?? inferServiceFromErrorEndpoint(message, desiredSpec);
+    return {
+      code: 'HOST_PORT_CONFLICT',
+      severity: 'blocker',
+      resourceKind: 'port',
+      resourceName: service?.name ?? null,
+      expected: hostPort,
+      actual: 'already allocated',
+      evidence: [
+        `Host port conflict: service "${service?.name ?? 'unknown'}" wants ${hostPort}, but Docker reported it is already allocated.`,
+      ],
+      confidence: service ? 0.96 : 0.86,
+      suggestedAction: { action: 'auto-revise', summary: 'Choose another host port before redeploying.' },
+      requiresUserInput: false,
+    };
+  }
+
+  if (/manifest .*not found|pull access denied|image .*not found|No such image/i.test(message)) {
+    const service = inferServiceFromImageError(message, desiredSpec);
+    return {
+      code: 'IMAGE_PULL_FAILED',
+      severity: 'error',
+      resourceKind: 'image',
+      resourceName: service?.name ?? null,
+      expected: service?.image ?? null,
+      actual: 'image pull failed',
+      evidence: [`Image pull failed during deploy: ${message}`],
+      confidence: service ? 0.9 : 0.78,
+      suggestedAction: { action: 'ask-user', summary: 'Provide a reachable image or credentials before redeploying.' },
+      requiresUserInput: true,
+    };
+  }
+
+  if (/permission denied|access denied|operation not permitted/i.test(message)) {
+    return {
+      code: 'DOCKER_PERMISSION_DENIED',
+      severity: 'blocker',
+      resourceKind: 'runtime',
+      resourceName: null,
+      expected: 'docker operation allowed',
+      actual: 'permission denied',
+      evidence: [`Docker permission denied during deploy: ${message}`],
+      confidence: 0.85,
+      suggestedAction: { action: 'ask-user', summary: 'Change runtime permissions or revise unsafe mounts/ports.' },
+      requiresUserInput: true,
+    };
+  }
+
+  return {
+    code: message.includes('MCP tool error') ? 'MCP_TOOL_ERROR' : 'UNKNOWN_RUNTIME_ERROR',
+    severity: 'error',
+    resourceKind: 'runtime',
+    resourceName: null,
+    expected: 'deploy success',
+    actual: 'deploy error',
+    evidence: [`Runtime deploy error: ${message}`],
+    confidence: 0.65,
+    suggestedAction: { action: 'ask-user', summary: 'Provide other feedback or cancel deployment.' },
+    requiresUserInput: true,
+  };
+}
+
+function inferServiceFromErrorEndpoint(
+  message: string,
+  desiredSpec: ApprovedAction['validatedSpec'],
+): ApprovedAction['validatedSpec']['services'][number] | null {
+  const endpoint = /endpoint\s+([A-Za-z0-9_.-]+)/i.exec(message)?.[1] ?? '';
+  if (!endpoint) return null;
+  return desiredSpec.services.find((service) => endpoint.includes(service.name)) ?? null;
+}
+
+function inferServiceFromImageError(
+  message: string,
+  desiredSpec: ApprovedAction['validatedSpec'],
+): ApprovedAction['validatedSpec']['services'][number] | null {
+  return desiredSpec.services.find((service) => message.includes(service.image)) ?? null;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

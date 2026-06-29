@@ -1,20 +1,24 @@
 import type { LlmProvider } from '../llm/provider.js';
 import type { PlannerRuntimeReader } from '../execution/runtime-environment-reader.js';
 import type {
+  FeedbackIntent,
   InfrastructureSpec,
   InfrastructureStateSnapshot,
   PlannerRevisionRequest,
   PlannerRevisionResult,
   ResolvedSpecPatchResult,
+  ServiceSelector,
+  SpecPatch,
   SpecPatchPlan,
   ValidatedQuery,
   VerificationFinding,
 } from '../domain/types.js';
-import { validateInfrastructureSpec, validateSpecPatchPlan } from '../domain/schemas.js';
-import { specPatchPlanJsonSchema } from '../domain/structured-output-schemas.js';
+import { validateFeedbackIntent, validateInfrastructureSpec, validateSpecPatchPlan } from '../domain/schemas.js';
+import { feedbackIntentJsonSchema, specPatchPlanJsonSchema } from '../domain/structured-output-schemas.js';
+import { expandStatefulDatabaseReplicas } from '../domain/stateful-database-volumes.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import type { PlannerAgent } from './agent-interfaces.js';
-import { applySpecPatchPlan } from './spec-patch-applier.js';
+import { applySpecPatchPlan, resolveServiceSelector } from './spec-patch-applier.js';
 
 export class StandardPlannerAgent implements PlannerAgent {
   constructor(private readonly provider: LlmProvider) {}
@@ -55,7 +59,7 @@ export class StandardPlannerAgent implements PlannerAgent {
       volumes: [],
     };
 
-    return validateInfrastructureSpec(spec);
+    return validateInfrastructureSpec(expandStatefulDatabaseReplicas(spec));
   }
 
   async repairSpec(
@@ -80,13 +84,35 @@ export class StandardPlannerAgent implements PlannerAgent {
 
     let revisedSpec = spec;
     let patchPlan: SpecPatchPlan | null = null;
+    let patchPlanError: string | null = null;
     let patchResults: ResolvedSpecPatchResult[] | undefined;
     let revisionDecision: PlannerRevisionResult['revisionDecision'] = 'auto-revised';
     let revisionStats: RevisionRepairResult | null = null;
 
     if (issues.length > 0) {
-      patchPlan = await this.getRevisionPatchPlan(spec, issues, findings, request.attemptIndex);
-      if (patchPlan !== null && patchPlan.patches.length > 0) {
+      let feedbackIntent = request.feedbackIntent ?? null;
+      if (feedbackIntent === null && obs.userFeedback !== null) {
+        const intentResult = await this.getFeedbackIntent(spec, request, issues, findings);
+        feedbackIntent = intentResult.feedbackIntent;
+        assumptions.push(...intentResult.diagnostics);
+      }
+      const patchPlanResult = await this.getRevisionPatchPlan(
+        spec,
+        { ...request, feedbackIntent },
+        issues,
+        findings,
+      );
+      patchPlan = patchPlanResult.patchPlan;
+      patchPlanError = patchPlanResult.error;
+      assumptions.push(...patchPlanResult.diagnostics);
+      if (obs.userFeedback !== null && (patchPlan === null || (patchPlan.patches.length === 0 && !isServiceTargetAmbiguityPatchPlan(patchPlan)))) {
+        const deterministicPatchPlan = buildDeterministicFeedbackPatchPlan(spec, obs.userFeedback.message, patchPlanError);
+        if (deterministicPatchPlan.patches.length > 0 || isServiceTargetAmbiguityPatchPlan(deterministicPatchPlan)) {
+          assumptions.push('Revision patch source: deterministic fallback replaced empty/unavailable LLM patch plan.');
+          patchPlan = deterministicPatchPlan;
+        }
+      }
+      if (patchPlan !== null && (patchPlan.patches.length > 0 || isServiceTargetAmbiguityPatchPlan(patchPlan))) {
         const plannedRevision = applySpecPatchPlan(spec, patchPlan.patches, {
           allowBlockedPatchOps: extractAllowedPatchOps(issues),
         });
@@ -113,6 +139,16 @@ export class StandardPlannerAgent implements PlannerAgent {
         assumptions.push(...patchPlan.assumptions);
         if (patchPlan.ambiguities.length > 0) {
           assumptions.push(`Revision ambiguities: ${patchPlan.ambiguities.join('; ')}`);
+        }
+      } else if (obs.userFeedback !== null) {
+        revisionDecision = 'needs-user-input';
+        assumptions.push(
+          `Revision ${request.attemptIndex + 1}: received ${issues.length} observation(s), but no schema-valid feedback patch could be inferred safely.`,
+        );
+        if (patchPlan !== null) {
+          assumptions.push(`LLM structured revision returned no direct patch: ${patchPlan.explanation}`);
+        } else {
+          assumptions.push(`LLM structured revision failed or was unavailable: ${patchPlanError ?? 'unknown error'}. Deterministic feedback parsing is disabled.`);
         }
       } else {
         const revision = applyRevisionRepairs(spec, issues, request.attemptIndex + 1, findings);
@@ -153,6 +189,7 @@ export class StandardPlannerAgent implements PlannerAgent {
     const clarificationContext = [
       ...(buildRevisionClarifications(findings) ?? []),
       ...buildPatchClarifications(patchResults ?? []),
+      ...buildPatchPlanAmbiguityClarifications(spec, patchPlan),
     ];
     if (clarificationContext.length > 0) {
       result.clarificationContext = clarificationContext;
@@ -162,55 +199,167 @@ export class StandardPlannerAgent implements PlannerAgent {
 
   private async getRevisionPatchPlan(
     spec: InfrastructureSpec,
+    request: PlannerRevisionRequest,
     issues: string[],
     findings: VerificationFinding[],
-    attemptIndex: number,
-  ): Promise<SpecPatchPlan | null> {
+  ): Promise<RevisionPatchPlanResult> {
     try {
+      const userPayload = JSON.stringify({
+        attemptIndex: request.attemptIndex,
+        projectName: spec.projectName,
+        serviceCatalog: buildRevisionServiceCatalog(spec),
+        verifierObservation: buildVerifierObservationContext(request.revisionObservation),
+        userFeedback: request.revisionObservation.userFeedback,
+        feedbackIntent: request.feedbackIntent ?? null,
+        runtimeIssueReport: request.runtimeIssueReport ?? null,
+        runtimeRefs: request.resourceRefs ?? null,
+        services: spec.services.map((service) => ({
+          name: service.name,
+          kind: service.kind,
+          ports: service.ports ?? [],
+          image: service.image,
+          replicas: service.replicas ?? 1,
+          dependsOn: service.dependsOn ?? [],
+          volumes: service.volumes ?? [],
+          environmentKeys: Object.keys(service.environment ?? {}),
+        })),
+        networks: spec.networks,
+        volumes: spec.volumes,
+        issues,
+        findings,
+        patchGuidance: {
+          sourceOfTruth: 'Return patches for InfrastructureSpec only. Compose YAML is rendered later.',
+          targetResolution: 'Prefer selectors by exact name, nameLike, kind, imageFamily, exposesHostPort, dependsOn, dependentOf instead of guessing a concrete name when the user uses an alias.',
+          portInference: 'When the user gives host:container, use it exactly. When the user gives one port and the target service already has exactly one mapping, preserve the existing container port unless the user explicitly says both sides should change.',
+          schemaNormalization: 'Always convert natural-language feedback to one or more SpecPatch objects when the intent and target can be inferred from current services. Do not leave patches empty just because wording is informal.',
+          feedbackIntent: 'If feedbackIntent is present, treat it as the structured parse of user other feedback and convert it to SpecPatch objects. If feedbackIntent is absent but userFeedback exists, infer intent from userFeedback and observations.',
+        },
+      });
       const response = await this.provider.completeStructured({
         purpose: 'react',
         system: [
           'REVISION_PATCH_PLANNER_V1',
           'You revise desired infrastructure by returning schema-valid JSON patches only.',
           'Patch InfrastructureSpec, not Docker API payloads and not docker-compose YAML.',
-          'Use semantic service selectors when the user uses aliases like nginx, backend, db, app, proxy, or cache.',
+          'Use the provided serviceCatalog as the source of truth for mapping user wording to existing services.',
+          'Use verifierObservation, userFeedback, and runtimeRefs as observations about the same desired spec; do not ignore verifier evidence when user feedback is present.',
+          'Treat userFeedback from an "other" answer as a fresh natural-language instruction, but still ground target selection in serviceCatalog and verifierObservation.',
+          'Choose targets by comparing the user request with each service name, role, image family, exposed ports, dependencies, dependents, and current replicas.',
+          'If prior clarification feedback contains targetService:<name>, apply the requested change to that exact existing service name.',
           'Understand natural language flexibly: map names, roles, image families, counts, and port intent into the closest valid SpecPatch.',
           'Normalize free-form user feedback into schema-valid patches: ports, replicas, images, env vars, volumes, dependencies, service names, service status, project name, networks, add/remove services.',
-          'Examples: "nginx sang 83:83" => replace-service-port with selector imageFamily nginx and to 83:83; "change web port from 80 to 67" => replace-service-port to 67:80 when current web mapping is 80:80; "web port 83" => replace-service-port preserving existing container port when only one current mapping exists; "backend len 3" => set-service-replicas; "doi image backend thanh node:22" => set-service-image; "set POSTGRES_PASSWORD to abc" => set-service-env; "them volume logs:/logs cho backend" => add-service-volume; "backend depends on db" => add-service-dependency; "stop redis" => set-service-desired-status; "them redis cache" => add-service; "doi ten api thanh backend" => rename-service.',
-          'Return requiresUserInput=true with ambiguities when the target or requested change is unsafe or unclear.',
+          'Use semantic selectors that reflect the matched service evidence, such as exact name, kind, imageFamily, exposed port, dependency, or dependent relationship.',
+          'When multiple current services could match, return requiresUserInput=true with a short ambiguity instead of guessing. The app will present service options to the user.',
         ].join('\n'),
-        user: JSON.stringify({
-          attemptIndex,
-          projectName: spec.projectName,
-          services: spec.services.map((service) => ({
-            name: service.name,
-            kind: service.kind,
-            ports: service.ports ?? [],
-            image: service.image,
-            replicas: service.replicas ?? 1,
-            dependsOn: service.dependsOn ?? [],
-            volumes: service.volumes ?? [],
-            environmentKeys: Object.keys(service.environment ?? {}),
-          })),
-          networks: spec.networks,
-          volumes: spec.volumes,
-          issues,
-          findings,
-          patchGuidance: {
-            sourceOfTruth: 'Return patches for InfrastructureSpec only. Compose YAML is rendered later.',
-            targetResolution: 'Prefer selectors by exact name, nameLike, kind, imageFamily, exposesHostPort, dependsOn, dependentOf instead of guessing a concrete name when the user uses an alias.',
-            portInference: 'When the user gives host:container, use it exactly. When the user gives one port and the target service already has exactly one mapping, preserve the existing container port unless the user explicitly says both sides should change.',
-            schemaNormalization: 'Always convert natural-language feedback to one or more SpecPatch objects when the intent and target can be inferred from current services. Do not leave patches empty just because wording is informal.',
-          },
-        }),
+        user: userPayload,
         schemaName: 'spec_patch_plan',
         schema: specPatchPlanJsonSchema,
       });
-      return validateSpecPatchPlan(parseJsonResponse(response.text));
-    } catch {
-      return null;
+      const patchPlan = normalizeAndValidateSpecPatchPlan(parseJsonResponse(response.text));
+      return {
+        patchPlan,
+        error: null,
+        diagnostics: [
+          'LLM revision request sent to structured provider with schema spec_patch_plan.',
+          `LLM revision input: ${truncateDiagnostic(userPayload)}`,
+          `LLM revision raw response: ${truncateDiagnostic(response.text)}`,
+          `LLM revision validated patch ops: ${patchPlan.patches.map((patch) => patch.op).join(', ') || 'none'}.`,
+        ],
+      };
+    } catch (error) {
+      const formattedError = formatRevisionPatchPlanError(error);
+      return {
+        patchPlan: null,
+        error: formattedError,
+        diagnostics: [
+          'LLM revision request failed or returned invalid structured output.',
+          `LLM revision error: ${truncateDiagnostic(formattedError)}`,
+        ],
+      };
     }
   }
+
+  private async getFeedbackIntent(
+    spec: InfrastructureSpec,
+    request: PlannerRevisionRequest,
+    issues: string[],
+    findings: VerificationFinding[],
+  ): Promise<FeedbackIntentResult> {
+    const rawText = request.revisionObservation.userFeedback?.message ?? '';
+    if (rawText.trim().length === 0) {
+      return {
+        feedbackIntent: null,
+        diagnostics: ['LLM feedback intent parsing skipped because user feedback is empty.'],
+      };
+    }
+
+    try {
+      const userPayload = JSON.stringify({
+        rawText,
+        attemptIndex: request.attemptIndex,
+        projectName: spec.projectName,
+        serviceCatalog: buildRevisionServiceCatalog(spec),
+        verifierObservation: buildVerifierObservationContext(request.revisionObservation),
+        runtimeIssueReport: request.runtimeIssueReport ?? null,
+        runtimeRefs: request.resourceRefs ?? null,
+        services: spec.services.map((service) => ({
+          name: service.name,
+          kind: service.kind,
+          ports: service.ports ?? [],
+          image: service.image,
+          replicas: service.replicas ?? 1,
+          dependsOn: service.dependsOn ?? [],
+          volumes: service.volumes ?? [],
+          environmentKeys: Object.keys(service.environment ?? {}),
+        })),
+        networks: spec.networks,
+        volumes: spec.volumes,
+        issues,
+        findings,
+        parserGuidance: {
+          sourceOfTruth: 'Parse other feedback into FeedbackIntent only. Do not return SpecPatchPlan here.',
+          yamlIntent: 'If the user pastes YAML or asks to edit YAML, set intent=yaml-edit-intent and place the YAML in desiredChange.yamlFragment; do not claim it is already applied.',
+          targetResolution: 'Ground target selection in service names, kinds, image families, exposed host ports, dependencies, and verifier findings.',
+        },
+      });
+      const response = await this.provider.completeStructured({
+        purpose: 'react',
+        system: [
+          'FEEDBACK_INTENT_PARSER_V1',
+          'Parse free-form user other feedback into one schema-valid FeedbackIntent object.',
+          'Do not produce infrastructure patches. Do not edit docker-compose YAML. Only classify intent, target, desiredChange, confidence, and ambiguities.',
+          'Use runtime issues and current service catalog to resolve phrases like change port, rename, replicas, image, env, volume, network, remove exposure, or YAML edit intent.',
+          'If the target or desired value is ambiguous, set requiresUserInput=true and include concise ambiguities.',
+        ].join('\n'),
+        user: userPayload,
+        schemaName: 'feedback_intent',
+        schema: feedbackIntentJsonSchema,
+      });
+      const feedbackIntent = validateFeedbackIntent(parseJsonResponse(response.text));
+      return {
+        feedbackIntent,
+        diagnostics: [
+          'LLM other feedback parsed with schema feedback_intent.',
+          `LLM feedback intent input: ${truncateDiagnostic(userPayload)}`,
+          `LLM feedback intent raw response: ${truncateDiagnostic(response.text)}`,
+          `LLM feedback intent parsed: ${feedbackIntent.intent} confidence=${feedbackIntent.confidence}.`,
+        ],
+      };
+    } catch (error) {
+      return {
+        feedbackIntent: null,
+        diagnostics: [
+          'LLM other feedback intent parsing failed or returned invalid structured output.',
+          `LLM feedback intent error: ${truncateDiagnostic(formatRevisionPatchPlanError(error))}`,
+        ],
+      };
+    }
+  }
+}
+
+interface FeedbackIntentResult {
+  feedbackIntent: FeedbackIntent | null;
+  diagnostics: string[];
 }
 
 interface PlannerRuntimeContext {
@@ -324,6 +473,76 @@ function collectRevisionIssues(obs: import('../domain/types.js').RevisionObserva
   return issues;
 }
 
+function buildRevisionServiceCatalog(spec: InfrastructureSpec): Array<{
+  name: string;
+  role: InfrastructureSpec['services'][number]['kind'];
+  image: string;
+  imageFamily: string;
+  currentDesiredInstances: number;
+  exposedPorts: string[];
+  dependsOn: string[];
+  dependents: string[];
+  volumes: string[];
+  environmentKeys: string[];
+}> {
+  return spec.services.map((service) => {
+    const imageFamily = service.image.toLowerCase().split(':')[0]?.split('/').pop() ?? service.image.toLowerCase();
+    return {
+      name: service.name,
+      role: service.kind,
+      image: service.image,
+      imageFamily,
+      currentDesiredInstances: service.replicas ?? 1,
+      exposedPorts: service.ports ?? [],
+      dependsOn: service.dependsOn ?? [],
+      dependents: spec.services
+        .filter((candidate) => candidate.dependsOn?.includes(service.name))
+        .map((candidate) => candidate.name),
+      volumes: service.volumes ?? [],
+      environmentKeys: Object.keys(service.environment ?? {}),
+    };
+  });
+}
+
+function buildVerifierObservationContext(obs: import('../domain/types.js').RevisionObservation): {
+  status: string | null;
+  scope: string | null;
+  revisionHint: string | null;
+  issues: string[];
+  findings: Array<{
+    code: string;
+    severity: string;
+    resourceKind: string;
+    resourceName: string | null;
+    expected: string | null;
+    actual: string | null;
+    evidence: string[];
+    suggestedAction: string | null;
+    requiresUserInput: boolean;
+  }>;
+  driftSummary: string | null;
+} {
+  const report = obs.verificationReport;
+  return {
+    status: report?.status ?? null,
+    scope: report?.scope ?? null,
+    revisionHint: report?.revisionHint ?? null,
+    issues: report?.issues ?? [],
+    findings: (report?.findings ?? []).map((finding) => ({
+      code: finding.code,
+      severity: finding.severity,
+      resourceKind: finding.resourceKind,
+      resourceName: finding.resourceName ?? null,
+      expected: finding.expected ?? null,
+      actual: finding.actual ?? null,
+      evidence: finding.evidence,
+      suggestedAction: finding.suggestedAction?.summary ?? null,
+      requiresUserInput: finding.requiresUserInput,
+    })),
+    driftSummary: obs.driftSummary,
+  };
+}
+
 function extractAllowedPatchOps(issues: string[]): string[] {
   return issues.flatMap((issue) => [...issue.matchAll(/allow:([a-z-]+)/gi)].map((match) => match[1]!));
 }
@@ -345,6 +564,437 @@ type RevisionRepairResult = {
   skippedPatchCount: number;
   unmatchedIssueCount: number;
 };
+
+type RevisionPatchPlanResult =
+  | { patchPlan: SpecPatchPlan; error: null; diagnostics: string[] }
+  | { patchPlan: null; error: string; diagnostics: string[] };
+
+function truncateDiagnostic(value: string, maxLength = 1200): string {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength)}... [truncated ${value.length - maxLength} chars]`;
+}
+
+function formatRevisionPatchPlanError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  return 'unknown error';
+}
+
+function normalizeAndValidateSpecPatchPlan(value: unknown): SpecPatchPlan {
+  const normalizedPlan = normalizeSpecPatchPlanShape(value);
+  return validateSpecPatchPlan(normalizedPlan);
+}
+
+function normalizeSpecPatchPlanShape(value: unknown): SpecPatchPlan {
+  const record = isRecord(value) ? value : {};
+  const rawPatches = Array.isArray(record.patches)
+    ? record.patches
+    : looksLikeRawPatch(record)
+      ? [record]
+      : [];
+  const patches = rawPatches.flatMap((patch) => normalizeSpecPatchShape(patch));
+  const ambiguities = normalizeStringArray(record.ambiguities);
+  const explanation = normalizeString(record.explanation)
+    ?? normalizeString(record.summary)
+    ?? normalizeString(record.reason)
+    ?? (patches.length > 0
+      ? 'Normalized LLM revision output into schema-valid SpecPatchPlan.'
+      : 'LLM revision output did not contain a directly applicable schema-valid patch.');
+
+  return {
+    patches,
+    explanation,
+    assumptions: normalizeStringArray(record.assumptions),
+    ambiguities,
+    requiresUserInput: typeof record.requiresUserInput === 'boolean'
+      ? record.requiresUserInput
+      : patches.length === 0,
+    confidence: normalizeConfidence(record.confidence, patches.length > 0 ? 0.7 : 0.25),
+  };
+}
+
+function normalizeSpecPatchShape(value: unknown): SpecPatch[] {
+  if (!isRecord(value)) return [];
+  const op = normalizePatchOp(value.op ?? value.kind ?? value.action ?? value.type);
+  const reason = normalizeString(value.reason) ?? normalizeString(value.explanation) ?? 'Normalized LLM patch.';
+  const target = normalizePatchTarget(value.target ?? value.selector ?? value.service ?? value.serviceName ?? value.name);
+
+  if (op === 'set-service-replicas') {
+    const replicas = normalizeInteger(value.replicas ?? value.replicaCount ?? value.instances ?? value.count);
+    return target && replicas !== null && replicas >= 1 && replicas <= 50 ? [{ op, target, replicas, reason }] : [];
+  }
+
+  if (op === 'replace-service-port') {
+    const to = normalizePortMapping(value.to ?? value.port ?? value.mapping ?? value.ports);
+    const from = normalizePortMapping(value.from);
+    return target && to ? [{ op, target, to, ...(from ? { from } : {}), reason }] : [];
+  }
+
+  if (op === 'add-service-port') {
+    const port = normalizePortMapping(value.port ?? value.to ?? value.mapping);
+    return target && port ? [{ op, target, port, reason }] : [];
+  }
+
+  if (op === 'remove-service-port') {
+    const port = normalizePortMapping(value.port ?? value.from);
+    return target ? [{ op, target, ...(port ? { port } : {}), reason }] : [];
+  }
+
+  if (op === 'set-service-image') {
+    const image = normalizeRevisionImage(normalizeString(value.image ?? value.to ?? value.value) ?? '');
+    return target && image ? [{ op, target, image, reason }] : [];
+  }
+
+  if (op === 'remove-service') {
+    return target ? [{ op, target, reason }] : [];
+  }
+
+  if (op === 'rename-service') {
+    const name = normalizeIdentifierString(value.to ?? value.newName ?? value.name);
+    return target && name ? [{ op, target, name, reason }] : [];
+  }
+
+  if (op === 'set-service-env') {
+    const key = normalizeString(value.key ?? value.name);
+    const envValue = normalizeString(value.value ?? value.to);
+    return target && key && envValue ? [{ op, target, key, value: envValue, reason }] : [];
+  }
+
+  if (op === 'remove-service-env') {
+    const key = normalizeString(value.key ?? value.name);
+    return target && key ? [{ op, target, key, reason }] : [];
+  }
+
+  if (op === 'add-service-volume' || op === 'remove-service-volume') {
+    const volume = normalizeString(value.volume ?? value.mount ?? value.value);
+    return target && volume ? [{ op, target, volume, reason }] : [];
+  }
+
+  if (op === 'add-service-dependency' || op === 'remove-service-dependency') {
+    const dependencyName = normalizeIdentifierString(value.dependencyName ?? value.dependency ?? value.dependsOn);
+    return target && dependencyName ? [{ op, target, dependencyName, reason }] : [];
+  }
+
+  if (op === 'set-service-desired-status') {
+    const desiredStatus = normalizeString(value.desiredStatus ?? value.status ?? value.value);
+    return target && (desiredStatus === 'running' || desiredStatus === 'stopped') ? [{ op, target, desiredStatus, reason }] : [];
+  }
+
+  if (op === 'set-project-name') {
+    const name = normalizeIdentifierString(value.name ?? value.projectName ?? value.to);
+    return name ? [{ op, name, reason }] : [];
+  }
+
+  if (op === 'rename-network') {
+    const from = normalizeIdentifierString(value.from);
+    const to = normalizeIdentifierString(value.to ?? value.name ?? value.networkName);
+    return to ? [{ op, ...(from ? { from } : {}), to, reason }] : [];
+  }
+
+  if (op === 'set-networks') {
+    const networks = normalizeStringArray(value.networks ?? value.names).map(sanitizeIdentifier).filter(Boolean);
+    return networks.length > 0 ? [{ op, networks: uniqueIdentifiers(networks), reason }] : [];
+  }
+
+  if (op === 'add-service' && isRecord(value.service)) {
+    return [{ op, service: value.service as SpecPatch & never, reason }].filter((patch) => validatePotentialPatch(patch));
+  }
+
+  return [];
+}
+
+function validatePotentialPatch(patch: unknown): patch is SpecPatch {
+  try {
+    validateSpecPatchPlan({ patches: [patch], explanation: 'validate', assumptions: [], ambiguities: [], requiresUserInput: false, confidence: 1 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function looksLikeRawPatch(record: Record<string, unknown>): boolean {
+  return ['op', 'kind', 'action', 'type'].some((key) => key in record);
+}
+
+function normalizePatchOp(value: unknown): SpecPatch['op'] | null {
+  const op = normalizeString(value)?.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase().replace(/_/g, '-');
+  if (!op) return null;
+  const aliases: Record<string, SpecPatch['op']> = {
+    'set-replicas': 'set-service-replicas',
+    'update-replicas': 'set-service-replicas',
+    'set-service-replica-count': 'set-service-replicas',
+    'update-service-replicas': 'set-service-replicas',
+    'set-instances': 'set-service-replicas',
+    'set-service-instances': 'set-service-replicas',
+    'change-port': 'replace-service-port',
+    'set-port': 'replace-service-port',
+    'set-service-port': 'replace-service-port',
+    'update-service-port': 'replace-service-port',
+    'change-service-port': 'replace-service-port',
+    'expose-port': 'add-service-port',
+    'add-port': 'add-service-port',
+    'remove-port': 'remove-service-port',
+    'delete-service-port': 'remove-service-port',
+    'change-image': 'set-service-image',
+    'update-image': 'set-service-image',
+    'set-image': 'set-service-image',
+    'delete-service': 'remove-service',
+    'set-env': 'set-service-env',
+    'remove-env': 'remove-service-env',
+    'add-volume': 'add-service-volume',
+    'remove-volume': 'remove-service-volume',
+    'add-dependency': 'add-service-dependency',
+    'remove-dependency': 'remove-service-dependency',
+    'set-status': 'set-service-desired-status',
+    'rename-project': 'set-project-name',
+  };
+  const allowed = new Set<SpecPatch['op']>([
+    'set-service-replicas', 'replace-service-port', 'add-service-port', 'remove-service-port', 'set-service-image',
+    'add-service', 'remove-service', 'rename-service', 'set-service-env', 'remove-service-env', 'add-service-volume',
+    'remove-service-volume', 'add-service-dependency', 'remove-service-dependency', 'set-service-desired-status',
+    'set-project-name', 'rename-network', 'set-networks',
+  ]);
+  return allowed.has(op as SpecPatch['op']) ? op as SpecPatch['op'] : aliases[op] ?? null;
+}
+
+function normalizePatchTarget(value: unknown): ServiceSelector | null {
+  if (typeof value === 'string') return { name: sanitizeIdentifier(value) };
+  if (!isRecord(value)) return null;
+  const selector: ServiceSelector = {};
+  const name = normalizeIdentifierString(value.name ?? value.serviceName);
+  const nameLike = normalizeString(value.nameLike ?? value.alias);
+  const kind = normalizeString(value.kind ?? value.role);
+  const imageFamily = normalizeString(value.imageFamily ?? value.image);
+  const dependsOn = normalizeIdentifierString(value.dependsOn);
+  const dependentOf = normalizeIdentifierString(value.dependentOf);
+  if (name) selector.name = name;
+  if (nameLike) selector.nameLike = nameLike;
+  if (kind === 'reverse-proxy' || kind === 'backend' || kind === 'database') selector.kind = kind;
+  if (imageFamily) selector.imageFamily = imageFamily.toLowerCase().split(':')[0]?.split('/').pop() ?? imageFamily;
+  if (typeof value.exposesHostPort === 'boolean') selector.exposesHostPort = value.exposesHostPort;
+  if (dependsOn) selector.dependsOn = dependsOn;
+  if (dependentOf) selector.dependentOf = dependentOf;
+  return Object.keys(selector).length > 0 ? selector : null;
+}
+
+function normalizePortMapping(value: unknown): string | null {
+  if (Array.isArray(value)) return normalizePortMapping(value[0]);
+  if (isRecord(value)) {
+    const host = normalizeInteger(value.hostPort ?? value.host);
+    const container = normalizeInteger(value.containerPort ?? value.container ?? value.targetPort);
+    return host !== null && container !== null && isValidTcpPort(host) && isValidTcpPort(container) ? `${host}:${container}` : null;
+  }
+  const text = normalizeString(value);
+  if (!text) return null;
+  const mapping = /(\d{1,5})\s*:\s*(\d{1,5})/.exec(text);
+  if (!mapping) return null;
+  const host = Number(mapping[1]);
+  const container = Number(mapping[2]);
+  return isValidTcpPort(host) && isValidTcpPort(container) ? `${host}:${container}` : null;
+}
+
+function normalizeStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap((item) => normalizeString(item) ?? []);
+  const text = normalizeString(value);
+  return text ? [text] : [];
+}
+
+function normalizeIdentifierString(value: unknown): string | null {
+  const text = normalizeString(value);
+  return text ? sanitizeIdentifier(text) : null;
+}
+
+function normalizeString(value: unknown): string | null {
+  if (typeof value === 'string') return value.trim() || null;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return null;
+}
+
+function normalizeInteger(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  if (typeof value !== 'string') return null;
+  const parsed = Number(value.trim());
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+function normalizeConfidence(value: unknown, fallback: number): number {
+  const numeric = typeof value === 'number' ? value : typeof value === 'string' ? Number(value) : NaN;
+  return Number.isFinite(numeric) ? Math.max(0, Math.min(1, numeric)) : fallback;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function buildDeterministicFeedbackPatchPlan(
+  spec: InfrastructureSpec,
+  feedback: string,
+  patchPlanError: string | null,
+): SpecPatchPlan {
+  const patches: SpecPatch[] = [];
+  const ambiguities: string[] = [];
+  const normalizedFeedback = feedback.trim();
+  const reason = `Deterministic fallback normalized user feedback: ${normalizedFeedback}`;
+
+  const replicaRequest = parseReplicaFeedback(normalizedFeedback);
+  if (replicaRequest !== null) {
+    const target = inferFeedbackServiceSelector(spec, normalizedFeedback, { preferReplicaServices: true });
+    if (target.selector !== null && target.ambiguous === false) {
+      patches.push({ op: 'set-service-replicas', target: target.selector, replicas: replicaRequest, reason });
+    } else {
+      ambiguities.push(target.reason ?? 'Which existing service should receive the requested replica/instance count?');
+    }
+  }
+
+  const portMappingRequest = parseRequestedPortMapping(normalizedFeedback);
+  if (portMappingRequest !== null) {
+    const target = inferFeedbackServiceSelector(spec, normalizedFeedback, { preferPortServices: true });
+    if (target.selector !== null && target.ambiguous === false) {
+      patches.push({
+        op: 'replace-service-port',
+        target: target.selector,
+        to: `${portMappingRequest.hostPort}:${portMappingRequest.containerPort}`,
+        reason,
+      });
+    } else {
+      ambiguities.push(target.reason ?? 'Which existing service should receive the requested port mapping?');
+    }
+  } else {
+    const hostPortRequest = parseRequestedHostPort(normalizedFeedback);
+    if (hostPortRequest !== null) {
+      const target = inferFeedbackServiceSelector(spec, normalizedFeedback, { preferPortServices: true });
+      const targetServices = target.selector ? resolveServiceSelector(spec, target.selector) : [];
+      if (target.selector !== null && target.ambiguous === false && targetServices.length === 1) {
+        const existingPort = targetServices[0]?.ports?.[0];
+        const containerPort = existingPort?.split(':')[1] ?? getDefaultContainerPort(targetServices[0]!.image) ?? String(hostPortRequest);
+        patches.push({
+          op: 'replace-service-port',
+          target: target.selector,
+          to: `${hostPortRequest}:${containerPort}`,
+          reason,
+        });
+      } else {
+        ambiguities.push(target.reason ?? 'Which existing service should receive the requested host port?');
+      }
+    }
+  }
+
+  const imageRequest = parseImageFeedback(normalizedFeedback);
+  if (imageRequest !== null) {
+    const target = inferFeedbackServiceSelector(spec, normalizedFeedback, { image: imageRequest });
+    if (target.selector !== null && target.ambiguous === false) {
+      patches.push({ op: 'set-service-image', target: target.selector, image: imageRequest, reason });
+    } else {
+      ambiguities.push(target.reason ?? 'Which existing service should use the requested image?');
+    }
+  }
+
+  const projectName = /(?:change|set|rename)\s+project\s+name\s+(?:to\s+)?([A-Za-z0-9_.-]+)/i.exec(normalizedFeedback)?.[1];
+  if (projectName) {
+    patches.push({ op: 'set-project-name', name: sanitizeIdentifier(projectName), reason });
+  }
+
+  const serviceRename = /rename\s+(?:service\s+)?([A-Za-z0-9_.-]+)\s+to\s+([A-Za-z0-9_.-]+)/i.exec(normalizedFeedback);
+  if (serviceRename && spec.services.some((service) => service.name === serviceRename[1])) {
+    patches.push({
+      op: 'rename-service',
+      target: { name: serviceRename[1]! },
+      name: sanitizeIdentifier(serviceRename[2]!),
+      reason,
+    });
+  }
+
+  const networkRename = /rename\s+network\s+([A-Za-z0-9_.-]+)\s+to\s+([A-Za-z0-9_.-]+)/i.exec(normalizedFeedback);
+  if (networkRename) {
+    patches.push({ op: 'rename-network', from: sanitizeIdentifier(networkRename[1]!), to: sanitizeIdentifier(networkRename[2]!), reason });
+  } else {
+    const networkName = /(?:change|set)\s+network\s+name\s+(?:to\s+)?([A-Za-z0-9_.-]+)/i.exec(normalizedFeedback)?.[1];
+    if (networkName) {
+      patches.push({ op: 'rename-network', to: sanitizeIdentifier(networkName), reason });
+    }
+  }
+
+  return validateSpecPatchPlan({
+    patches,
+    explanation: patchPlanError
+      ? `LLM structured revision failed validation, so deterministic fallback produced schema-valid patches where safe. Original error: ${patchPlanError}`
+      : 'Deterministic fallback produced schema-valid patches where safe.',
+    assumptions: [
+      'Fallback only emits InfrastructureSpec patches supported by SpecPatchPlan schema.',
+      'Fallback applies changes only when the target service can be inferred from the current service catalog.',
+    ],
+    ambiguities: uniqueIdentifiers(ambiguities),
+    requiresUserInput: ambiguities.length > 0 && patches.length === 0,
+    confidence: patches.length > 0 && ambiguities.length === 0 ? 0.82 : patches.length > 0 ? 0.65 : 0.25,
+  });
+}
+
+function parseReplicaFeedback(feedback: string): number | null {
+  const patterns = [
+    /\b(?:giam|giảm|tang|tăng|ha|hạ|nang|nâng|xuong|xuống|len|lên)\s+(?:(?:xuong|xuống|len|lên)\s+)?(?:(?:con|còn|thanh|thành|toi|tới|to)\s+)?(\d+)\s*(?:instances?|replicas?)?\b/i,
+    /\b(?:just|only|to|use|with|set|make|want|needs?|need)\s+(\d+)\s+(?:instances?|replicas?)\b/i,
+    /\b(?:instances?|replicas?)\s+(?:to|=|is|are)?\s*(\d+)\b/i,
+    /\b(?:scale|replicas?)\s+[^\d]{0,30}\bto\s+(\d+)\b/i,
+  ];
+  for (const pattern of patterns) {
+    const value = pattern.exec(feedback)?.[1];
+    if (!value) continue;
+    const replicas = Number(value);
+    if (Number.isInteger(replicas) && replicas >= 1 && replicas <= 50) return replicas;
+  }
+  return null;
+}
+
+function parseImageFeedback(feedback: string): string | null {
+  const requestedImage = /(?:use|image|replace\s+with|change\s+image\s+to|set\s+image\s+to)\s+([A-Za-z0-9_./:-]+)/i.exec(feedback)?.[1];
+  return requestedImage ? normalizeRevisionImage(requestedImage) : null;
+}
+
+function inferFeedbackServiceSelector(
+  spec: InfrastructureSpec,
+  feedback: string,
+  options: { preferReplicaServices?: boolean; preferPortServices?: boolean; image?: string } = {},
+): { selector: ServiceSelector | null; ambiguous: boolean; reason: string | null } {
+  const normalizedFeedback = feedback.toLowerCase();
+  const exactService = spec.services.find((service) => containsIdentifier(normalizedFeedback, service.name));
+  if (exactService) return { selector: { name: exactService.name }, ambiguous: false, reason: null };
+
+  const imageFamilyService = spec.services.find((service) => {
+    const imageFamily = service.image.toLowerCase().split(':')[0]?.split('/').pop() ?? '';
+    return imageFamily.length > 0 && containsIdentifier(normalizedFeedback, imageFamily);
+  });
+  if (imageFamilyService) {
+    return { selector: { name: imageFamilyService.name }, ambiguous: false, reason: null };
+  }
+
+  const kind = inferFeedbackServiceKind(normalizedFeedback, options.image);
+  if (kind !== null) {
+    const matches = spec.services.filter((service) => service.kind === kind);
+    if (matches.length === 1) return { selector: { kind }, ambiguous: false, reason: null };
+    if (matches.length > 1) return { selector: null, ambiguous: true, reason: `Multiple ${kind} services match the feedback.` };
+  }
+
+  if (options.preferPortServices) {
+    const portServices = spec.services.filter((service) => (service.ports?.length ?? 0) > 0);
+    if (portServices.length === 1) return { selector: { name: portServices[0]!.name }, ambiguous: false, reason: null };
+    if (portServices.length > 1) return { selector: null, ambiguous: true, reason: 'Multiple services expose host ports.' };
+  }
+
+  if (options.preferReplicaServices) {
+    const replicatedServices = spec.services.filter((service) => (service.replicas ?? 1) !== 1);
+    if (replicatedServices.length === 1) return { selector: { name: replicatedServices[0]!.name }, ambiguous: false, reason: null };
+  }
+
+  if (spec.services.length === 1) return { selector: { name: spec.services[0]!.name }, ambiguous: false, reason: null };
+  return { selector: null, ambiguous: true, reason: 'Feedback target does not clearly match exactly one current service.' };
+}
+
+function inferFeedbackServiceKind(feedback: string, requestedImage: string | null | undefined): InfrastructureSpec['services'][number]['kind'] | null {
+  const imageKind = requestedImage ? inferServiceKind(requestedImage) : null;
+  if (/\b(db|database|postgres|postgresql|mysql|mariadb|mongo|redis)\b/i.test(feedback) || imageKind === 'database') return 'database';
+  if (/\b(web|nginx|proxy|reverse-proxy|frontend|httpd|traefik|haproxy|caddy)\b/i.test(feedback) || imageKind === 'reverse-proxy') return 'reverse-proxy';
+  if (/\b(api|backend|node|nodejs|server)\b/i.test(feedback)) return 'backend';
+  return null;
+}
 
 function applyRevisionRepairs(
   spec: InfrastructureSpec,
@@ -762,6 +1412,35 @@ function buildPatchClarifications(
       ],
       allowOther: true,
     }));
+}
+
+function buildPatchPlanAmbiguityClarifications(
+  spec: InfrastructureSpec,
+  patchPlan: SpecPatchPlan | null,
+): NonNullable<PlannerRevisionResult['clarificationContext']> {
+  if (patchPlan === null || !isServiceTargetAmbiguityPatchPlan(patchPlan)) return [];
+
+  return [{
+    id: 'revision-llm-target-ambiguity',
+    severity: 'warning',
+    field: 'topology',
+    message: 'Planner could not confidently choose which existing service to change.',
+    reason: patchPlan.ambiguities[0] ?? 'The requested change is ambiguous against the current desired services.',
+    affectedServices: spec.services.map((service) => service.name),
+    choices: spec.services.slice(0, 3).map((service, index) => ({
+      id: String(index + 1),
+      label: service.name,
+      description: `Apply the requested change to ${service.kind} service ${service.name} (${service.image}).`,
+      value: `targetService:${service.name}`,
+    })),
+    allowOther: true,
+  }];
+}
+
+function isServiceTargetAmbiguityPatchPlan(patchPlan: SpecPatchPlan): boolean {
+  return patchPlan.requiresUserInput && patchPlan.patches.length === 0 && patchPlan.ambiguities.some((ambiguity) =>
+    /which existing service|target service|which service/i.test(ambiguity),
+  );
 }
 
 function patchField(op: string): import('../domain/types.js').PlanningUncertaintyField {

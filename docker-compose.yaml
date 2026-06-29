@@ -2,36 +2,42 @@ services:
   nginx:
     image: nginx:stable
     restart: unless-stopped
+    deploy:
+      replicas: 1
     ports:
-      - 67:80
+      - 80:80
     environment: {}
     depends_on:
-      - nodejs-backend
+      - api
     networks: &a1
       - app-network
-  nodejs-backend:
+  api:
     image: node:20-alpine
     restart: unless-stopped
     deploy:
       replicas: 2
     environment: {}
     depends_on:
-      - postgres
+      - postgres-1
+      - postgres-2
+      - postgres-3
     command:
       - tail
       - -f
       - /dev/null
     networks: *a1
-  postgres:
+  postgres-1:
     image: postgres:16
     restart: unless-stopped
-    environment:
+    deploy:
+      replicas: 1
+    environment: &a2
       POSTGRES_DB: app
       POSTGRES_USER: app
       POSTGRES_PASSWORD: abcabcabc
     volumes:
-      - postgres-data:/var/lib/postgresql/data
-    healthcheck:
+      - postgres-data-1:/var/lib/postgresql/data
+    healthcheck: &a3
       test:
         - CMD-SHELL
         - pg_isready -U app
@@ -39,8 +45,39 @@ services:
       timeout: 5s
       retries: 5
       startPeriod: 10s
-    networks: *a1
+    networks:
+      app-network:
+        aliases:
+          - postgres
+  postgres-2:
+    image: postgres:16
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    environment: *a2
+    volumes:
+      - postgres-data-2:/var/lib/postgresql/data
+    healthcheck: *a3
+    networks:
+      app-network:
+        aliases:
+          - postgres
+  postgres-3:
+    image: postgres:16
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    environment: *a2
+    volumes:
+      - postgres-data-3:/var/lib/postgresql/data
+    healthcheck: *a3
+    networks:
+      app-network:
+        aliases:
+          - postgres
 networks:
   app-network: {}
 volumes:
-  postgres-data: {}
+  postgres-data-1: {}
+  postgres-data-2: {}
+  postgres-data-3: {}

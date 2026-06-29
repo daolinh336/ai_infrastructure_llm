@@ -44,9 +44,9 @@ export interface McpToolDefinition {
 // --- McpConnectionPlugOptions ---
 
 export interface McpConnectionPlugOptions {
-  /** Command to spawn the MCP server subprocess (e.g. 'npx') */
+  /** Command to spawn the MCP server subprocess (e.g. 'node') */
   command: string;
-  /** Arguments for the command (e.g. ['-y', '@modelcontextprotocol/server-docker']) */
+  /** Arguments for the command (e.g. ['packages/docker-mcp-server-supernova/dist/index.js']) */
   args: string[];
   /** Timeout for individual JSON-RPC requests in milliseconds */
   requestTimeoutMs?: number;

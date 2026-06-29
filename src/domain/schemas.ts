@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { hasSharedDatabaseDataVolume } from './stateful-database-volumes.js';
 import type {
   AgentRunResult,
   ActionClassification,
@@ -20,6 +21,7 @@ import type {
   VerificationReport,
   ContainerCreateSpec,
   DockerDeployResult,
+  FeedbackIntent,
   PlannerRevisionRequest,
   ClarificationAnswer,
   PlanningClarificationContext,
@@ -28,6 +30,23 @@ import type {
   UserFeedback,
   RevisionObservation,
 } from './types.js';
+import { loadInfrastructureSchemaLimitConfig } from '../config/runtime-limits.js';
+
+const serviceReplicasSchema = z
+  .number()
+  .int('Replicas must be an integer.')
+  .min(1)
+  .superRefine((replicas, context) => {
+    const { maxServiceReplicas } = loadInfrastructureSchemaLimitConfig();
+
+    if (replicas > maxServiceReplicas) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Replicas must be <= ${maxServiceReplicas}.`,
+      });
+    }
+  });
+
 const identifierSchema = z
   .string()
   .min(1, 'Must not be empty.')
@@ -135,7 +154,7 @@ export const requestMetadataSchema = z
 export const cliInputSchema = z.object({
   prompt: z.string().min(1, 'Prompt must not be empty.'),
   dryRun: z.boolean().default(false),
-  provider: z.enum(['stub', 'openai', 'gemini']).default('stub'),
+  provider: z.enum(['stub', 'openai', 'gemini']).default('openai'),
 });
 
 export const reactReasoningOutputSchema = z
@@ -202,7 +221,7 @@ export const infrastructureServiceSchema = z
     name: identifierSchema,
     image: z.string().min(1, 'Image must not be empty.'),
     desiredStatus: z.enum(['running', 'stopped']).optional(),
-    replicas: z.number().int('Replicas must be an integer.').min(1).max(50).optional(),
+    replicas: serviceReplicasSchema.optional(),
     ports: z.array(portMappingSchema).min(1).optional(),
     environment: z.record(environmentKeySchema, z.string().min(1, 'Environment values must not be empty.')).optional(),
     dependsOn: z.array(identifierSchema).min(1).optional(),
@@ -331,6 +350,15 @@ export const infrastructureSpecSchema = z
           });
         }
       });
+
+      if (hasSharedDatabaseDataVolume(service)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['services', serviceIndex, 'volumes'],
+          message:
+            `Database service "${service.name}" cannot use one shared data volume with ${service.replicas ?? 1} replicas; use generated per-replica volumes instead.`,
+        });
+      }
     });
   });
 
@@ -521,20 +549,29 @@ export const actionClassificationSchema = z
 
 export const findingCodeSchema = z.enum([
   'HOST_PORT_CONFLICT',
+  'REPLICA_PORT_BIND_CONFLICT',
   'CONTAINER_NAME_CONFLICT',
+  'PROJECT_NAME_CONFLICT',
   'NETWORK_NAME_CONFLICT',
   'VOLUME_NAME_CONFLICT',
+  'MOUNT_DENIED',
+  'ENV_INVALID',
   'MISSING_CONTAINER',
   'CONTAINER_NOT_RUNNING',
   'CONTAINER_UNHEALTHY',
+  'HEALTHCHECK_FAILED',
   'IMAGE_MISMATCH',
   'IMAGE_NOT_FOUND',
+  'IMAGE_PULL_FAILED',
   'PORT_MISMATCH',
   'NETWORK_MISMATCH',
   'VOLUME_MISMATCH',
   'DEPENDENCY_NOT_READY',
+  'DOCKER_PERMISSION_DENIED',
+  'MCP_TOOL_ERROR',
   'RUNTIME_DRIFT',
   'RUNTIME_OBSERVATION_UNCERTAIN',
+  'UNKNOWN_RUNTIME_ERROR',
 ]);
 
 export const suggestedResolutionSchema = z
@@ -1158,6 +1195,54 @@ export const revisionObservationSchema = z
     }
   });
 
+const feedbackIntentSchema = z
+  .object({
+    source: z.literal('user-other-feedback'),
+    rawText: z.string().min(1),
+    intent: z.enum([
+      'change-port',
+      'change-name',
+      'change-replicas',
+      'change-image',
+      'change-env',
+      'change-volume',
+      'change-network',
+      'remove-exposure',
+      'yaml-edit-intent',
+      'retry-as-is',
+      'cancel',
+      'unknown',
+    ]),
+    target: z
+      .object({
+        resourceKind: z
+          .enum(['project', 'service', 'container', 'port', 'image', 'volume', 'network', 'environment'])
+          .optional(),
+        serviceSelector: z.lazy(() => serviceSelectorSchema).optional(),
+        currentValue: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    desiredChange: z
+      .object({
+        hostPort: z.number().int().min(1).max(65535).optional(),
+        containerPort: z.number().int().min(1).max(65535).optional(),
+        name: z.string().min(1).optional(),
+        replicas: serviceReplicasSchema.optional(),
+        image: z.string().min(1).optional(),
+        environment: z.record(z.string(), z.string()).optional(),
+        volumes: z.array(z.string().min(1)).optional(),
+        networks: z.array(z.string().min(1)).optional(),
+        yamlFragment: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+    confidence: z.number().min(0).max(1),
+    ambiguities: z.array(z.string().min(1)),
+    requiresUserInput: z.boolean(),
+  })
+  .strict();
+
 const serviceSelectorSchema = z
   .object({
     name: identifierSchema.optional(),
@@ -1182,7 +1267,7 @@ const serviceSelectorSchema = z
 const patchReasonSchema = z.string().min(1, 'Patch reason must not be empty.');
 
 export const specPatchSchema = z.discriminatedUnion('op', [
-  z.object({ op: z.literal('set-service-replicas'), target: serviceSelectorSchema, replicas: z.number().int().min(1).max(50), reason: patchReasonSchema }).strict(),
+  z.object({ op: z.literal('set-service-replicas'), target: serviceSelectorSchema, replicas: serviceReplicasSchema, reason: patchReasonSchema }).strict(),
   z.object({ op: z.literal('replace-service-port'), target: serviceSelectorSchema, from: portMappingSchema.optional(), to: portMappingSchema, reason: patchReasonSchema }).strict(),
   z.object({ op: z.literal('add-service-port'), target: serviceSelectorSchema, port: portMappingSchema, reason: patchReasonSchema }).strict(),
   z.object({ op: z.literal('remove-service-port'), target: serviceSelectorSchema, port: portMappingSchema.optional(), reason: patchReasonSchema }).strict(),
@@ -1216,6 +1301,9 @@ export const specPatchPlanSchema = z
 export const plannerRevisionRequestSchema = z
   .object({
     desiredSpec: infrastructureSpecSchema,
+    currentPlan: executionPlanSchema.optional(),
+    runtimeIssueReport: z.unknown().optional(),
+    feedbackIntent: feedbackIntentSchema.nullable().optional(),
     revisionObservation: revisionObservationSchema,
     stateSnapshot: infrastructureStateSnapshotSchema.nullable(),
     resourceRefs: z
@@ -1317,6 +1405,10 @@ export function validateUserFeedback(value: unknown): UserFeedback {
 
 export function validateRevisionObservation(value: unknown): RevisionObservation {
   return parseWithSchema(revisionObservationSchema, value, 'revision observation') as RevisionObservation;
+}
+
+export function validateFeedbackIntent(value: unknown): FeedbackIntent {
+  return parseWithSchema(feedbackIntentSchema, value, 'feedback intent') as FeedbackIntent;
 }
 
 export function validatePlannerRevisionRequest(value: unknown): PlannerRevisionRequest {

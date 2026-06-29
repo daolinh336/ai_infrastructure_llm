@@ -5,6 +5,7 @@ import type {
   ServiceSelector,
   SpecPatch,
 } from '../domain/types.js';
+import { expandStatefulDatabaseReplicas, getDatabaseDataVolumeTarget } from '../domain/stateful-database-volumes.js';
 
 export function applySpecPatchPlan(
   spec: InfrastructureSpec,
@@ -41,10 +42,16 @@ function resolvePatchTargets(
 
   const matches = resolveServiceSelector(spec, patch.target);
   if (matches.length === 0) {
+    if (patch.op === 'set-service-replicas' && resolveStatefulDatabaseReplicaGroup(spec, patch.target, []) !== null) {
+      return { matchedServices: [], blockedReason: null };
+    }
     return { matchedServices: [], blockedReason: 'No matching service for selector.' };
   }
 
   if (matches.length > 1) {
+    if (patch.op === 'set-service-replicas' && resolveStatefulDatabaseReplicaGroup(spec, patch.target, matches) !== null) {
+      return { matchedServices: matches, blockedReason: null };
+    }
     return { matchedServices: matches, blockedReason: 'Ambiguous selector matched multiple services.' };
   }
 
@@ -157,6 +164,13 @@ function applyResolvedPatch(
     };
   }
 
+  if (patch.op === 'set-service-replicas') {
+    const databaseGroup = resolveStatefulDatabaseReplicaGroup(spec, patch.target, matchedServices);
+    if (databaseGroup) {
+      return resizeStatefulDatabaseReplicaGroup(spec, databaseGroup, patch.replicas);
+    }
+  }
+
   if (matchedServices.length !== 1) {
     return spec;
   }
@@ -192,6 +206,15 @@ function applyResolvedPatch(
           : {}),
       })),
     };
+  }
+
+  if (patch.op === 'set-service-replicas' && target.kind === 'database') {
+    return expandStatefulDatabaseReplicas({
+      ...spec,
+      services: spec.services.map((service) =>
+        service.name === target.name ? { ...service, replicas: patch.replicas } : service,
+      ),
+    });
   }
 
   return {
@@ -268,6 +291,139 @@ function inferServiceKind(image: string): InfrastructureService['kind'] {
   if (reverseProxyImages.has(base)) return 'reverse-proxy';
   if (databaseImages.has(base)) return 'database';
   return 'backend';
+}
+
+type StatefulDatabaseReplicaGroup = {
+  baseName: string;
+  services: InfrastructureService[];
+};
+
+function resolveStatefulDatabaseReplicaGroup(
+  spec: InfrastructureSpec,
+  selector: ServiceSelector,
+  matchedServices: InfrastructureService[],
+): StatefulDatabaseReplicaGroup | null {
+  const groups = new Map<string, InfrastructureService[]>();
+  for (const service of spec.services) {
+    if (service.kind !== 'database') continue;
+    const parsed = parseNumberedReplicaServiceName(service.name);
+    if (!parsed) continue;
+    const services = groups.get(parsed.baseName) ?? [];
+    services.push(service);
+    groups.set(parsed.baseName, services);
+  }
+
+  const candidates = [...groups.entries()]
+    .map(([baseName, services]) => ({ baseName, services: sortNumberedReplicaServices(services) }))
+    .filter((group) => group.services.length > 0)
+    .filter((group) => matchesReplicaGroupSelector(group, selector, matchedServices));
+
+  return candidates.length === 1 ? candidates[0]! : null;
+}
+
+function matchesReplicaGroupSelector(
+  group: StatefulDatabaseReplicaGroup,
+  selector: ServiceSelector,
+  matchedServices: InfrastructureService[],
+): boolean {
+  const imageFamilies = new Set(group.services.map((service) => imageFamily(service.image)));
+  if (selector.name && selector.name !== group.baseName && !group.services.some((service) => service.name === selector.name)) return false;
+  if (selector.nameLike) {
+    const needle = selector.nameLike.toLowerCase();
+    if (!group.baseName.toLowerCase().includes(needle) && ![...imageFamilies].some((family) => family.includes(needle))) return false;
+  }
+  if (selector.kind && selector.kind !== 'database') return false;
+  if (selector.imageFamily && ![...imageFamilies].some((family) => family.includes(selector.imageFamily!.toLowerCase()))) return false;
+  if (matchedServices.length > 0) {
+    const groupNames = new Set(group.services.map((service) => service.name));
+    return matchedServices.every((service) => groupNames.has(service.name));
+  }
+  return Boolean(selector.name || selector.nameLike || selector.kind || selector.imageFamily);
+}
+
+function resizeStatefulDatabaseReplicaGroup(
+  spec: InfrastructureSpec,
+  group: StatefulDatabaseReplicaGroup,
+  replicas: number,
+): InfrastructureSpec {
+  const groupNames = new Set(group.services.map((service) => service.name));
+  const groupVolumeSources = new Set(group.services.flatMap((service) => (service.volumes ?? []).map(mountSource)));
+  const first = group.services[0]!;
+  const logicalDatabase = toLogicalDatabaseService(first, group.baseName, replicas, groupNames);
+  let inserted = false;
+  const logicalServices = spec.services.flatMap((service) => {
+    if (groupNames.has(service.name)) {
+      if (inserted) return [];
+      inserted = true;
+      return [logicalDatabase];
+    }
+
+    return [rewriteServiceDependencies(service, groupNames, group.baseName)];
+  });
+
+  return expandStatefulDatabaseReplicas({
+    ...spec,
+    services: logicalServices,
+    volumes: spec.volumes.filter((volume) => !groupVolumeSources.has(volume)),
+  });
+}
+
+function toLogicalDatabaseService(
+  service: InfrastructureService,
+  baseName: string,
+  replicas: number,
+  groupNames: Set<string>,
+): InfrastructureService {
+  const target = getDatabaseDataVolumeTarget(service);
+  const dataMount = target ? (service.volumes ?? []).find((volume) => mountTarget(volume) === target) : undefined;
+  const baseDataSource = dataMount ? stripReplicaOrdinal(mountSource(dataMount)) : `${baseName}-data`;
+  const dependsOn = (service.dependsOn ?? []).filter((dependency) => !groupNames.has(dependency));
+  const { replicas: _replicas, ...rest } = cloneService(service);
+  return {
+    ...rest,
+    name: baseName,
+    replicas,
+    ...(target ? { volumes: [`${baseDataSource}:${target}`] } : {}),
+    ...(dependsOn.length > 0 ? { dependsOn } : {}),
+  };
+}
+
+function rewriteServiceDependencies(
+  service: InfrastructureService,
+  groupNames: Set<string>,
+  baseName: string,
+): InfrastructureService {
+  if (!service.dependsOn) return service;
+  return {
+    ...service,
+    dependsOn: unique(service.dependsOn.map((dependency) => groupNames.has(dependency) ? baseName : dependency)),
+  };
+}
+
+function parseNumberedReplicaServiceName(name: string): { baseName: string; ordinal: number } | null {
+  const match = /^(.+)-(\d+)$/.exec(name);
+  if (!match) return null;
+  return { baseName: match[1]!, ordinal: Number(match[2]) };
+}
+
+function sortNumberedReplicaServices(services: InfrastructureService[]): InfrastructureService[] {
+  return [...services].sort((left, right) => (parseNumberedReplicaServiceName(left.name)?.ordinal ?? 0) - (parseNumberedReplicaServiceName(right.name)?.ordinal ?? 0));
+}
+
+function imageFamily(image: string): string {
+  return image.toLowerCase().split(':')[0]?.split('/').pop() ?? '';
+}
+
+function stripReplicaOrdinal(source: string): string {
+  return source.replace(/-\d+$/, '');
+}
+
+function mountSource(mount: string): string {
+  return mount.split(':')[0] ?? '';
+}
+
+function mountTarget(mount: string): string {
+  return mount.split(':')[1] ?? '';
 }
 
 function cloneSpec(spec: InfrastructureSpec): InfrastructureSpec {

@@ -1,8 +1,8 @@
 /**
  * Docker MCP response parsers.
  *
- * Extracted from the original DockerMcpClient so they can be tested
- * independently and reused across different gateway implementations.
+ * Shared parser helpers for MCP tool responses, tested independently
+ * and reused across gateway operations.
  */
 import type {
   RuntimeContainerObservation,

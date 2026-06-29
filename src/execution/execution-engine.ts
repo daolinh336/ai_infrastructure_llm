@@ -17,6 +17,10 @@ import { resolveSecrets, type SecretResolutionResult } from '../compose/secret-r
 import { writeGeneratedSecretsFile } from '../compose/generated-secrets-writer.js';
 import { validateAgentRunResult } from '../domain/schemas.js';
 import {
+  getContainerVolumeMountsForReplica,
+  normalizeStatefulDatabaseReplicaVolumes,
+} from '../domain/stateful-database-volumes.js';
+import {
   createPendingPreviewState,
   loadState,
   saveApprovalRejection,
@@ -80,6 +84,7 @@ export interface DestroyResult {
   containersRemoved: string[];
   networksRemoved: string[];
   volumesRemoved: string[];
+  removalErrors: string[];
   actual: RuntimeActualState;
   verificationReport: VerificationReport;
 }
@@ -125,7 +130,10 @@ export class ExecutionEngine {
     const previousSpec =
       previousState?.current?.desired ?? previousState?.pendingPreview?.desired ?? null;
     const secretResolution = resolveSecrets(validResult.plan.spec, previousSpec);
-    const resolvedPlan = { ...validResult.plan, spec: secretResolution.updatedSpec };
+    const resolvedPlan = {
+      ...validResult.plan,
+      spec: normalizeStatefulDatabaseReplicaVolumes(secretResolution.updatedSpec),
+    };
 
     const composeYaml = renderCompose(resolvedPlan.spec);
     const schedule = buildDependencyAwareExecutionSchedule(resolvedPlan.spec);
@@ -291,7 +299,7 @@ export class ExecutionEngine {
       'removeVolume',
     ]);
 
-    const spec = approvedAction.validatedSpec;
+    const spec = normalizeStatefulDatabaseReplicaVolumes(approvedAction.validatedSpec);
     const replicatedServicesWithPorts = spec.services.filter(
       (service) => (service.replicas ?? 1) > 1 && (service.ports?.length ?? 0) > 0,
     );
@@ -327,6 +335,16 @@ export class ExecutionEngine {
       // If a desired container already exists but is not running, starting it
       // would change state that was not created by this deployment attempt.
       const existingContainers = await dockerMcpClient.listContainers(true);
+      const desiredContainerNames = new Set(
+        spec.services.flatMap((service) => toReplicaContainerNames(spec.projectName, service)),
+      );
+      const staleProjectContainers = existingContainers.filter((container) =>
+        container.name.startsWith(spec.projectName + '-') && !desiredContainerNames.has(container.name),
+      );
+      for (const container of staleProjectContainers) {
+        await dockerMcpClient.stopContainer(container.name);
+        await dockerMcpClient.removeContainer(container.name);
+      }
       const blockedExistingContainers = spec.services
         .flatMap((service) => toReplicaContainerNames(spec.projectName, service))
         .map((name) => existingContainers.find((container) => container.name === name))
@@ -352,14 +370,24 @@ export class ExecutionEngine {
         networksCreated.push(network);
       }
 
-      // Step 2: Pull images
+      // Step 2: Create volumes
+      const existingVolumes = await dockerMcpClient.listVolumes();
+      for (const volume of spec.volumes) {
+        if (existingVolumes.some((existing) => existing.name === volume)) {
+          continue;
+        }
+        await dockerMcpClient.createVolume(volume, labels);
+        createdVolumes.push(volume);
+      }
+
+      // Step 3: Pull images
       const uniqueImages = [...new Set(spec.services.map((s) => s.image))];
       for (const image of uniqueImages) {
         await this.pullImageWithRetry(dockerMcpClient, image);
         imagesPulled.push(image);
       }
 
-      // Step 3: Create and start containers in dependency order
+      // Step 4: Create and start containers in dependency order
       for (const step of schedule.steps) {
         if (step.kind !== 'start-service') continue;
 
@@ -367,14 +395,14 @@ export class ExecutionEngine {
         if (!service) continue;
 
         const command = getRuntimeKeepaliveCommand(service.image);
-        for (const containerName of toReplicaContainerNames(spec.projectName, service)) {
+        for (const [replicaIndex, containerName] of toReplicaContainerNames(spec.projectName, service).entries()) {
           const containerSpec: import('../domain/types.js').ContainerCreateSpec = {
             name: containerName,
             image: service.image,
             ...(command ? { command } : {}),
             ports: service.ports,
             environment: service.environment,
-            volumes: service.volumes,
+            volumes: getContainerVolumeMountsForReplica(service, replicaIndex),
             networks: spec.networks.length > 0 ? [spec.networks[0]!] : undefined,
             labels,
           };
@@ -446,6 +474,7 @@ export class ExecutionEngine {
     const containersRemoved: string[] = [];
     const networksRemoved: string[] = [];
     const volumesRemoved: string[] = [];
+    const removalErrors: string[] = [];
 
     mcpClient.setAllowMutations(true);
     try {
@@ -459,9 +488,13 @@ export class ExecutionEngine {
           ((refs?.containers.includes(container.name) ?? false) && expectedContainers.has(container.name)),
       );
       for (const container of projectContainers) {
-        await mcpClient.stopContainer(container.name);
-        await mcpClient.removeContainer(container.name);
-        containersRemoved.push(container.name);
+        try {
+          await mcpClient.stopContainer(container.name);
+          await mcpClient.removeContainer(container.name);
+          containersRemoved.push(container.name);
+        } catch (error) {
+          removalErrors.push(`Container "${container.name}" could not be removed: ${getErrorMessage(error)}`);
+        }
       }
 
       const expectedNetworks = new Set(desired?.networks ?? []);
@@ -473,8 +506,12 @@ export class ExecutionEngine {
             ((refs?.networks.includes(network.name) ?? false) && expectedNetworks.has(network.name))),
       );
       for (const network of projectNetworks) {
-        await mcpClient.removeNetwork(network.name);
-        networksRemoved.push(network.name);
+        try {
+          await mcpClient.removeNetwork(network.name);
+          networksRemoved.push(network.name);
+        } catch (error) {
+          removalErrors.push(`Network "${network.name}" could not be removed: ${getErrorMessage(error)}`);
+        }
       }
 
       if (options.removeVolumes) {
@@ -486,8 +523,12 @@ export class ExecutionEngine {
             ((refs?.volumes.includes(volume.name) ?? false) && expectedVolumes.has(volume.name)),
         );
         for (const volume of projectVolumes) {
-          await mcpClient.removeVolume(volume.name);
-          volumesRemoved.push(volume.name);
+          try {
+            await mcpClient.removeVolume(volume.name);
+            volumesRemoved.push(volume.name);
+          } catch (error) {
+            removalErrors.push(`Volume "${volume.name}" could not be removed: ${getErrorMessage(error)}`);
+          }
         }
       }
     } finally {
@@ -501,11 +542,13 @@ export class ExecutionEngine {
       refs,
       actualAfterDestroy,
       Boolean(options.removeVolumes),
+      removalErrors,
     );
     return {
       containersRemoved,
       networksRemoved,
       volumesRemoved,
+      removalErrors,
       actual: actualAfterDestroy,
       verificationReport,
     };
@@ -574,7 +617,10 @@ export class ExecutionEngine {
                 ...(command ? { command } : {}),
                 ports: service.ports,
                 environment: service.environment,
-                volumes: service.volumes,
+                volumes: getContainerVolumeMountsForReplica(
+                  service,
+                  replicaIndexFromContainerName(action.resourceName),
+                ),
                 networks:
                   snapshot.desired.networks.length > 0
                     ? [snapshot.desired.networks[0]!]
@@ -772,9 +818,10 @@ function verifyDestroy(
   refs: RuntimeResourceRefs | undefined,
   actual: RuntimeActualState,
   removeVolumes: boolean,
+  removalErrors: string[] = [],
 ): VerificationReport {
   const checkedAt = new Date().toISOString();
-  const issues: string[] = [];
+  const issues: string[] = [...removalErrors];
   const evidence: string[] = [];
   const expectedContainers = new Set(
     desired ? desired.services.map((s) => project + '-' + s.name) : (refs?.containers ?? []),
@@ -960,4 +1007,10 @@ function buildOperationLabels(scope: AttemptScope): Record<string, string> {
     'approvedActionId': scope.approvedActionId,
     'managed-by': 'infra-react-agent',
   };
+}
+
+function replicaIndexFromContainerName(containerName: string): number {
+  const match = containerName.match(/-(\d+)$/);
+  if (!match) return 0;
+  return Math.max(Number(match[1]) - 1, 0);
 }

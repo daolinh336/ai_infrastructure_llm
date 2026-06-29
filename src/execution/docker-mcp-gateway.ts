@@ -1,13 +1,12 @@
 /**
  * DockerMcpGateway — Facade combining McpConnectionPlug + McpRoutingTable + ApprovalGuard.
  *
- * This replaces the original DockerMcpClient monolith with a layered design:
+ * DockerMcpGateway combines the runtime MCP layers in one explicit facade:
  *   1. McpConnectionPlug  — generic MCP transport (JSON-RPC, subprocess)
  *   2. McpRoutingTable    — explicit operation→tool routing with read/mutate classification
  *   3. ApprovalGuard      — mutation gate (setAllowMutations) that blocks mutate routes
  *
- * The public API surface is identical to the original DockerMcpClient so all
- * consumers can migrate by changing only their import.
+ * Consumers should import DockerMcpGateway directly.
  */
 import {
   McpConnectionPlug,

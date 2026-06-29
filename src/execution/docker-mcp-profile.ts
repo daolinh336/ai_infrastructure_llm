@@ -4,10 +4,7 @@ import {
   type McpRouteDefinition,
 } from './mcp-routing-table.js';
 
-export type DockerMcpProfileName =
-  | 'supernova-local'
-  | 'legacy-uvx'
-  | 'official';
+export type DockerMcpProfileName = 'supernova-local' | 'official';
 
 export interface DockerMcpRuntimeProfile {
   name: DockerMcpProfileName;
@@ -27,11 +24,6 @@ const SUPERNOVA_LOCAL_PROFILE: DockerMcpRuntimeProfile = {
   args: ['packages/docker-mcp-server-supernova/dist/index.js'],
 };
 
-const LEGACY_UVX_PROFILE: DockerMcpRuntimeProfile = {
-  name: 'legacy-uvx',
-  command: 'uvx',
-  args: ['mcp-server-docker'],
-};
 
 const OFFICIAL_PROFILE: DockerMcpRuntimeProfile = {
   name: 'official',
@@ -51,11 +43,7 @@ export function resolveDockerMcpRuntimeProfile(
 ): DockerMcpRuntimeProfile {
   const requestedProfile = env.INFRA_DOCKER_MCP_PROFILE?.trim();
   const baseProfile =
-    requestedProfile === 'legacy-uvx'
-      ? LEGACY_UVX_PROFILE
-      : requestedProfile === 'official'
-        ? OFFICIAL_PROFILE
-        : SUPERNOVA_LOCAL_PROFILE;
+    requestedProfile === 'official' ? OFFICIAL_PROFILE : SUPERNOVA_LOCAL_PROFILE;
   const command = env.INFRA_DOCKER_MCP_COMMAND?.trim() || baseProfile.command;
   const args = env.INFRA_DOCKER_MCP_ARGS
     ? parseMcpArgs(env.INFRA_DOCKER_MCP_ARGS)

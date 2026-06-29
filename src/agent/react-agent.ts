@@ -9,6 +9,7 @@ import {
   validateValidatedQuery,
 } from '../domain/schemas.js';
 import { reactReasoningOutputJsonSchema } from '../domain/structured-output-schemas.js';
+import { expandStatefulDatabaseReplicas } from '../domain/stateful-database-volumes.js';
 import {
   SUPPORTED_IMAGE_BASES,
   getImageReferenceBase,
@@ -1234,12 +1235,12 @@ function buildSpecFromDraft(query: ValidatedQuery): InfrastructureSpec {
 
   applyInferredDependencies(services);
 
-  return {
+  return expandStatefulDatabaseReplicas({
     projectName: 'sample-infra',
     networks: ['app-network'],
     volumes: [...volumes],
     services,
-  };
+  });
 }
 
 function inferTopology(
@@ -1269,9 +1270,11 @@ function buildServiceFromDraft(
     ? getDefaultServiceName(imageBase, index, topology)
     : (service.name ?? getDefaultServiceName(imageBase, index, topology));
   const volumeName = isStatefulServiceImage(imageBase) ? `${name}-data` : null;
+  const replicas = service.replicas ?? null;
+  const shouldUseSharedDataVolume = volumeName !== null && (replicas ?? 1) <= 1;
   const hostPort = service.port ?? getDefaultHostPort(imageBase);
 
-  if (volumeName !== null) {
+  if (shouldUseSharedDataVolume) {
     declaredVolumes.add(volumeName);
   }
 
@@ -1280,9 +1283,9 @@ function buildServiceFromDraft(
     name,
     image: getDefaultImage(service.image),
     ...getDefaultEnvironment(imageBase),
-    ...(service.replicas !== null ? { replicas: service.replicas } : {}),
+    ...(replicas !== null ? { replicas } : {}),
     ...(hostPort !== null ? { ports: [`${hostPort}:${getDefaultContainerPort(imageBase, hostPort)}`] } : {}),
-    ...(volumeName !== null ? { volumes: [`${volumeName}:${getDefaultVolumeTarget(imageBase)}`] } : {}),
+    ...(shouldUseSharedDataVolume ? { volumes: [`${volumeName}:${getDefaultVolumeTarget(imageBase)}`] } : {}),
   };
 }
 

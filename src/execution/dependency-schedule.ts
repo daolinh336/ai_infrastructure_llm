@@ -17,6 +17,7 @@ import type {
 } from '../domain/types.js';
 
 import { getImageReferenceBase } from '../domain/supported-images.js';
+import { normalizeStatefulDatabaseReplicaVolumes } from '../domain/stateful-database-volumes.js';
 import { isSecretLikeKey } from '../compose/secret-resolver.js';
 const ARTIFACT_TARGET_PATH = 'docker-compose.yaml';
 
@@ -25,7 +26,9 @@ const DATABASE_HEALTHCHECK_BASES = new Set(['postgres', 'mysql', 'mariadb', 'mon
 export function buildDependencyAwareExecutionSchedule(
   spec: InfrastructureSpec,
 ): DependencyAwareExecutionSchedule {
-  const validSpec = validateInfrastructureSpec(spec);
+  const validSpec = normalizeStatefulDatabaseReplicaVolumes(
+    validateInfrastructureSpec(spec),
+  );
   const dependents = buildDependentsMap(validSpec.services);
   const serviceStartOrder = orderServicesByDependency(validSpec.services, dependents);
   const steps: ExecutionScheduleStep[] = [];
@@ -128,25 +131,26 @@ export function buildDetailedDryRunPreview(
   schedule = buildDependencyAwareExecutionSchedule(plan.spec),
 ): DetailedDryRunPreview {
   const validPlan = validateExecutionPlan(plan);
+  const validSpec = normalizeStatefulDatabaseReplicaVolumes(validPlan.spec);
   const validSchedule = validateDependencyAwareExecutionSchedule(schedule);
-  const policyFindings = evaluateDryRunPolicy(validPlan.spec, validSchedule);
+  const policyFindings = evaluateDryRunPolicy(validSpec, validSchedule);
 
   return validateDetailedDryRunPreview({
-    projectName: validPlan.spec.projectName,
+    projectName: validSpec.projectName,
     artifactTargetPath: ARTIFACT_TARGET_PATH,
     artifactWritten: false,
     stateSaved: false,
     dockerCalled: false,
     mcpCalled: false,
     composePreviewLineCount: countNonEmptyLines(composeYaml),
-    totalServices: validPlan.spec.services.length,
-    totalContainers: validPlan.spec.services.reduce(
+    totalServices: validSpec.services.length,
+    totalContainers: validSpec.services.reduce(
       (total, service) => total + (service.replicas ?? 1),
       0,
     ),
-    networks: validPlan.spec.networks,
-    volumes: validPlan.spec.volumes,
-    services: validPlan.spec.services.map((service) => ({
+    networks: validSpec.networks,
+    volumes: validSpec.volumes,
+    services: validSpec.services.map((service) => ({
       name: service.name,
       kind: service.kind,
       image: service.image,
@@ -179,7 +183,9 @@ export function evaluateDryRunPolicy(
   spec: InfrastructureSpec,
   schedule = buildDependencyAwareExecutionSchedule(spec),
 ): DryRunPolicyFinding[] {
-  const validSpec = validateInfrastructureSpec(spec);
+  const validSpec = normalizeStatefulDatabaseReplicaVolumes(
+    validateInfrastructureSpec(spec),
+  );
   const findings: DryRunPolicyFinding[] = [];
 
   for (const service of validSpec.services) {
@@ -228,9 +234,9 @@ export function evaluateDryRunPolicy(
 
     if ((service.replicas ?? 1) > 1) {
       findings.push({
-        severity: 'info',
+        severity: 'warning',
         code: 'replica-preview',
-        message: `Service "${service.name}" would run ${service.replicas ?? 1} replicas.`,
+        message: buildReplicaScaleWarning(service),
         resourceName: service.name,
         resourceType: 'service',
       });
@@ -407,9 +413,25 @@ function buildScheduleWarnings(
 }
 
 function buildServiceWarnings(service: InfrastructureService): string[] {
-  return [
+  const warnings = [
     `Readiness gate is preview-only in this dry-run: ${inferWaitCondition(service)}.`,
   ];
+
+  if ((service.replicas ?? 1) > 1) {
+    warnings.push(buildReplicaScaleWarning(service));
+  }
+
+  return warnings;
+}
+
+function buildReplicaScaleWarning(service: InfrastructureService): string {
+  const replicas = service.replicas ?? 1;
+
+  if (service.kind === 'database') {
+    return `Service "${service.name}" scales from 1 to ${replicas} replicas; stateful databases must use isolated per-replica services and volumes, not one shared data volume.`;
+  }
+
+  return `Service "${service.name}" scales from 1 to ${replicas} replicas; confirm the service is stateless and does not use fixed host ports or shared writable state.`;
 }
 
 function inferWaitCondition(service: InfrastructureService): string {

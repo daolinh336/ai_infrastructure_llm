@@ -8,7 +8,6 @@ export default tseslint.config(
       'dist/**',
       'node_modules/**',
       'state/**',
-      '.worktrees/**',
       'packages/docker-mcp-server-supernova/**',
       '_*.mjs',
       'test-*.js',
