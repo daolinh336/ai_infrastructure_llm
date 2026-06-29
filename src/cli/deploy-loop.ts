@@ -16,6 +16,7 @@ import type {
 import type { ExecutionEngine } from '../execution/execution-engine.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 import { buildDriftReport } from '../execution/drift-detector.js';
+import { toReplicaContainerNames } from '../execution/container-names.js';
 import {
   createConflictVerificationReport,
   detectPreDeployConflicts,
@@ -74,7 +75,10 @@ export interface ClosedLoopDeployResult {
 
 export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Promise<ClosedLoopDeployResult> {
   let currentApprovedAction = options.approvedAction;
-  let currentPlan = options.plan;
+  let currentPlan = {
+    ...options.plan,
+    spec: currentApprovedAction.validatedSpec,
+  };
   let attemptIndex = 0;
   const revisionHistory: RevisionHistoryRecord[] = [];
   const log = options.log ?? (() => undefined);
@@ -88,7 +92,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
     if (preDeployConflicts.length > 0) {
       attemptIndex += 1;
       const conflictReport = createConflictVerificationReport(preDeployConflicts);
-      const resourceRefs = buildResourceRefs(currentApprovedAction.validatedSpec.projectName, preDeployActual);
+      const resourceRefs = buildResourceRefs(currentApprovedAction.validatedSpec.projectName, preDeployActual, currentApprovedAction.validatedSpec);
       const guardOutcome = tickGuard(options.closedLoopGuard, currentApprovedAction, conflictReport);
       if (guardOutcome === 'guard-stopped') {
         return { status: 'guard-stopped', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
@@ -143,11 +147,11 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
 
     const deployResult = await options.engine.deployWithDocker(currentApprovedAction, options.mcpClient);
     const verificationReport = await options.agent.verifyAfterApply(currentPlan, options.mcpClient);
-    const containerNames = currentApprovedAction.validatedSpec.services.map(
-      (service) => currentApprovedAction.validatedSpec.projectName + '-' + service.name.replace(/[_\s]+/g, '-'),
+    const containerNames = currentApprovedAction.validatedSpec.services.flatMap((service) =>
+      toReplicaContainerNames(currentApprovedAction.validatedSpec.projectName, service),
     );
     const actualState = await options.mcpClient.observeActualStateWithInspect({ containerNames });
-    const resourceRefs = buildResourceRefs(currentApprovedAction.validatedSpec.projectName, actualState);
+    const resourceRefs = buildResourceRefs(currentApprovedAction.validatedSpec.projectName, actualState, currentApprovedAction.validatedSpec);
     const driftReport = buildDriftReport(currentApprovedAction.validatedSpec, actualState);
 
     if (verificationReport.status === 'passed') {

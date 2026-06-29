@@ -43,7 +43,7 @@ import type {
 } from '../domain/types.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import type { LlmProvider } from '../llm/provider.js';
-import type { StateStoreOptions } from '../state/sqlite-state-store.js';
+import { loadState, type StateStoreOptions } from '../state/sqlite-state-store.js';
 import { AgentToolRegistry } from './tool-registry.js';
 import {
   createInternalAgentToolRegistry,
@@ -54,6 +54,7 @@ import type { PlannerAgent, VerifierAgent } from './agent-interfaces.js';
 import { StandardPlannerAgent } from './standard-planner-agent.js';
 import { StandardVerifierAgent } from './standard-verifier-agent.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
+import { createVerifierRuntimeReader } from '../execution/runtime-environment-reader.js';
 import {
   ReActLoopGuard,
   ReActLoopGuardError,
@@ -196,11 +197,41 @@ export class ReActAgent {
   }
 
   async verifyAfterApply(plan: ExecutionPlan, mcpClient: DockerMcpGateway): Promise<VerificationReport> {
-    return this.verifier.verify(plan.spec, mcpClient);
+    return this.verifier.verify(plan.spec, createVerifierRuntimeReader(mcpClient));
   }
 
   async reviseFromFeedback(request: PlannerRevisionRequest): Promise<PlannerRevisionResult> {
     return this.planner.reviseFromFeedback(request);
+  }
+
+  private async loadReasoningStateMemory(
+    trace: ReActStep[],
+    observations: AgentObservation[],
+  ): Promise<InfrastructureStateSnapshot | null> {
+    const snapshot = await loadState(this.stateStore).catch((error: unknown) => {
+      recordStep(trace, observations, {
+        phase: 'observe',
+        message: `Saved state could not be loaded before reasoning: ${getErrorMessage(error)}`,
+        toolName: 'load_state',
+      }, this.reportProgress);
+      return null;
+    });
+
+    if (snapshot === null) {
+      recordStep(trace, observations, {
+        phase: 'observe',
+        message: 'No saved infrastructure state found before reasoning.',
+        toolName: 'load_state',
+      }, this.reportProgress);
+      return null;
+    }
+
+    recordStep(trace, observations, {
+      phase: 'observe',
+      message: formatStateMemoryObservation(snapshot),
+      toolName: 'load_state',
+    }, this.reportProgress);
+    return snapshot;
   }
 
   async continueFromClarification(
@@ -259,6 +290,7 @@ export class ReActAgent {
     let validatedQuery = validateValidatedQuery(query);
     const observations: AgentObservation[] = [];
     const trace: ReActStep[] = [];
+    const previousState = await this.loadReasoningStateMemory(trace, observations);
 
     recordStep(
       trace,
@@ -272,7 +304,7 @@ export class ReActAgent {
       this.reportProgress,
     );
 
-    const reasoning = await this.observeStructuredReasoning(validatedQuery, trace, observations);
+    const reasoning = await this.observeStructuredReasoning(validatedQuery, trace, observations, previousState);
 
     const imageResolution = await this.resolveDraftImageReferences(
       validatedQuery,
@@ -296,8 +328,6 @@ export class ReActAgent {
     if (imageSelectionClarification) {
       return imageSelectionClarification;
     }
-
-    await this.runTool('load_state', validatedQuery, trace, observations);
 
     const draftProposalResult = await this.runTool(
       'propose_draft_spec',
@@ -621,6 +651,7 @@ export class ReActAgent {
     query: ValidatedQuery,
     trace: ReActStep[],
     observations: AgentObservation[],
+    previousState: InfrastructureStateSnapshot | null,
   ): Promise<ReActReasoningOutput | null> {
     try {
       this.reportProgress({
@@ -630,8 +661,8 @@ export class ReActAgent {
       });
       const completion = await this.provider.completeStructured({
         system:
-          'You are a ReAct infrastructure agent. Return structured reasoning only. Do not call Docker, MCP, shell, or side-effecting tools. Treat your output as an observation; deterministic internal tools remain the execution authority.',
-        user: JSON.stringify(query),
+          'You are a ReAct infrastructure agent. Return structured reasoning only. Use bounded prior reasoning memory when it is relevant, but treat the current user query and validated state schemas as the source of truth. Do not call Docker, MCP, shell, or side-effecting tools. Treat your output as an observation; deterministic internal tools remain the execution authority.',
+        user: JSON.stringify(buildReasoningPromptInput(query, previousState)),
         purpose: 'react',
         schemaName: 'react_reasoning_output',
         schema: reactReasoningOutputJsonSchema,
@@ -801,6 +832,57 @@ function formatStateMemoryObservation(snapshot: InfrastructureStateSnapshot): st
     `Loaded state memory: ${currentText}; ${pendingText}.`,
     'Actual Docker runtime remains unverified unless current.actual.source comes from a read-only runtime observation.',
   ].join(' ');
+}
+
+interface ReasoningPromptInput {
+  query: ValidatedQuery;
+  memory: {
+    summary: string;
+    currentProject: string | null;
+    pendingPreviewProject: string | null;
+    priorReasoning: Array<Pick<ReActStep, 'id' | 'phase' | 'message' | 'toolName'>>;
+    priorObservations: AgentObservation[];
+  };
+}
+
+function buildReasoningPromptInput(
+  query: ValidatedQuery,
+  previousState: InfrastructureStateSnapshot | null,
+): ReasoningPromptInput {
+  const pendingPreview = previousState?.pendingPreview ?? null;
+  const current = previousState?.current ?? null;
+  const trace = pendingPreview?.trace ?? [];
+  const observations = pendingPreview?.observations ?? [];
+
+  return {
+    query,
+    memory: {
+      summary: previousState ? formatStateMemoryObservation(previousState) : 'No saved infrastructure state found.',
+      currentProject: current?.desired.projectName ?? null,
+      pendingPreviewProject: pendingPreview?.desired.projectName ?? null,
+      priorReasoning: trace
+        .filter((step) => step.phase === 'reason' || step.toolName === 'llm_reasoning')
+        .slice(-8)
+        .map((step) => ({
+          id: step.id,
+          phase: step.phase,
+          message: truncateMemoryText(step.message),
+          toolName: step.toolName,
+        })),
+      priorObservations: observations
+        .filter((observation) => observation.source.startsWith('observe:'))
+        .slice(-8)
+        .map((observation) => ({
+          source: observation.source,
+          message: truncateMemoryText(observation.message),
+        })),
+    },
+  };
+}
+
+function truncateMemoryText(value: string): string {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  return normalized.length > 500 ? `${normalized.slice(0, 497)}...` : normalized;
 }
 
 function recordStep(

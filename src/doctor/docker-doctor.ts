@@ -1,14 +1,12 @@
-import { execFile } from 'node:child_process';
+import http from 'node:http';
+import { platform } from 'node:os';
 
 export interface DockerDoctorCommandOutput {
   stdout: string;
   stderr: string;
 }
 
-export type DockerDoctorCommandRunner = (
-  command: string,
-  args: string[],
-) => Promise<DockerDoctorCommandOutput>;
+export type DockerDoctorEngineApiRunner = () => Promise<DockerDoctorCommandOutput>;
 
 export interface DockerDoctorCommandRecord {
   command: string;
@@ -30,46 +28,28 @@ export interface DockerDoctorReport {
 }
 
 export async function runDockerDoctor(
-  runner: DockerDoctorCommandRunner = defaultDockerDoctorCommandRunner,
+  runner: DockerDoctorEngineApiRunner = defaultDockerEngineApiPingRunner,
   checkedAt = new Date().toISOString(),
 ): Promise<DockerDoctorReport> {
   const commands: DockerDoctorCommandRecord[] = [];
   const issues: string[] = [];
   const evidence: string[] = [
-    'Docker doctor is read-only and does not call docker run, pull, compose, create, start, stop, or remove.',
+    'Docker doctor is read-only and sends GET /_ping to the Docker Engine API.',
+    'Docker doctor does not call the Docker CLI, MCP, docker run, pull, compose, create, start, stop, or remove.',
   ];
-  const cliCheck = await runDoctorCommand(runner, 'docker', ['--version']);
-  commands.push(cliCheck);
-
-  if (!cliCheck.ok) {
-    issues.push('Docker CLI was not found or could not be executed.');
-
-    return {
-      status: 'failed',
-      checkedAt,
-      dockerCliFound: false,
-      engineReachable: false,
-      commands,
-      issues,
-      evidence,
-    };
-  }
-
-  evidence.push('Docker CLI responded to docker --version.');
-
-  const engineCheck = await runDoctorCommand(runner, 'docker', ['version']);
+  const engineCheck = await runDoctorCommand(runner, 'Docker Engine API', ['GET', '/_ping']);
   commands.push(engineCheck);
 
   if (!engineCheck.ok) {
-    issues.push('Docker Desktop engine is not reachable via read-only docker version.');
+    issues.push('Docker Desktop engine is not reachable via read-only Docker Engine API ping.');
   } else {
-    evidence.push('Docker Desktop engine responded to read-only docker version.');
+    evidence.push('Docker Desktop engine responded to read-only Docker Engine API ping.');
   }
 
   return {
     status: issues.length ? 'failed' : 'passed',
     checkedAt,
-    dockerCliFound: true,
+    dockerCliFound: false,
     engineReachable: engineCheck.ok,
     commands,
     issues,
@@ -77,40 +57,56 @@ export async function runDockerDoctor(
   };
 }
 
-export function defaultDockerDoctorCommandRunner(
-  command: string,
-  args: string[],
-): Promise<DockerDoctorCommandOutput> {
+export function defaultDockerEngineApiPingRunner(): Promise<DockerDoctorCommandOutput> {
   return new Promise((resolve, reject) => {
-    execFile(
-      command,
-      args,
+    const request = http.request(
       {
+        method: 'GET',
+        path: '/_ping',
+        socketPath: getDockerEngineSocketPath(),
         timeout: 10_000,
-        windowsHide: true,
       },
-      (error, stdout, stderr) => {
-        if (error) {
-          reject(error);
-          return;
-        }
+      (response) => {
+        let body = '';
 
-        resolve({
-          stdout,
-          stderr,
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => {
+          body += chunk;
+        });
+        response.on('end', () => {
+          if (response.statusCode === 200 && body.trim() === 'OK') {
+            resolve({ stdout: body, stderr: '' });
+            return;
+          }
+
+          reject(
+            new Error(
+              `Docker Engine API ping returned status ${response.statusCode ?? 'unknown'} with body ${JSON.stringify(body)}`,
+            ),
+          );
         });
       },
     );
+
+    request.on('timeout', () => {
+      request.destroy(new Error('Docker Engine API ping timed out after 10000ms'));
+    });
+    request.on('error', reject);
+    request.end();
   });
 }
 
+function getDockerEngineSocketPath(): string {
+  return platform() === 'win32' ? '//./pipe/docker_engine' : '/var/run/docker.sock';
+}
+
 async function runDoctorCommand(
-  runner: DockerDoctorCommandRunner,
+  runner: DockerDoctorEngineApiRunner,
   command: string,
   args: string[],
 ): Promise<DockerDoctorCommandRecord> {
   try {
-    const output = await runner(command, args);
+    const output = await runner();
 
     return {
       command,

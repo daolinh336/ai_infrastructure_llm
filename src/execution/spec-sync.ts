@@ -4,6 +4,7 @@ import type {
   RuntimeActualState,
   RuntimeContainerObservation,
 } from '../domain/types.js';
+import { isProtectedDockerNetwork } from './protected-docker-resources.js';
 
 const PROXY_HINTS = ['nginx', 'traefik', 'caddy', 'envoy', 'haproxy', 'apache', 'httpd'];
 const DB_HINTS = ['postgres', 'postgresql', 'mysql', 'mariadb', 'redis', 'mongodb', 'mongo', 'sqlite'];
@@ -105,6 +106,7 @@ export function deriveSpecFromRuntime(
 
   const observedNetworks = actual.networks
     .map((network) => normalizeRuntimeResourceName(network.name, projectName))
+    .filter((name) => !isProtectedDockerNetwork(name))
     .filter((name) => IDENTIFIER_RE.test(name));
   const finalNetworks = observedNetworks.length > 0 ? observedNetworks : sourceSpec.networks;
 

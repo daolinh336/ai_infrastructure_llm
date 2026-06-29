@@ -504,6 +504,140 @@ export interface RevisionObservation {
   driftSummary: string | null;
 }
 
+export interface ServiceSelector {
+  name?: string;
+  nameLike?: string;
+  kind?: InfrastructureService['kind'];
+  imageFamily?: string;
+  exposesHostPort?: boolean;
+  dependsOn?: string;
+  dependentOf?: string;
+}
+
+export type SpecPatch =
+  | {
+      op: 'set-service-replicas';
+      target: ServiceSelector;
+      replicas: number;
+      reason: string;
+    }
+  | {
+      op: 'replace-service-port';
+      target: ServiceSelector;
+      to: string;
+      from?: string;
+      reason: string;
+    }
+  | {
+      op: 'add-service-port';
+      target: ServiceSelector;
+      port: string;
+      reason: string;
+    }
+  | {
+      op: 'remove-service-port';
+      target: ServiceSelector;
+      port?: string;
+      reason: string;
+    }
+  | {
+      op: 'set-service-image';
+      target: ServiceSelector;
+      image: string;
+      reason: string;
+    }
+  | {
+      op: 'add-service';
+      service: InfrastructureService;
+      reason: string;
+    }
+  | {
+      op: 'remove-service';
+      target: ServiceSelector;
+      reason: string;
+    }
+  | {
+      op: 'rename-service';
+      target: ServiceSelector;
+      name: string;
+      reason: string;
+    }
+  | {
+      op: 'set-service-env';
+      target: ServiceSelector;
+      key: string;
+      value: string;
+      reason: string;
+    }
+  | {
+      op: 'remove-service-env';
+      target: ServiceSelector;
+      key: string;
+      reason: string;
+    }
+  | {
+      op: 'add-service-volume';
+      target: ServiceSelector;
+      volume: string;
+      reason: string;
+    }
+  | {
+      op: 'remove-service-volume';
+      target: ServiceSelector;
+      volume: string;
+      reason: string;
+    }
+  | {
+      op: 'add-service-dependency';
+      target: ServiceSelector;
+      dependencyName: string;
+      reason: string;
+    }
+  | {
+      op: 'remove-service-dependency';
+      target: ServiceSelector;
+      dependencyName: string;
+      reason: string;
+    }
+  | {
+      op: 'set-service-desired-status';
+      target: ServiceSelector;
+      desiredStatus: NonNullable<InfrastructureService['desiredStatus']>;
+      reason: string;
+    }
+  | {
+      op: 'set-project-name';
+      name: string;
+      reason: string;
+    }
+  | {
+      op: 'rename-network';
+      from?: string;
+      to: string;
+      reason: string;
+    }
+  | {
+      op: 'set-networks';
+      networks: string[];
+      reason: string;
+    };
+
+export interface SpecPatchPlan {
+  patches: SpecPatch[];
+  explanation: string;
+  assumptions: string[];
+  ambiguities: string[];
+  requiresUserInput: boolean;
+  confidence: number;
+}
+
+export interface ResolvedSpecPatchResult {
+  patch: SpecPatch;
+  matchedServiceNames: string[];
+  applied: boolean;
+  blockedReason: string | null;
+}
+
 export interface PlannerRevisionRequest {
   desiredSpec: InfrastructureSpec;
   revisionObservation: RevisionObservation;
@@ -518,6 +652,8 @@ export interface PlannerRevisionResult {
   assumptions: string[];
   revisionDecision?: PlannerRevisionDecision;
   clarificationContext?: PlanningUncertainty[];
+  patchPlan?: SpecPatchPlan;
+  patchResults?: ResolvedSpecPatchResult[];
 }
 
 export interface RevisionHistoryRecord {
@@ -636,6 +772,17 @@ export interface RuntimeContainerObservation {
   restartCount?: number | null;
   exitCode?: number | null;
   logSnippet?: string | null;
+}
+
+export interface RuntimeContainerSummary {
+  name: string;
+  image: string | null;
+  status: string | null;
+  ports: string[];
+  networks: string[];
+  mountDestinations: string[];
+  restartPolicy: string | null;
+  healthStatus: string | null;
 }
 
 export interface RuntimeNamedResourceObservation {

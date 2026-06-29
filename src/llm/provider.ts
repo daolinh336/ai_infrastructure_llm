@@ -8,6 +8,7 @@ import type {
   LlmPurpose,
   ProviderName,
   ReActReasoningOutput,
+  SpecPatchPlan,
 } from '../domain/types.js';
 import {
   canonicalizeImageBase,
@@ -150,6 +151,12 @@ export class StubLlmProvider implements LlmProvider {
     if (input.schemaName === 'react_reasoning_output') {
       return {
         text: JSON.stringify(createReActReasoningForStub()),
+      };
+    }
+
+    if (input.schemaName === 'spec_patch_plan') {
+      return {
+        text: JSON.stringify(createSpecPatchPlanForStub(input.user)),
       };
     }
 
@@ -591,6 +598,128 @@ function createReActReasoningForStub(): ReActReasoningOutput {
     safetyNotes: [
       'Do not call Docker, MCP, or side-effecting tools during Phase 4 planning.',
     ],
+  };
+}
+
+function createSpecPatchPlanForStub(rawInput: string): SpecPatchPlan {
+  let issuesText = rawInput;
+  let existingReverseProxyPort: string | null = null;
+  let firstExposedServiceName: string | null = null;
+  try {
+    const parsed = JSON.parse(rawInput) as { issues?: unknown; services?: unknown };
+    if (Array.isArray(parsed.issues)) {
+      const issues = parsed.issues.filter((issue): issue is string => typeof issue === 'string');
+      const userIssues = issues.filter((issue) => issue.startsWith('User feedback:'));
+      issuesText = (userIssues.length > 0 ? userIssues : []).join('\n');
+    }
+    if (Array.isArray(parsed.services)) {
+      const exposedReverseProxy = parsed.services.find((service) => {
+        if (typeof service !== 'object' || service === null) return false;
+        const candidate = service as { kind?: unknown; ports?: unknown };
+        return candidate.kind === 'reverse-proxy' && Array.isArray(candidate.ports) && candidate.ports.some((port) => typeof port === 'string');
+      }) as { ports?: string[] } | undefined;
+      const firstExposedService = parsed.services.find((service) => {
+        if (typeof service !== 'object' || service === null) return false;
+        const candidate = service as { ports?: unknown };
+        return Array.isArray(candidate.ports) && candidate.ports.some((port) => typeof port === 'string');
+      }) as { name?: string; ports?: string[] } | undefined;
+      existingReverseProxyPort = exposedReverseProxy?.ports?.find((port) => typeof port === 'string') ?? null;
+      firstExposedServiceName = typeof firstExposedService?.name === 'string' ? firstExposedService.name : null;
+      existingReverseProxyPort ??= firstExposedService?.ports?.find((port) => typeof port === 'string') ?? null;
+    }
+  } catch {
+    // Use the raw structured prompt as the fallback issue text.
+  }
+
+  const portMapping = [...issuesText.matchAll(/(\d{1,5})\s*:\s*(\d{1,5})/g)].at(-1);
+  if (portMapping) {
+    return {
+      patches: [
+        {
+          op: 'replace-service-port',
+          target: { nameLike: 'nginx', exposesHostPort: true },
+          to: `${portMapping[1]}:${portMapping[2]}`,
+          reason: 'Stub planner converted user feedback into a port mapping patch.',
+        },
+      ],
+      explanation: 'Apply requested port mapping change.',
+      assumptions: ['Target the matching exposed reverse-proxy service.'],
+      ambiguities: [],
+      requiresUserInput: false,
+      confidence: 0.8,
+    };
+  }
+
+  const requestedHostPort = /\bport\b[\s\S]*?\b(?:to|->|=>)\s*(\d{1,5})(?!\s*:)/i.exec(issuesText)?.[1]
+    ?? /\b(?:host\s+)?port\b[\s\S]*?(\d{1,5})(?!\s*:)/i.exec(issuesText)?.[1];
+  if (requestedHostPort) {
+    const containerPort = /\bnginx\b/i.test(issuesText)
+      ? '80'
+      : existingReverseProxyPort?.split(':')[1]?.trim() || requestedHostPort;
+    const target = { nameLike: firstExposedServiceName ?? 'nginx', exposesHostPort: true };
+    return {
+      patches: [
+        ...(/\bnginx\b/i.test(issuesText)
+          ? [{ op: 'set-service-image' as const, target, image: 'nginx:stable', reason: 'Stub planner converted user feedback into an image patch.' }]
+          : []),
+        {
+          op: 'replace-service-port',
+          target,
+          to: `${requestedHostPort}:${containerPort}`,
+          reason: 'Stub planner converted user feedback into a host port patch.',
+        },
+      ],
+      explanation: 'Apply requested host port change.',
+      assumptions: ['Target the matching exposed reverse-proxy service and preserve the existing container port.'],
+      ambiguities: [],
+      requiresUserInput: false,
+      confidence: 0.75,
+    };
+  }
+
+  const replicas = /(?:replicas?|instance|instances|bản|ban|con|lên|len|scale)[^\d]*(\d{1,2})/i.exec(issuesText)?.[1];
+  if (replicas) {
+    return {
+      patches: [
+        {
+          op: 'set-service-replicas',
+          target: { kind: 'backend' },
+          replicas: Number(replicas),
+          reason: 'Stub planner converted user feedback into a replica count patch.',
+        },
+      ],
+      explanation: 'Apply requested backend replica count.',
+      assumptions: ['Target the backend service when the request mentions application replicas.'],
+      ambiguities: [],
+      requiresUserInput: false,
+      confidence: 0.75,
+    };
+  }
+
+  if (/\b(redis|cache)\b/i.test(issuesText)) {
+    return {
+      patches: [
+        {
+          op: 'add-service',
+          service: { kind: 'database', name: 'redis', image: 'redis:7-alpine' },
+          reason: 'Stub planner converted user feedback into an added Redis cache service.',
+        },
+      ],
+      explanation: 'Add a Redis cache service requested by the user.',
+      assumptions: ['Redis is represented as a database/cache infrastructure service.'],
+      ambiguities: [],
+      requiresUserInput: false,
+      confidence: 0.75,
+    };
+  }
+
+  return {
+    patches: [],
+    explanation: 'No safe structured patch recognized by the stub planner.',
+    assumptions: [],
+    ambiguities: ['Feedback requires clarification or a real LLM provider.'],
+    requiresUserInput: true,
+    confidence: 0.2,
   };
 }
 

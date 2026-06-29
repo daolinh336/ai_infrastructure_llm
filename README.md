@@ -153,10 +153,27 @@ npm run dev -- plan "Create a web application with nginx, 2 node backends, and p
 npm run dev -- doctor --docker
 npm run dev -- status
 npm run build
+npm run build:supernova-mcp
+npm run test:e2e:docker-mcp
 npm run typecheck
 npm run lint
 npm test
 ```
+
+## Docker MCP deployment
+
+Docker deploys use the local Supernova MCP server by default. The runtime path is CLI/execution engine -> `DockerMcpGateway` -> Supernova MCP stdio server -> `dockerode` -> Docker Engine API. The CLI does not call Docker directly for deploy, observe, verify, or cleanup.
+
+Before a real deploy or the opt-in E2E smoke test, build the server:
+
+```bash
+npm --prefix .worktrees/docker-mcp-server-supernova install
+npm run build:supernova-mcp
+npm run test:e2e:docker-mcp
+npm run test:e2e:docker-mcp:all-tools
+```
+
+The default profile is `supernova-local` and runs `node .worktrees/docker-mcp-server-supernova/dist/index.js`. `INFRA_DOCKER_MCP_PROFILE=legacy-uvx` and `INFRA_DOCKER_MCP_PROFILE=official` remain explicit debug overrides only.
 
 ## LLM provider setup
 
@@ -192,9 +209,8 @@ Provider variables:
 
 ## Notes
 
-- The current implementation is preview/state-memory-first: it can plan, validate,
-  render, dry-run, save a pending preview, and create a Phase 8 approved compose
-  artifact action, but does not yet perform real Docker deployment.
+- Real Docker deployment is available through the guarded Supernova MCP path after
+  approval; preview/dry-run remains the default path when deploy is not requested.
 - OpenAI and Gemini are both working first-class provider choices configured
   via `.env` (see provider setup above); the stub provider remains the default
   deterministic path for local dev/tests. Only OpenAI and Gemini are

@@ -6,19 +6,19 @@ import type {
   PlannerRevisionRequest,
   PlannerRevisionResult,
 } from '../domain/types.js';
-import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
+import type { PlannerRuntimeReader, VerifierRuntimeReader } from '../execution/runtime-environment-reader.js';
 
 export interface PlannerAgent {
   proposeSpec(
     query: ValidatedQuery,
     stateSnapshot: InfrastructureStateSnapshot | null,
-    dockerMcpClient?: DockerMcpGateway,
+    runtimeReader?: PlannerRuntimeReader,
   ): Promise<InfrastructureSpec>;
 
   repairSpec(
     spec: InfrastructureSpec,
     issues: string[],
-    dockerMcpClient?: DockerMcpGateway,
+    runtimeReader?: PlannerRuntimeReader,
   ): Promise<InfrastructureSpec>;
 
   reviseFromFeedback(
@@ -29,7 +29,7 @@ export interface PlannerAgent {
 export interface VerifierAgent {
   verify(
     desiredSpec: InfrastructureSpec,
-    dockerMcpClient: DockerMcpGateway,
+    runtimeReader: VerifierRuntimeReader,
   ): Promise<VerificationReport>;
 
   compareState(

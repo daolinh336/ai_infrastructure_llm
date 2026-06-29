@@ -6,10 +6,7 @@ import type {
   RuntimeActualState,
   RuntimeContainerObservation,
 } from '../domain/types.js';
-
-function toContainerName(projectName: string, serviceName: string): string {
-  return projectName + '-' + serviceName.replace(/[_\s]+/g, '-');
-}
+import { toReplicaContainerNames } from './container-names.js';
 
 function imageBase(image: string): string {
   return (image.split(':')[0] ?? '').split('/').pop() ?? image.toLowerCase();
@@ -56,24 +53,35 @@ export function buildDriftReport(
   const findings: DriftFinding[] = [];
 
   for (const service of desired.services) {
-    const expectedName = toContainerName(desired.projectName, service.name);
-    const matches = actual.containers.filter(
-      (container) => container.name === expectedName || container.name.includes(service.name),
+    const expectedNames = toReplicaContainerNames(desired.projectName, service);
+    const replicas = service.replicas ?? 1;
+    const matches = actual.containers.filter((container) =>
+      expectedNames.includes(container.name) ||
+      (replicas <= 1 && normalizeObservedResourceName(container.name, desired.projectName) === service.name),
+    );
+    const missingNames = expectedNames.filter(
+      (expectedName) => !matches.some((container) =>
+        container.name === expectedName ||
+        (replicas <= 1 && normalizeObservedResourceName(container.name, desired.projectName) === service.name),
+      ),
     );
 
-    if (matches.length === 0) {
+    for (const missingName of missingNames) {
       findings.push(
         finding(
           'missing-container',
           'major',
           'container',
-          expectedName,
-          'Service "' + service.name + '" has no matching container.',
-          expectedName,
+          missingName,
+          'Service "' + service.name + '" is missing expected container "' + missingName + '".',
+          missingName,
           null,
           true,
         ),
       );
+    }
+
+    if (matches.length === 0) {
       continue;
     }
 

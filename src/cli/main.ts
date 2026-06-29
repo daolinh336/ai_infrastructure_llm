@@ -4,20 +4,24 @@ import { Command } from 'commander';
 import chalk from 'chalk';
 import { buildResourceRefs } from '../agent/standard-verifier-agent.js';
 import { runDockerDoctor } from '../doctor/docker-doctor.js';
-import { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 import { buildDriftReport } from '../execution/drift-detector.js';
 import { ExecutionEngine } from '../execution/execution-engine.js';
 import { buildRepairPlan } from '../execution/repair-planner.js';
 import { deriveSpecFromRuntime } from '../execution/spec-sync.js';
+import { isProtectedDockerNetwork } from '../execution/protected-docker-resources.js';
+import { toReplicaContainerNames } from '../execution/container-names.js';
 import { clearManagedStateAfterDestroyAll, loadState, saveStateOperationRecord, saveVerifiedRuntimeSnapshot } from '../state/sqlite-state-store.js';
 import { StatusService } from '../status/status-service.js';
 import { registerPlanCommand } from './plan-command.js';
 import {
   collectDestroyAllTargets,
+  createDockerMcpGatewayFromEnv,
   createProgressPrinter,
   getErrorMessage,
+  isMissingDockerResourceError,
   isCommanderDisplayExitError,
   isCommanderExcessArgumentsError,
+  loadDockerPullRetryPolicyFromEnv,
   loadLocalEnvFile,
   printDockerDoctorReport,
 } from './shared.js';
@@ -54,7 +58,7 @@ program
   .command('observe')
   .description('Observe current Docker runtime state using MCP')
   .action(async () => {
-    const mcpClient = new DockerMcpGateway();
+    const mcpClient = createDockerMcpGatewayFromEnv();
     try {
       await mcpClient.initialize();
       const containers = await mcpClient.listContainers(true);
@@ -103,7 +107,7 @@ program
   .option('--yes', 'Skip interactive approval by typing the verification phrase automatically', false)
   .action(async (options) => {
     const state = await loadState();
-    const mcpClient = new DockerMcpGateway();
+    const mcpClient = createDockerMcpGatewayFromEnv();
     try {
       await mcpClient.initialize();
       const actual = await mcpClient.observeActualState();
@@ -115,7 +119,7 @@ program
       console.log('- Networks: ' + (targets.networks.join(', ') || 'none'));
       console.log('- Volumes: ' + (targets.volumes.join(', ') || (options.removeVolumes ? 'none' : 'preserved; use --remove-volumes')));
       console.log('- Images: preserved');
-      console.log(chalk.yellow('Targets are limited to resources from saved state, current project prefixes, or Codex operation labels.'));
+      console.log(chalk.yellow('Targets are limited to resources from saved state'));
 
       const totalTargets = targets.containers.length + targets.networks.length + targets.volumes.length;
       if (totalTargets === 0) {
@@ -140,6 +144,7 @@ program
 
       mcpClient.setAllowMutations(true);
       const removed = { containers: [] as string[], networks: [] as string[], volumes: [] as string[] };
+      const warnings: Array<{ resource: string; message: string }> = [];
       const failed: Array<{ resource: string; error: string }> = [];
       try {
         for (const container of targets.containers) {
@@ -148,7 +153,11 @@ program
             await mcpClient.removeContainer(container);
             removed.containers.push(container);
           } catch (error) {
-            failed.push({ resource: 'container:' + container, error: getErrorMessage(error) });
+            if (isMissingDockerResourceError(error)) {
+              warnings.push({ resource: 'container:' + container, message: 'already absent' });
+            } else {
+              failed.push({ resource: 'container:' + container, error: getErrorMessage(error) });
+            }
           }
         }
         for (const network of targets.networks) {
@@ -156,7 +165,11 @@ program
             await mcpClient.removeNetwork(network);
             removed.networks.push(network);
           } catch (error) {
-            failed.push({ resource: 'network:' + network, error: getErrorMessage(error) });
+            if (isMissingDockerResourceError(error)) {
+              warnings.push({ resource: 'network:' + network, message: 'already absent' });
+            } else {
+              failed.push({ resource: 'network:' + network, error: getErrorMessage(error) });
+            }
           }
         }
         for (const volume of targets.volumes) {
@@ -164,7 +177,11 @@ program
             await mcpClient.removeVolume(volume);
             removed.volumes.push(volume);
           } catch (error) {
-            failed.push({ resource: 'volume:' + volume, error: getErrorMessage(error) });
+            if (isMissingDockerResourceError(error)) {
+              warnings.push({ resource: 'volume:' + volume, message: 'already absent' });
+            } else {
+              failed.push({ resource: 'volume:' + volume, error: getErrorMessage(error) });
+            }
           }
         }
       } finally {
@@ -175,6 +192,12 @@ program
       console.log('- Containers removed: ' + (removed.containers.join(', ') || 'none'));
       console.log('- Networks removed: ' + (removed.networks.join(', ') || 'none'));
       console.log('- Volumes removed: ' + (removed.volumes.join(', ') || 'none'));
+      if (warnings.length > 0) {
+        console.log(chalk.yellow('Warnings:'));
+        for (const entry of warnings) {
+          console.log(`  - ${entry.resource}: ${entry.message}`);
+        }
+      }
       if (failed.length > 0) {
         console.log(chalk.yellow('Failures:'));
         for (const entry of failed) {
@@ -213,7 +236,9 @@ program
       message: 'acting... load saved infrastructure snapshot.',
     });
     const state = await loadState();
-    const engine = new ExecutionEngine();
+    const engine = new ExecutionEngine({
+      dockerPullRetry: loadDockerPullRetryPolicyFromEnv(),
+    });
     const status = await new StatusService().showStatus();
     reportProgress({
       phase: 'execution',
@@ -226,7 +251,7 @@ program
         return;
       }
       const project = state.current.desired.projectName;
-      const mcpClient = new DockerMcpGateway();
+      const mcpClient = createDockerMcpGatewayFromEnv();
       try {
         await mcpClient.initialize();
         const { drift, actual } = await engine.detectRuntimeDrift(state.current, mcpClient);
@@ -237,7 +262,7 @@ program
         }
 
         if (drift.status === 'none') {
-          const resourceRefs = buildResourceRefs(project, actual);
+          const resourceRefs = buildResourceRefs(project, actual, state.current.desired);
           await saveVerifiedRuntimeSnapshot({
             sourceSnapshot: state.current,
             actual,
@@ -308,7 +333,7 @@ program
           console.log('- Volumes: ' + (syncedSpec.volumes.join(', ') || 'none'));
           const driftAfterSync = buildDriftReport(syncedSpec, actual);
           try {
-            const resourceRefs = buildResourceRefs(project, actual);
+            const resourceRefs = buildResourceRefs(project, actual, state.current.desired);
             await saveVerifiedRuntimeSnapshot({ sourceSnapshot: state.current, desired: syncedSpec, actual, verificationReport: { status: 'passed', scope: 'tool-runtime', checkedAt: new Date().toISOString(), issues: [], evidence: ['Runtime accepted as truth via sync from status --drift.'], errorReason: null, revisionHint: null, confidence: 0.95 }, operation: 'sync', resourceRefs, driftReport: driftAfterSync });
             console.log(chalk.green('Synced verified runtime state to SQLite (runtime as truth).'));
             console.log(chalk.cyan('Post-sync drift:'));
@@ -337,7 +362,7 @@ program
         console.log('- ' + driftAfterRepair.summary);
 
         if (report.status === 'applied' && driftAfterRepair.status === 'none') {
-          const resourceRefs = buildResourceRefs(project, actualAfterRepair);
+          const resourceRefs = buildResourceRefs(project, actualAfterRepair, state.current.desired);
           await saveVerifiedRuntimeSnapshot({ sourceSnapshot: state.current, actual: actualAfterRepair, verificationReport: { status: 'passed', scope: 'tool-runtime', checkedAt: new Date().toISOString(), issues: [], evidence: ['Repair applied successfully from status --drift. Drift resolved.'], errorReason: null, revisionHint: null, confidence: 0.95 }, operation: 'repair', resourceRefs, driftReport: driftAfterRepair, repairReport: report });
           console.log(chalk.green('Saved verified runtime state to SQLite after repair.'));
           await saveStateOperationRecord({ type: 'verified-runtime-saved', projectName: project, request: state.current.request, summary: 'Drift repaired from status --drift and verified runtime state synced to SQLite.' });
@@ -363,17 +388,30 @@ program
   .option('--yes', 'Skip interactive approval', false)
   .action(async (options) => {
     const state = await loadState();
-    const engine = new ExecutionEngine();
+    const engine = new ExecutionEngine({
+      dockerPullRetry: loadDockerPullRetryPolicyFromEnv(),
+    });
     if (!state || !state.current) {
       console.log(chalk.red('No current verified runtime snapshot found. Run a deploy first.'));
       process.exitCode = 1;
       return;
     }
     const project = options.project ?? state.current.desired.projectName;
+    const expectedContainers = state.current.desired.services.flatMap((service) =>
+      toReplicaContainerNames(project, service),
+    );
+    const expectedNetworks = new Set(state.current.desired.networks);
+    const expectedVolumes = new Set(state.current.desired.volumes);
+    const previewContainers = (state.current.resourceRefs?.containers ?? expectedContainers)
+      .filter((name) => name.startsWith(project + '-') || expectedContainers.includes(name));
+    const previewNetworks = (state.current.resourceRefs?.networks ?? state.current.desired.networks)
+      .filter((name) => !isProtectedDockerNetwork(name) && (name.startsWith(project + '-') || expectedNetworks.has(name)));
+    const previewVolumes = (state.current.resourceRefs?.volumes ?? state.current.desired.volumes)
+      .filter((name) => name.startsWith(project + '-') || expectedVolumes.has(name));
     console.log(chalk.cyan('Destroy preview for project "' + project + '":'));
-    console.log('- Containers: ' + (state.current.resourceRefs?.containers.join(', ') || state.current.desired.services.map((s) => project + '-' + s.name).join(', ') || 'none'));
-    console.log('- Networks: ' + (state.current.resourceRefs?.networks.join(', ') || state.current.desired.networks.join(', ') || 'none'));
-    if (options.removeVolumes) console.log('- Volumes: ' + (state.current.resourceRefs?.volumes.join(', ') || 'none'));
+    console.log('- Containers: ' + (previewContainers.join(', ') || 'none'));
+    console.log('- Networks: ' + (previewNetworks.join(', ') || 'none'));
+    if (options.removeVolumes) console.log('- Volumes: ' + (previewVolumes.join(', ') || 'none'));
     console.log('- Images: preserved');
     if (!options.yes) {
       const readline = createInterface({ input, output });
@@ -385,7 +423,7 @@ program
         }
       } finally { readline.close(); }
     }
-    const mcpClient = new DockerMcpGateway();
+      const mcpClient = createDockerMcpGatewayFromEnv();
     try {
       await mcpClient.initialize();
       const result = await engine.destroyWithDocker(state.current, mcpClient, { projectName: project, removeVolumes: Boolean(options.removeVolumes) });
@@ -410,7 +448,7 @@ program
       }
 
       if (result.verificationReport.status === 'passed') {
-        const resourceRefs = buildResourceRefs(project, result.actual);
+        const resourceRefs = buildResourceRefs(project, result.actual, state.current.desired);
         await saveVerifiedRuntimeSnapshot({
           sourceSnapshot: state.current,
           actual: result.actual,
@@ -436,14 +474,16 @@ program
 .option('--approve-risky', 'Include approval-required repair actions in the approval request', false)
 .action(async (options) => {
   const state = await loadState();
-  const engine = new ExecutionEngine();
+  const engine = new ExecutionEngine({
+    dockerPullRetry: loadDockerPullRetryPolicyFromEnv(),
+  });
   if (!state || !state.current) {
     console.log(chalk.red('No current verified runtime snapshot found. Run a deploy first.'));
     process.exitCode = 1;
     return;
   }
   const project = state.current.desired.projectName;
-  const mcpClient = new DockerMcpGateway();
+  const mcpClient = createDockerMcpGatewayFromEnv();
   try {
     await mcpClient.initialize();
     const { drift } = await engine.detectRuntimeDrift(state.current, mcpClient);
@@ -482,7 +522,7 @@ program
     console.log(chalk.cyan('Post-repair drift:'));
     console.log('- ' + driftAfterRepair.summary);
     if (report.status === 'applied' && driftAfterRepair.status === 'none') {
-      const resourceRefs = buildResourceRefs(project, actualAfterRepair);
+      const resourceRefs = buildResourceRefs(project, actualAfterRepair, state.current.desired);
       await saveVerifiedRuntimeSnapshot({ sourceSnapshot: state.current, actual: actualAfterRepair, verificationReport: { status: 'passed', scope: 'tool-runtime', checkedAt: new Date().toISOString(), issues: [], evidence: ['Repair applied successfully. Drift resolved.'], errorReason: null, revisionHint: null, confidence: 0.95 }, operation: 'repair', resourceRefs, driftReport: driftAfterRepair, repairReport: report });
       console.log(chalk.green('Saved verified runtime state to SQLite after repair.'));
     } else {
@@ -518,6 +558,3 @@ program.parseAsync(process.argv).catch((error: unknown) => {
   }
   process.exitCode = 1;
 });
-
-
-

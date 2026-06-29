@@ -4,7 +4,16 @@ import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
   {
-    ignores: ['dist/**', 'node_modules/**', 'state/**', '_*.mjs', 'test-*.js', '.codex_*.mjs'],
+    ignores: [
+      'dist/**',
+      'node_modules/**',
+      'state/**',
+      '.worktrees/**',
+      'packages/docker-mcp-server-supernova/**',
+      '_*.mjs',
+      'test-*.js',
+      '.codex_*.mjs',
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

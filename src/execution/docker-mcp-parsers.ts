@@ -6,6 +6,7 @@
  */
 import type {
   RuntimeContainerObservation,
+  RuntimeContainerSummary,
   RuntimeImageObservation,
   RuntimeNamedResourceObservation,
 } from '../domain/types.js';
@@ -62,12 +63,69 @@ export function parseInspectResult(output: string, containerName: string): Runti
   }
 }
 
+
+/**
+ * Parse Docker inspect output into the narrow planner-safe summary.
+ * This intentionally omits env values, labels, raw command, bind sources, and
+ * internal network metadata while retaining conflict-planning signals.
+ */
+export function parseInspectSummaryResult(output: string, containerName: string): RuntimeContainerSummary | null {
+  try {
+    const parsed = JSON.parse(output) as unknown;
+    const inspect = Array.isArray(parsed) ? parsed.find(isRecord) : parsed;
+    if (!isRecord(inspect)) return null;
+    const config = isRecord(inspect.Config) ? inspect.Config : undefined;
+    const hostConfig = isRecord(inspect.HostConfig) ? inspect.HostConfig : undefined;
+    const rawName = typeof inspect.Name === 'string' ? inspect.Name.replace(/^\//, '') : containerName;
+    return {
+      name: rawName,
+      image: normalizeImage(config?.Image ?? inspect.Image),
+      status: isRecord(inspect.State) ? stringField(inspect.State, 'Status') : stringField(inspect, 'Status'),
+      ports: extractPortsFromInspect(inspect),
+      networks: extractNetworkNamesFromInspect(inspect),
+      mountDestinations: extractMountDestinationsFromInspect(inspect),
+      restartPolicy: extractRestartPolicy(hostConfig),
+      healthStatus: extractHealthStatus(inspect),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function extractHealthStatus(inspect: Record<string, unknown>): string | null {
   const state = inspect.State;
   if (!isRecord(state)) return null;
   const health = state.Health;
   if (!isRecord(health)) return null;
   return stringField(health, 'Status');
+}
+
+function extractRestartPolicy(hostConfig: Record<string, unknown> | undefined): string | null {
+  if (!hostConfig) return null;
+  const restartPolicy = hostConfig.RestartPolicy;
+  if (!isRecord(restartPolicy)) return null;
+  const name = stringField(restartPolicy, 'Name');
+  if (!name || name === 'no') return null;
+  const maximumRetryCount = numberField(restartPolicy, 'MaximumRetryCount');
+  return maximumRetryCount && maximumRetryCount > 0 ? name + ':' + String(maximumRetryCount) : name;
+}
+
+function extractNetworkNamesFromInspect(inspect: Record<string, unknown>): string[] {
+  const networkSettings = inspect.NetworkSettings;
+  if (!isRecord(networkSettings) || !isRecord(networkSettings.Networks)) return [];
+  return Object.keys(networkSettings.Networks).filter((name) => name.trim().length > 0).sort();
+}
+
+function extractMountDestinationsFromInspect(inspect: Record<string, unknown>): string[] {
+  const mounts = inspect.Mounts;
+  if (!Array.isArray(mounts)) return [];
+  const destinations = new Set<string>();
+  for (const mount of mounts) {
+    if (!isRecord(mount)) continue;
+    const destination = stringField(mount, 'Destination') ?? stringField(mount, 'Target');
+    if (destination) destinations.add(destination);
+  }
+  return [...destinations].sort();
 }
 
 /**

@@ -132,3 +132,202 @@ export const reactReasoningOutputJsonSchema = {
   },
   required: ['summary', 'nextAction', 'rationale', 'safetyNotes'],
 } satisfies JsonSchema;
+
+const serviceSelectorJsonSchema = {
+  type: 'object',
+  properties: {
+    name: { type: 'string', minLength: 1 },
+    nameLike: { type: 'string', minLength: 1 },
+    kind: { type: 'string', enum: ['reverse-proxy', 'backend', 'database'] },
+    imageFamily: { type: 'string', minLength: 1 },
+    exposesHostPort: { type: 'boolean' },
+    dependsOn: { type: 'string', minLength: 1 },
+    dependentOf: { type: 'string', minLength: 1 },
+  },
+} satisfies JsonSchema;
+
+const patchBaseProperties = {
+  target: serviceSelectorJsonSchema,
+  reason: { type: 'string', minLength: 1 },
+};
+
+const infrastructureServiceJsonSchema = {
+  type: 'object',
+  properties: {
+    kind: { type: 'string', enum: ['reverse-proxy', 'backend', 'database'] },
+    name: { type: 'string', minLength: 1 },
+    image: { type: 'string', minLength: 1 },
+    desiredStatus: { type: 'string', enum: ['running', 'stopped'] },
+    replicas: { type: 'integer', minimum: 1, maximum: 50 },
+    ports: { type: 'array', items: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' } },
+    environment: { type: 'object', additionalProperties: { type: 'string' } },
+    dependsOn: { type: 'array', items: { type: 'string', minLength: 1 } },
+    volumes: { type: 'array', items: { type: 'string', minLength: 1 } },
+  },
+  required: ['kind', 'name', 'image'],
+} satisfies JsonSchema;
+
+export const specPatchPlanJsonSchema = {
+  type: 'object',
+  properties: {
+    patches: {
+      type: 'array',
+      items: {
+        anyOf: [
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-service-replicas'] },
+              ...patchBaseProperties,
+              replicas: { type: 'integer', minimum: 1, maximum: 50 },
+            },
+            required: ['op', 'target', 'replicas', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['replace-service-port'] },
+              ...patchBaseProperties,
+              from: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
+              to: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
+            },
+            required: ['op', 'target', 'to', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['add-service-port'] },
+              ...patchBaseProperties,
+              port: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
+            },
+            required: ['op', 'target', 'port', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['remove-service-port'] },
+              ...patchBaseProperties,
+              port: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
+            },
+            required: ['op', 'target', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-service-image'] },
+              ...patchBaseProperties,
+              image: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'target', 'image', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['add-service'] },
+              service: infrastructureServiceJsonSchema,
+              reason: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'service', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['remove-service'] },
+              ...patchBaseProperties,
+            },
+            required: ['op', 'target', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['rename-service'] },
+              ...patchBaseProperties,
+              name: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'target', 'name', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-service-env'] },
+              ...patchBaseProperties,
+              key: { type: 'string', minLength: 1 },
+              value: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'target', 'key', 'value', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['remove-service-env'] },
+              ...patchBaseProperties,
+              key: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'target', 'key', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['add-service-volume', 'remove-service-volume'] },
+              ...patchBaseProperties,
+              volume: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'target', 'volume', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['add-service-dependency', 'remove-service-dependency'] },
+              ...patchBaseProperties,
+              dependencyName: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'target', 'dependencyName', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-service-desired-status'] },
+              ...patchBaseProperties,
+              desiredStatus: { type: 'string', enum: ['running', 'stopped'] },
+            },
+            required: ['op', 'target', 'desiredStatus', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-project-name'] },
+              name: { type: 'string', minLength: 1 },
+              reason: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'name', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['rename-network'] },
+              from: { type: 'string', minLength: 1 },
+              to: { type: 'string', minLength: 1 },
+              reason: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'to', 'reason'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-networks'] },
+              networks: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1 },
+              reason: { type: 'string', minLength: 1 },
+            },
+            required: ['op', 'networks', 'reason'],
+          },
+        ],
+      },
+    },
+    explanation: { type: 'string', minLength: 1 },
+    assumptions: { type: 'array', items: { type: 'string', minLength: 1 } },
+    ambiguities: { type: 'array', items: { type: 'string', minLength: 1 } },
+    requiresUserInput: { type: 'boolean' },
+    confidence: { type: 'number', minimum: 0, maximum: 1 },
+  },
+  required: ['patches', 'explanation', 'assumptions', 'ambiguities', 'requiresUserInput', 'confidence'],
+} satisfies JsonSchema;

@@ -1,4 +1,4 @@
-import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
+import type { VerifierRuntimeReader } from '../execution/runtime-environment-reader.js';
 import type {
   DriftFindingKind,
   InfrastructureService,
@@ -11,20 +11,21 @@ import type {
 } from '../domain/types.js';
 import { validateVerificationReport } from '../domain/schemas.js';
 import { buildDriftReport } from '../execution/drift-detector.js';
-import { RuntimeEnvironmentReader } from '../execution/runtime-environment-reader.js';
+import { toReplicaContainerNames, toServiceContainerName } from '../execution/container-names.js';
+import { isProtectedDockerNetwork } from '../execution/protected-docker-resources.js';
 import type { VerifierAgent } from './agent-interfaces.js';
 
 export class StandardVerifierAgent implements VerifierAgent {
   async verify(
     desiredSpec: InfrastructureSpec,
-    dockerMcpClient: DockerMcpGateway,
+    runtimeReader: VerifierRuntimeReader,
   ): Promise<VerificationReport> {
     const checkedAt = new Date().toISOString();
     const evidence: string[] = [];
     const findings: VerificationFinding[] = [];
 
     try {
-      if (!dockerMcpClient.isInitialized) {
+      if (!runtimeReader.isReady) {
         return validateVerificationReport(buildReport({
           status: 'uncertain',
           checkedAt,
@@ -33,22 +34,23 @@ export class StandardVerifierAgent implements VerifierAgent {
             severity: 'blocker',
             resourceKind: 'runtime',
             resourceName: null,
-            expected: 'initialized Docker MCP gateway',
+            expected: 'initialized verifier runtime reader',
             actual: 'not initialized',
-            evidence: ['DockerMcpClient is not initialized.'],
+            evidence: ['VerifierRuntimeReader is not initialized.'],
             confidence: 1,
-            suggestedAction: { action: 'retry-observe', summary: 'Call initialize() before verify().' },
+            suggestedAction: { action: 'retry-observe', summary: 'Provide a ready verifier runtime reader before verify().' },
           })],
           evidence: [],
-          errorReason: 'Cannot verify because Docker MCP client is not initialized.',
-          revisionHint: 'Call initialize() before verify().',
+          errorReason: 'Cannot verify because verifier runtime reader is not initialized.',
+          revisionHint: 'Provide a ready verifier runtime reader before verify().',
           confidence: 0,
         }));
       }
 
-      const containerNames = desiredSpec.services.map((service) => toContainerName(desiredSpec.projectName, service.name));
-      const reader = new RuntimeEnvironmentReader(dockerMcpClient);
-      const actual: RuntimeActualState = await reader.read(desiredSpec, { containerNames });
+      const containerNames = desiredSpec.services.flatMap((service) =>
+        toReplicaContainerNames(desiredSpec.projectName, service),
+      );
+      const actual: RuntimeActualState = await runtimeReader.read(desiredSpec, { containerNames });
       const containers = actual.containers;
       const networks = actual.networks;
       const volumes = actual.volumes;
@@ -77,7 +79,7 @@ export class StandardVerifierAgent implements VerifierAgent {
       evidence.push('Observed ' + String(containers.length) + ' container(s), ' + String(networks.length) + ' network(s), ' + String(volumes.length) + ' volume(s), ' + String(images.length) + ' image(s).');
 
       for (const service of desiredSpec.services) {
-        await runServiceChecks(desiredSpec, service, actual, dockerMcpClient, findings, evidence);
+        await runServiceChecks(desiredSpec, service, actual, runtimeReader, findings, evidence);
       }
 
       for (const network of desiredSpec.networks) {
@@ -206,13 +208,16 @@ async function runServiceChecks(
   desiredSpec: InfrastructureSpec,
   service: InfrastructureService,
   actual: RuntimeActualState,
-  dockerMcpClient: DockerMcpGateway,
+  runtimeReader: VerifierRuntimeReader,
   findings: VerificationFinding[],
   evidence: string[],
 ): Promise<void> {
-  const expectedName = toContainerName(desiredSpec.projectName, service.name);
-  const matchingContainers = actual.containers.filter(
-    (container) => container.name === expectedName || container.name.includes(service.name),
+  const expectedNames = toReplicaContainerNames(desiredSpec.projectName, service);
+  const matchingContainers = actual.containers.filter((container) =>
+    expectedNames.includes(container.name),
+  );
+  const missingNames = expectedNames.filter(
+    (expectedName) => !matchingContainers.some((container) => container.name === expectedName),
   );
 
   if (matchingContainers.length === 0) {
@@ -220,10 +225,10 @@ async function runServiceChecks(
       code: 'MISSING_CONTAINER',
       severity: 'error',
       resourceKind: 'container',
-      resourceName: expectedName,
+      resourceName: expectedNames[0]!,
       expected: 'container exists',
       actual: 'missing',
-      evidence: ['Service "' + service.name + '" has no matching container (expected: ' + expectedName + ').'],
+      evidence: ['Service "' + service.name + '" has no matching container (expected: ' + expectedNames.join(', ') + ').'],
       confidence: 0.9,
       suggestedAction: { action: 'repair-runtime', summary: 'Create and start the missing service container.' },
     }));
@@ -234,11 +239,14 @@ async function runServiceChecks(
     findings.push(createFinding({
       code: 'MISSING_CONTAINER',
       severity: 'error',
-      resourceKind: 'service',
-      resourceName: service.name,
+      resourceKind: missingNames.length === 1 ? 'container' : 'service',
+      resourceName: missingNames.length === 1 ? missingNames[0]! : service.name,
       expected: String(service.replicas) + ' replica(s)',
       actual: String(matchingContainers.length) + ' replica(s)',
-      evidence: ['Service "' + service.name + '" expected ' + String(service.replicas) + ' replica(s), found ' + String(matchingContainers.length) + '.'],
+      evidence: [
+        'Service "' + service.name + '" expected ' + String(service.replicas) + ' replica(s), found ' + String(matchingContainers.length) + '.',
+        ...(missingNames.length > 0 ? ['Missing container(s): ' + missingNames.join(', ') + '.'] : []),
+      ],
       confidence: 0.85,
       suggestedAction: { action: 'repair-runtime', summary: 'Recreate service replicas to match the spec.' },
     }));
@@ -278,8 +286,7 @@ async function runServiceChecks(
   addReadinessFindings(service, container, findings);
 
   if ((container.status ?? '').toLowerCase() !== 'running') {
-    const reader = new RuntimeEnvironmentReader(dockerMcpClient);
-    const logs = await reader.readLogs(container.name, 80);
+    const logs = await runtimeReader.readLogs(container.name, 80);
     const evidenceItems = ['Container "' + container.name + '" is not running (status: ' + String(container.status ?? 'unknown') + ').'];
     if (logs) evidenceItems.push('Log tail: ' + logs.replace(/\s+/g, ' ').slice(0, 500));
     findings.push(createFinding({
@@ -380,18 +387,33 @@ export function buildPreDeployVerificationReport(
   const actualContainersByName = new Map(actual.containers.map((container) => [container.name, container]));
 
   for (const service of desired.services) {
-    const containerName = toContainerName(desired.projectName, service.name);
-    if (actualContainersByName.has(containerName)) {
+    for (const containerName of toReplicaContainerNames(desired.projectName, service)) {
+      if (actualContainersByName.has(containerName)) {
+        findings.push(createFinding({
+          code: 'CONTAINER_NAME_CONFLICT',
+          severity: 'blocker',
+          resourceKind: 'container',
+          resourceName: containerName,
+          expected: 'container name available',
+          actual: 'already exists',
+          evidence: [`Container name conflict: "${containerName}" already exists in Docker runtime.`],
+          confidence: 0.98,
+          suggestedAction: { action: 'auto-revise', summary: 'Add a safe project suffix before deployment.' },
+        }));
+      }
+    }
+
+    if ((service.replicas ?? 1) > 1 && (service.ports?.length ?? 0) > 0) {
       findings.push(createFinding({
-        code: 'CONTAINER_NAME_CONFLICT',
+        code: 'HOST_PORT_CONFLICT',
         severity: 'blocker',
-        resourceKind: 'container',
-        resourceName: containerName,
-        expected: 'container name available',
-        actual: 'already exists',
-        evidence: [`Container name conflict: "${containerName}" already exists in Docker runtime.`],
-        confidence: 0.98,
-        suggestedAction: { action: 'auto-revise', summary: 'Add a safe project suffix before deployment.' },
+        resourceKind: 'port',
+        resourceName: service.name,
+        expected: 'replicated service without host port bindings',
+        actual: service.ports?.join(', ') ?? '',
+        evidence: [`Service "${service.name}" requests ${service.replicas ?? 1} replicas with host port binding(s): ${(service.ports ?? []).join(', ')}.`],
+        confidence: 0.95,
+        suggestedAction: { action: 'auto-revise', summary: 'Remove host port bindings from replicated internal services.' },
       }));
     }
   }
@@ -444,13 +466,29 @@ export function buildPreDeployVerificationReport(
 export function buildResourceRefs(
   projectName: string,
   actual: RuntimeActualState,
+  desired?: InfrastructureSpec,
 ): RuntimeResourceRefs {
+  const desiredContainers = new Set(
+    desired?.services.flatMap((service) => toReplicaContainerNames(projectName, service)) ?? [],
+  );
+  const desiredNetworks = new Set(desired?.networks ?? []);
+  const desiredVolumes = new Set(desired?.volumes ?? []);
+  const desiredImages = new Set(desired?.services.map((service) => service.image) ?? []);
+
   return {
     projectName,
-    containers: actual.containers.map((c) => c.name),
-    networks: actual.networks.map((n) => n.name),
-    volumes: actual.volumes.map((v) => v.name),
-    images: actual.images.map((i) => i.reference),
+    containers: actual.containers
+      .map((container) => container.name)
+      .filter((name) => name.startsWith(projectName + '-') || desiredContainers.has(name)),
+    networks: actual.networks
+      .map((network) => network.name)
+      .filter((name) => !isProtectedDockerNetwork(name) && (name.startsWith(projectName + '-') || desiredNetworks.has(name))),
+    volumes: actual.volumes
+      .map((volume) => volume.name)
+      .filter((name) => name.startsWith(projectName + '-') || desiredVolumes.has(name)),
+    images: actual.images
+      .map((image) => image.reference)
+      .filter((reference) => desiredImages.size === 0 || desiredImages.has(reference)),
   };
 }
 
@@ -547,7 +585,7 @@ function mapDriftCode(kind: DriftFindingKind): VerificationFinding['code'] {
 }
 
 function toContainerName(projectName: string, serviceName: string): string {
-  return projectName + '-' + serviceName.replace(/[_\s]+/g, '-');
+  return toServiceContainerName(projectName, serviceName);
 }
 
 function getErrorMessage(error: unknown): string {

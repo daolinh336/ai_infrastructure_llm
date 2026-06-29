@@ -9,34 +9,48 @@
  * The public API surface is identical to the original DockerMcpClient so all
  * consumers can migrate by changing only their import.
  */
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { McpConnectionPlug, type McpConnectionPlugOptions, type McpToolDefinition } from './mcp-connection-plug.js';
-import { McpRoutingTable, DOCKER_MCP_ROUTES, type McpRouteDefinition } from './mcp-routing-table.js';
+import {
+  McpConnectionPlug,
+  type McpConnectionPlugOptions,
+  type McpToolDefinition,
+} from './mcp-connection-plug.js';
+import {
+  McpRoutingTable,
+  DOCKER_MCP_ROUTES,
+  type McpRouteDefinition,
+} from './mcp-routing-table.js';
 import {
   parseContainerList,
   parseInspectResult,
-  hasInspectTool,
+  parseInspectSummaryResult,
   parseImageList,
   parseNamedResourceList,
   extractContainerIdFromRunResult,
 } from './docker-mcp-parsers.js';
+import {
+  buildCapabilityReport,
+  resolveDockerMcpRuntimeProfile,
+  resolveRoutesForServerTools,
+  type DockerMcpCapabilityReport,
+} from './docker-mcp-profile.js';
 import type {
   RuntimeContainerObservation,
+  RuntimeContainerSummary,
   RuntimeImageObservation,
   RuntimeNamedResourceObservation,
 } from '../domain/types.js';
-import { DockerMutationSafetyError, type ContainerCreateSpec } from '../domain/types.js';
+import {
+  DockerMutationSafetyError,
+  type ContainerCreateSpec,
+} from '../domain/types.js';
 import { evaluateToolPolicy } from './tool-policy.js';
-
-const execFileAsync = promisify(execFile);
 
 // --- Options ---
 
 export interface DockerMcpGatewayOptions {
-  /** Command to spawn the MCP server (default: 'npx') */
+  /** Command to spawn the MCP server (default: 'node') */
   command?: string;
-  /** Arguments for the command (default: ['mcp-server-docker']) */
+  /** Arguments for the command (default: ['packages/docker-mcp-server-supernova/dist/index.js']) */
   args?: string[];
   /** Timeout for individual MCP requests in milliseconds */
   requestTimeoutMs?: number;
@@ -46,8 +60,26 @@ export interface DockerMcpGatewayOptions {
   routes?: ReadonlyArray<McpRouteDefinition>;
 }
 
-const DEFAULT_COMMAND = 'uvx';
-const DEFAULT_ARGS = ['mcp-server-docker'];
+const READ_OPERATIONS = [
+  'listContainers',
+  'inspectContainer',
+  'listImages',
+  'listNetworks',
+  'listVolumes',
+] as const;
+const MUTATE_OPERATIONS = [
+  'pullImage',
+  'createContainer',
+  'startContainer',
+  'stopContainer',
+  'restartContainer',
+  'removeContainer',
+  'removeImage',
+  'createNetwork',
+  'removeNetwork',
+  'createVolume',
+  'removeVolume',
+] as const;
 
 // --- DockerMcpGateway ---
 
@@ -58,11 +90,18 @@ export class DockerMcpGateway {
   readonly routes: McpRoutingTable;
 
   private allowMutationsInternal = false;
+  private readonly baseRoutes: ReadonlyArray<McpRouteDefinition>;
+  private readonly runtimeProfile = resolveDockerMcpRuntimeProfile();
+  private readonly commandInternal: string;
+  private readonly argsInternal: string[];
+  private capabilityReportInternal: DockerMcpCapabilityReport | null = null;
 
   constructor(options: DockerMcpGatewayOptions = {}) {
+    this.commandInternal = options.command ?? this.runtimeProfile.command;
+    this.argsInternal = options.args ?? this.runtimeProfile.args;
     const plugOptions: McpConnectionPlugOptions = {
-      command: options.command ?? DEFAULT_COMMAND,
-      args: options.args ?? DEFAULT_ARGS,
+      command: this.commandInternal,
+      args: this.argsInternal,
     };
     if (options.requestTimeoutMs !== undefined) {
       plugOptions.requestTimeoutMs = options.requestTimeoutMs;
@@ -70,8 +109,9 @@ export class DockerMcpGateway {
     if (options.skipInitialize !== undefined) {
       plugOptions.skipHandshake = options.skipInitialize;
     }
+    this.baseRoutes = options.routes ?? DOCKER_MCP_ROUTES;
     this.plug = new McpConnectionPlug(plugOptions);
-    this.routes = new McpRoutingTable(options.routes ?? DOCKER_MCP_ROUTES);
+    this.routes = new McpRoutingTable(this.baseRoutes);
   }
 
   // --- Lifecycle ---
@@ -80,8 +120,28 @@ export class DockerMcpGateway {
     return this.plug.isConnected;
   }
 
+  get runtimeProfileName(): string {
+    return this.runtimeProfile.name;
+  }
+
+  get serverInfo(): { name: string; version: string } | null {
+    return this.plug.serverInfo;
+  }
+
+  get connectionCommand(): { command: string; args: string[] } {
+    return { command: this.commandInternal, args: [...this.argsInternal] };
+  }
+
   async initialize(): Promise<void> {
-    await this.plug.connect();
+    try {
+      await this.plug.connect();
+    } catch (error) {
+      throw new Error(
+        'Docker MCP gateway initialization failed. Build the Supernova MCP server with `npm run build:supernova-mcp` and ensure Docker Engine is reachable. Cause: ' +
+          inspectErrorMessage(error),
+      );
+    }
+    await this.preflightReadCapabilities();
   }
 
   async shutdown(): Promise<void> {
@@ -109,33 +169,90 @@ export class DockerMcpGateway {
     return this.plug.listTools();
   }
 
+  get capabilityReport(): DockerMcpCapabilityReport | null {
+    return this.capabilityReportInternal;
+  }
+
+  async preflightCapabilities(
+    operations: ReadonlyArray<string> = [
+      ...READ_OPERATIONS,
+      ...MUTATE_OPERATIONS,
+    ],
+  ): Promise<DockerMcpCapabilityReport> {
+    let tools: McpToolDefinition[];
+    try {
+      tools = await this.listServerTools();
+    } catch (error) {
+      throw new Error(
+        'Docker MCP capability preflight failed during tools/list. ' +
+          'Build the Supernova MCP server and ensure it exposes Docker runtime tools. Cause: ' +
+          inspectErrorMessage(error),
+      );
+    }
+    const resolvedRoutes = resolveRoutesForServerTools(tools, this.baseRoutes);
+    const report = buildCapabilityReport(tools, operations, resolvedRoutes);
+    this.replaceRoutes(resolvedRoutes);
+    this.capabilityReportInternal = report;
+    if (report.missingOperations.length > 0) {
+      throw new Error(
+        'Docker MCP capability preflight failed. Missing required operation(s): ' +
+          report.missingOperations.join(', ') +
+          '. Supernova Docker MCP server must expose these Docker runtime capabilities. Available tools: ' +
+          (report.toolNames.join(', ') || '(none)'),
+      );
+    }
+    return report;
+  }
+
+  async preflightReadCapabilities(): Promise<DockerMcpCapabilityReport> {
+    return this.preflightCapabilities(READ_OPERATIONS);
+  }
+
+  async preflightMutationCapabilities(
+    operations: ReadonlyArray<string>,
+  ): Promise<DockerMcpCapabilityReport> {
+    return this.preflightCapabilities([
+      ...new Set([...READ_OPERATIONS, ...operations]),
+    ]);
+  }
+
   // --- Read-only methods ---
 
   async listContainers(all?: boolean): Promise<RuntimeContainerObservation[]> {
-    const result = await this.executeRoute('listContainers', { all: all ?? false });
+    const result = await this.executeRoute('listContainers', {
+      all: all ?? false,
+    });
     return parseContainerList(result);
   }
 
-  async inspectContainer(containerName: string): Promise<RuntimeContainerObservation | null> {
-    if (!(await this.supportsInspect())) {
-      return inspectContainerWithDockerCli(containerName);
-    }
-    try {
-      const result = await this.executeRoute('inspectContainer', { container_id: containerName });
-      return parseInspectResult(result, containerName);
-    } catch (error) {
-      console.warn(
-        'MCP inspect_container failed for "' + containerName + '": ' + inspectErrorMessage(error) + '. Falling back to Docker CLI inspect.',
-      );
-      return inspectContainerWithDockerCli(containerName);
-    }
+  async inspectContainer(
+    containerName: string,
+  ): Promise<RuntimeContainerObservation | null> {
+    const result = await this.executeRoute('inspectContainer', {
+      container_id: containerName,
+    });
+    return parseInspectResult(result, containerName);
   }
 
-  async readContainerLogs(containerName: string, tailLines = 80): Promise<string | null> {
-    return readContainerLogsWithDockerCli(containerName, tailLines);
+  async inspectContainerSummary(
+    containerName: string,
+  ): Promise<RuntimeContainerSummary | null> {
+    const result = await this.executeRoute('inspectContainer', {
+      container_id: containerName,
+    });
+    return parseInspectSummaryResult(result, containerName);
   }
 
-  async listUsedHostPorts(): Promise<Array<{ hostPort: string; containerName: string }>> {
+  async readContainerLogs(
+    _containerName: string,
+    _tailLines = 80,
+  ): Promise<string | null> {
+    return null;
+  }
+
+  async listUsedHostPorts(): Promise<
+    Array<{ hostPort: string; containerName: string }>
+  > {
     const containers = await this.listContainers(true);
     return containers.flatMap((container) =>
       (container.ports ?? [])
@@ -150,12 +267,13 @@ export class DockerMcpGateway {
    * Returns false until the server has been queried via listServerTools().
    */
   async supportsInspect(): Promise<boolean> {
-    try {
-      const tools = await this.listServerTools();
-      return hasInspectTool(tools);
-    } catch {
-      return false;
-    }
+    const tools = await this.listServerTools();
+    const report = buildCapabilityReport(
+      tools,
+      ['inspectContainer'],
+      this.baseRoutes,
+    );
+    return report.missingOperations.length === 0;
   }
 
   async listImages(): Promise<RuntimeImageObservation[]> {
@@ -184,12 +302,16 @@ export class DockerMcpGateway {
       image: spec.image,
       name: spec.name,
     };
-    if (spec.command && spec.command.length > 0) args.command = spec.command.join(' ');
-    if (spec.ports && spec.ports.length > 0) args.ports = mapPortBindings(spec.ports);
-    if (spec.environment) args.environment = spec.environment;
+    if (spec.command && spec.command.length > 0) args.command = spec.command;
+    if (spec.ports && spec.ports.length > 0)
+      args.ports = mapPortBindings(spec.ports);
+    if (spec.environment) args.env = spec.environment;
     if (spec.volumes && spec.volumes.length > 0) args.volumes = spec.volumes;
-    if (spec.networks && spec.networks.length > 0) args.network = spec.networks[0];
-    if (spec.labels && Object.keys(spec.labels).length > 0) args.labels = spec.labels;
+    if (spec.networks && spec.networks.length > 0)
+      args.network = spec.networks[0];
+    if (spec.labels && Object.keys(spec.labels).length > 0)
+      args.labels = spec.labels;
+    args.detach = true;
     const result = await this.executeRoute('createContainer', args);
     return extractContainerIdFromRunResult(result, spec.name);
   }
@@ -203,18 +325,27 @@ export class DockerMcpGateway {
   }
 
   async restartContainer(containerName: string): Promise<void> {
-    await this.executeRoute('restartContainer', { container_id: containerName, image: '' });
+    await this.executeRoute('restartContainer', {
+      container_id: containerName,
+      image: '',
+    });
   }
 
   async removeContainer(containerName: string): Promise<void> {
-    await this.executeRoute('removeContainer', { container_id: containerName, force: true });
+    await this.executeRoute('removeContainer', {
+      container_id: containerName,
+      force: true,
+    });
   }
 
   async removeImage(ref: string): Promise<void> {
     await this.executeRoute('removeImage', { image: ref });
   }
 
-  async createNetwork(name: string, labels?: Record<string, string>): Promise<void> {
+  async createNetwork(
+    name: string,
+    labels?: Record<string, string>,
+  ): Promise<void> {
     const args: Record<string, unknown> = { name };
     if (labels && Object.keys(labels).length > 0) args.labels = labels;
     await this.executeRoute('createNetwork', args);
@@ -224,13 +355,18 @@ export class DockerMcpGateway {
     await this.executeRoute('removeNetwork', { network_id: name });
   }
 
-  async createVolume(name: string, labels?: Record<string, string>): Promise<void> {
+  async createVolume(
+    name: string,
+    labels?: Record<string, string>,
+  ): Promise<void> {
     const args: Record<string, unknown> = { name };
     if (labels && Object.keys(labels).length > 0) args.labels = labels;
     await this.executeRoute('createVolume', args);
   }
 
-  async observeActualState(): Promise<import('../domain/types.js').RuntimeActualState> {
+  async observeActualState(): Promise<
+    import('../domain/types.js').RuntimeActualState
+  > {
     const [containers, networks, volumes, images] = await Promise.all([
       this.listContainers(true),
       this.listNetworks(),
@@ -266,23 +402,18 @@ export class DockerMcpGateway {
       this.listImages(),
     ]);
 
-    let enrichedContainers = containers;
-
-    const candidateNames = (options.containerNames?.length ? options.containerNames : containers.map((c) => c.name));
+    const candidateNames = options.containerNames?.length
+      ? options.containerNames
+      : containers.map((c) => c.name);
     const inspected = await Promise.all(
-      candidateNames.map(async (name) => {
-        try {
-          return await this.inspectContainer(name);
-        } catch (error) {
-          console.warn(
-            'Container inspect failed for "' + name + '": ' + inspectErrorMessage(error) + '. Keeping list-only observation.',
-          );
-          return null;
-        }
-      }),
+      candidateNames.map((name) => this.inspectContainer(name)),
     );
-    const inspectedMap = new Map(inspected.filter((c): c is RuntimeContainerObservation => c !== null).map((c) => [c.name, c]));
-    enrichedContainers = containers.map((container) => {
+    const inspectedMap = new Map(
+      inspected
+        .filter((c): c is RuntimeContainerObservation => c !== null)
+        .map((c) => [c.name, c]),
+    );
+    const enrichedContainers = containers.map((container) => {
       const inspectedContainer = inspectedMap.get(container.name);
       return inspectedContainer ?? container;
     });
@@ -298,26 +429,38 @@ export class DockerMcpGateway {
   }
 
   async removeVolume(name: string): Promise<void> {
-    await this.executeRoute('removeVolume', { volume_name: name, force: true });
+    await this.executeRoute('removeVolume', { name, force: true });
   }
 
   // --- Internal: route resolution + approval guard + tool call ---
 
-  private async executeRoute(operation: string, args: Record<string, unknown>): Promise<string> {
+  private async executeRoute(
+    operation: string,
+    args: Record<string, unknown>,
+  ): Promise<string> {
     if (!this.plug.isConnected) {
-      throw new Error('DockerMcpGateway is not initialized. Call initialize() before invoking tools.');
+      throw new Error(
+        'DockerMcpGateway is not initialized. Call initialize() before invoking tools.',
+      );
     }
     const route = this.routes.resolve(operation);
 
-    const policy = evaluateToolPolicy(route.destructive ? 'destructive' : route.category, {
-      dryRun: !this.allowMutationsInternal,
-      approved: this.allowMutationsInternal,
-    });
+    const policy = evaluateToolPolicy(
+      route.destructive ? 'destructive' : route.category,
+      {
+        dryRun: !this.allowMutationsInternal,
+        approved: this.allowMutationsInternal,
+      },
+    );
     if (!policy.allowed) {
       throw new DockerMutationSafetyError(route.mcpToolName);
     }
 
     return this.plug.callTool(route.mcpToolName, args);
+  }
+
+  private replaceRoutes(routes: ReadonlyArray<McpRouteDefinition>): void {
+    (this as { routes: McpRoutingTable }).routes = new McpRoutingTable(routes);
   }
 }
 
@@ -325,53 +468,20 @@ function inspectErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-
 function mapImageReference(ref: string): Record<string, unknown> {
   const colonIndex = ref.lastIndexOf(':');
   if (colonIndex > -1 && !ref.slice(colonIndex + 1).includes('/')) {
-    return { repository: ref.slice(0, colonIndex), tag: ref.slice(colonIndex + 1) };
+    return { image: ref.slice(0, colonIndex), tag: ref.slice(colonIndex + 1) };
   }
-  return { repository: ref };
+  return { image: ref };
 }
 
-function mapPortBindings(ports: string[]): Record<string, number> {
-  const bindings: Record<string, number> = {};
+function mapPortBindings(ports: string[]): Record<string, string> {
+  const bindings: Record<string, string> = {};
   for (const port of ports) {
     const [host, container] = port.split(':');
     if (!host || !container) continue;
-    bindings[container + '/tcp'] = Number(host);
+    bindings[container + '/tcp'] = host;
   }
   return bindings;
-}
-
-async function inspectContainerWithDockerCli(
-  containerName: string,
-): Promise<RuntimeContainerObservation | null> {
-  try {
-    const { stdout } = await execFileAsync('docker', ['inspect', containerName], {
-      windowsHide: true,
-      timeout: 15_000,
-    });
-    return parseInspectResult(stdout, containerName);
-  } catch {
-    return null;
-  }
-}
-
-async function readContainerLogsWithDockerCli(
-  containerName: string,
-  tailLines: number,
-): Promise<string | null> {
-  try {
-    const safeTail = String(Math.max(1, Math.min(500, Math.trunc(tailLines))));
-    const { stdout, stderr } = await execFileAsync('docker', ['logs', '--tail', safeTail, containerName], {
-      windowsHide: true,
-      timeout: 15_000,
-      maxBuffer: 128 * 1024,
-    });
-    const combined = [stdout, stderr].filter((part) => part.trim().length > 0).join('\n');
-    return combined.length > 4_000 ? combined.slice(-4_000) : combined;
-  } catch {
-    return null;
-  }
 }

@@ -3,6 +3,9 @@ import { createInterface } from 'node:readline/promises';
 import chalk from 'chalk';
 import type { ReActAgent } from '../agent/react-agent.js';
 import { isSecretLikeKey, type SecretResolutionResult, type ResolvedSecret } from '../compose/secret-resolver.js';
+import { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
+import { toReplicaContainerNames } from '../execution/container-names.js';
+import type { DockerPullRetryPolicy } from '../execution/execution-engine.js';
 import { createApprovalResult } from '../execution/phase8-approval.js';
 import type { DockerDoctorReport } from '../doctor/docker-doctor.js';
 import type {
@@ -24,6 +27,45 @@ import type {
   InfrastructureStateSnapshot,
   VerifiedRuntimeSnapshot,
 } from '../domain/types.js';
+import { isProtectedDockerNetwork } from '../execution/protected-docker-resources.js';
+
+const DEFAULT_DOCKER_MCP_REQUEST_TIMEOUT_MS = 120_000;
+
+export function createDockerMcpGatewayFromEnv(): DockerMcpGateway {
+  return new DockerMcpGateway({
+    requestTimeoutMs: readPositiveIntegerEnv(
+      'INFRA_DOCKER_MCP_REQUEST_TIMEOUT_MS',
+      DEFAULT_DOCKER_MCP_REQUEST_TIMEOUT_MS,
+    ),
+  });
+}
+
+export function loadDockerPullRetryPolicyFromEnv(): Partial<DockerPullRetryPolicy> {
+  return {
+    maxAttempts: readPositiveIntegerEnv('INFRA_DOCKER_PULL_MAX_ATTEMPTS', 3),
+    initialDelayMs: readNonNegativeIntegerEnv('INFRA_DOCKER_PULL_RETRY_INITIAL_DELAY_MS', 1_000),
+    maxDelayMs: readNonNegativeIntegerEnv('INFRA_DOCKER_PULL_RETRY_MAX_DELAY_MS', 5_000),
+    backoffFactor: readPositiveNumberEnv('INFRA_DOCKER_PULL_RETRY_BACKOFF_FACTOR', 2),
+  };
+}
+
+function readPositiveIntegerEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.floor(value);
+}
+
+function readNonNegativeIntegerEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value) || value < 0) return fallback;
+  return Math.floor(value);
+}
+
+function readPositiveNumberEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value) || value < 1) return fallback;
+  return value;
+}
 
 export function printStaticGatewayMetrics(metrics: StaticGatewayMetrics): void {
   console.log(chalk.cyan('Static validation metrics:'));
@@ -48,6 +90,27 @@ export function printObservations(observations: Array<{ source: string; message:
   console.log(chalk.cyan('Observations:'));
   for (const observation of observations) {
     console.log(`- [${observation.source}] ${observation.message}`);
+  }
+  console.log();
+}
+
+export function printRevisionPatchResults(result: PlannerRevisionResult): void {
+  if (!result.patchPlan && !result.patchResults?.length) return;
+
+  console.log(chalk.cyan('Revision patches:'));
+  if (result.patchPlan) {
+    console.log(`- explanation: ${result.patchPlan.explanation}`);
+    if (result.patchPlan.ambiguities.length > 0) {
+      console.log(`- ambiguities: ${result.patchPlan.ambiguities.join('; ')}`);
+    }
+  }
+  for (const patchResult of result.patchResults ?? []) {
+    const target = patchResult.matchedServiceNames.join(', ') || 'n/a';
+    const status = patchResult.applied ? 'applied' : patchResult.blockedReason ? 'blocked' : 'skipped';
+    console.log(`- ${patchResult.patch.op}: ${status}; target=${target}; reason=${patchResult.patch.reason}`);
+    if (patchResult.blockedReason) {
+      console.log(chalk.yellow(`  blocked: ${patchResult.blockedReason}`));
+    }
   }
   console.log();
 }
@@ -404,7 +467,7 @@ export function printDockerDoctorReport(report: DockerDoctorReport): void {
   console.log(chalk.cyan('Docker doctor:'));
   console.log(`Status: ${statusColor(report.status)}`);
   console.log(`Checked at: ${report.checkedAt}`);
-  console.log(`Docker CLI found: ${report.dockerCliFound}`);
+  console.log('Docker CLI checked: false (bypassed; Engine API is checked directly)');
   console.log(`Docker engine reachable: ${report.engineReachable}`);
   console.log();
 
@@ -501,8 +564,8 @@ export function detectPreDeployConflicts(
   actual: RuntimeActualState,
 ): string[] {
   const issues: string[] = [];
-  const desiredContainerNames = desired.services.map(
-    (service) => desired.projectName + '-' + service.name.replace(/[_\s]+/g, '-'),
+  const desiredContainerNames = desired.services.flatMap((service) =>
+    toReplicaContainerNames(desired.projectName, service),
   );
   const actualContainersByName = new Map(actual.containers.map((container) => [container.name, container]));
 
@@ -609,23 +672,42 @@ export function collectDestroyAllTargets(
   const containers = new Set<string>();
   const networks = new Set<string>();
   const volumes = new Set<string>();
-  const protectedNetworks = new Set(['bridge', 'host', 'none']);
-
   const addSnapshotTargets = (snapshot: VerifiedRuntimeSnapshot | null | undefined): void => {
     if (!snapshot) {
       return;
     }
     projects.add(snapshot.desired.projectName);
-    for (const name of snapshot.resourceRefs?.containers ?? snapshot.desired.services.map((service) => snapshot.desired.projectName + '-' + service.name)) {
+    const expectedContainers = new Set(
+      snapshot.desired.services.flatMap((service) => toReplicaContainerNames(snapshot.desired.projectName, service)),
+    );
+    const expectedNetworks = new Set(snapshot.desired.networks);
+    const expectedVolumes = new Set(snapshot.desired.volumes);
+
+    for (const name of snapshot.resourceRefs?.containers ?? [...expectedContainers]) {
+      if (name.startsWith(snapshot.desired.projectName + '-') || expectedContainers.has(name)) {
+        containers.add(name);
+      }
+    }
+    for (const name of expectedContainers) {
       containers.add(name);
     }
     for (const name of snapshot.resourceRefs?.networks ?? snapshot.desired.networks) {
-      if (!protectedNetworks.has(name)) {
+      if (!isProtectedDockerNetwork(name) && (name.startsWith(snapshot.desired.projectName + '-') || expectedNetworks.has(name))) {
+        networks.add(name);
+      }
+    }
+    for (const name of expectedNetworks) {
+      if (!isProtectedDockerNetwork(name)) {
         networks.add(name);
       }
     }
     if (removeVolumes) {
       for (const name of snapshot.resourceRefs?.volumes ?? snapshot.desired.volumes) {
+        if (name.startsWith(snapshot.desired.projectName + '-') || expectedVolumes.has(name)) {
+          volumes.add(name);
+        }
+      }
+      for (const name of expectedVolumes) {
         volumes.add(name);
       }
     }
@@ -643,7 +725,7 @@ export function collectDestroyAllTargets(
       }
     }
     for (const network of actual.networks) {
-      if (!protectedNetworks.has(network.name) && network.name.startsWith(project + '-')) {
+      if (!isProtectedDockerNetwork(network.name) && network.name.startsWith(project + '-')) {
         networks.add(network.name);
       }
     }
@@ -679,6 +761,11 @@ export function loadLocalEnvFile(): void {
 export function getErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
+}
+
+export function isMissingDockerResourceError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes('http code 404') || message.includes('no such container') || message.includes('no such network') || message.includes('no such volume');
 }
 
 export function isNodeError(error: unknown): error is NodeJS.ErrnoException {

@@ -1,0 +1,101 @@
+{
+  "name": "@supernova123/docker-mcp-server",
+  "version": "0.4.3",
+  "mcpName": "io.github.friendlygeorge/docker-mcp-server",
+  "description": "MCP server for Docker — container management, health checks, auto-restart, Compose lifecycle, and log streaming for Claude, Cursor, and AI agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "docker-mcp-server": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build",
+    "cf:dev": "wrangler dev src/cf-worker/index.ts",
+    "cf:deploy": "wrangler deploy src/cf-worker/index.ts",
+    "cf:typecheck": "tsc --noEmit src/cf-worker/*.ts"
+  },
+  "keywords": [
+    "agent",
+    "ai-agent",
+    "ai-agents",
+    "ai-tools",
+    "automation",
+    "chatgpt",
+    "ci-cd",
+    "claude",
+    "claude-desktop",
+    "compose",
+    "container",
+    "container-health",
+    "container-logs",
+    "container-orchestration",
+    "container-security",
+    "containerization",
+    "containers",
+    "continuous-integration",
+    "cursor",
+    "deployment",
+    "devops",
+    "devops-tools",
+    "docker",
+    "docker-compose",
+    "docker-events",
+    "docker-mcp",
+    "docker-network",
+    "docker-swarm",
+    "docker-volume",
+    "fleet-management",
+    "health-check",
+    "health-monitoring",
+    "infrastructure",
+    "infrastructure-as-code",
+    "k8s",
+    "kubernetes",
+    "llm-tools",
+    "load-balancing",
+    "log-search",
+    "logging",
+    "mcp",
+    "mcp-server",
+    "microservices",
+    "model-context-protocol",
+    "monitoring",
+    "observability",
+    "orchestration",
+    "resource-monitoring",
+    "rollback",
+    "scaling",
+    "tracing"
+  ],
+  "author": "Nova",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/friendlygeorge/docker-mcp-server"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "postInstallInstructions": "Run with: npx @supernova123/docker-mcp-server",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "dockerode": "^4.0.4",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260613.1",
+    "@types/dockerode": "^3.3.31",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.1.0",
+    "wrangler": "^4.100.0"
+  },
+  "homepage": "https://github.com/friendlygeorge/docker-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/friendlygeorge/docker-mcp-server/issues"
+  }
+}

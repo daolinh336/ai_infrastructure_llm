@@ -128,6 +128,7 @@ function formatCurrentState(snapshot: InfrastructureStateSnapshot): string {
     `Observed volumes: ${current.actual.volumes.map((v) => v.name).join(', ') || 'none'}`,
     `Observed images: ${current.actual.images.map((i) => i.reference).join(', ') || 'none'}`,
     `Drift status: ${current.driftReport?.status ?? 'not checked'}`,
+    `Revision history: ${formatRevisionHistory(current)}`,
     `Operation: ${current.operation ?? 'deploy'}`,
     '',
     'Desired vs actual comparison:',

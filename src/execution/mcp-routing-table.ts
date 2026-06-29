@@ -24,32 +24,161 @@ export interface McpRouteDefinition {
 // --- Docker MCP Routes (Static Registry) ---
 
 /**
- * Canonical routing table for the Docker MCP server.
+ * Canonical routing table for the Supernova Docker MCP server.
  *
  * Each entry maps a typed operation name (used in agent/execution code)
- * to the MCP tool name exposed by `mcp-server-docker`.
+ * to the Supernova MCP tool name. DockerMcpGateway resolves these canonical names
+ * against the connected Docker MCP server capability list before executing.
  *
  * Security note: grep `category: 'mutate'` to audit all mutation routes.
  */
 export const DOCKER_MCP_ROUTES: ReadonlyArray<McpRouteDefinition> = [
   // --- Read-only ---
-  { operation: 'listContainers',    mcpToolName: 'list_containers',             category: 'read',   description: 'List Docker containers', destructive: false, approvalRequired: false, riskLevel: 'low' },
-  { operation: 'inspectContainer',  mcpToolName: 'inspect_container',        category: 'read',   description: 'Inspect a container and return detailed config/state', destructive: false, approvalRequired: false, riskLevel: 'low' },
-  { operation: 'listImages',        mcpToolName: 'list_images',         category: 'read',   description: 'List Docker images', destructive: false, approvalRequired: false, riskLevel: 'low' },
-  { operation: 'listNetworks',      mcpToolName: 'list_networks',     category: 'read',   description: 'List Docker networks', destructive: false, approvalRequired: false, riskLevel: 'low' },
-  { operation: 'listVolumes',       mcpToolName: 'list_volumes',      category: 'read',   description: 'List Docker volumes', destructive: false, approvalRequired: false, riskLevel: 'low' },
+  {
+    operation: 'listContainers',
+    mcpToolName: 'list_containers',
+    category: 'read',
+    description: 'List Docker containers',
+    destructive: false,
+    approvalRequired: false,
+    riskLevel: 'low',
+  },
+  {
+    operation: 'inspectContainer',
+    mcpToolName: 'inspect_container',
+    category: 'read',
+    description: 'Inspect a container and return detailed config/state',
+    destructive: false,
+    approvalRequired: false,
+    riskLevel: 'low',
+  },
+  {
+    operation: 'listImages',
+    mcpToolName: 'list_images',
+    category: 'read',
+    description: 'List Docker images',
+    destructive: false,
+    approvalRequired: false,
+    riskLevel: 'low',
+  },
+  {
+    operation: 'listNetworks',
+    mcpToolName: 'list_networks',
+    category: 'read',
+    description: 'List Docker networks',
+    destructive: false,
+    approvalRequired: false,
+    riskLevel: 'low',
+  },
+  {
+    operation: 'listVolumes',
+    mcpToolName: 'list_volumes',
+    category: 'read',
+    description: 'List Docker volumes',
+    destructive: false,
+    approvalRequired: false,
+    riskLevel: 'low',
+  },
   // --- Mutate ---
-  { operation: 'pullImage',         mcpToolName: 'pull_image',           category: 'mutate', description: 'Pull a Docker image', destructive: false, approvalRequired: true, riskLevel: 'medium' },
-  { operation: 'createContainer',   mcpToolName: 'create_container',            category: 'mutate', description: 'Create and run a container', destructive: false, approvalRequired: true, riskLevel: 'medium' },
-  { operation: 'startContainer',    mcpToolName: 'start_container',          category: 'mutate', description: 'Start a stopped container', destructive: false, approvalRequired: true, riskLevel: 'medium' },
-  { operation: 'stopContainer',     mcpToolName: 'stop_container',           category: 'mutate', description: 'Stop a running container', destructive: true, approvalRequired: true, riskLevel: 'high' },
-  { operation: 'restartContainer',  mcpToolName: 'recreate_container',        category: 'mutate', description: 'Restart a container', destructive: true, approvalRequired: true, riskLevel: 'high' },
-  { operation: 'removeContainer',   mcpToolName: 'remove_container',             category: 'mutate', description: 'Remove a container', destructive: true, approvalRequired: true, riskLevel: 'high' },
-  { operation: 'removeImage',       mcpToolName: 'remove_image',            category: 'mutate', description: 'Remove an image', destructive: true, approvalRequired: true, riskLevel: 'high' },
-  { operation: 'createNetwork',     mcpToolName: 'create_network', category: 'mutate', description: 'Create a Docker network', destructive: false, approvalRequired: true, riskLevel: 'medium' },
-  { operation: 'removeNetwork',     mcpToolName: 'remove_network',     category: 'mutate', description: 'Remove a Docker network', destructive: true, approvalRequired: true, riskLevel: 'high' },
-  { operation: 'createVolume',      mcpToolName: 'create_volume',  category: 'mutate', description: 'Create a Docker volume', destructive: false, approvalRequired: true, riskLevel: 'medium' },
-  { operation: 'removeVolume',      mcpToolName: 'remove_volume',      category: 'mutate', description: 'Remove a Docker volume', destructive: true, approvalRequired: true, riskLevel: 'high' },
+  {
+    operation: 'pullImage',
+    mcpToolName: 'pull_image',
+    category: 'mutate',
+    description: 'Pull a Docker image',
+    destructive: false,
+    approvalRequired: true,
+    riskLevel: 'medium',
+  },
+  {
+    operation: 'createContainer',
+    mcpToolName: 'run_container',
+    category: 'mutate',
+    description: 'Create and run a container',
+    destructive: false,
+    approvalRequired: true,
+    riskLevel: 'medium',
+  },
+  {
+    operation: 'startContainer',
+    mcpToolName: 'start_container',
+    category: 'mutate',
+    description: 'Start a stopped container',
+    destructive: false,
+    approvalRequired: true,
+    riskLevel: 'medium',
+  },
+  {
+    operation: 'stopContainer',
+    mcpToolName: 'stop_container',
+    category: 'mutate',
+    description: 'Stop a running container',
+    destructive: true,
+    approvalRequired: true,
+    riskLevel: 'high',
+  },
+  {
+    operation: 'restartContainer',
+    mcpToolName: 'recreate_container',
+    category: 'mutate',
+    description: 'Restart a container',
+    destructive: true,
+    approvalRequired: true,
+    riskLevel: 'high',
+  },
+  {
+    operation: 'removeContainer',
+    mcpToolName: 'remove_container',
+    category: 'mutate',
+    description: 'Remove a container',
+    destructive: true,
+    approvalRequired: true,
+    riskLevel: 'high',
+  },
+  {
+    operation: 'removeImage',
+    mcpToolName: 'remove_image',
+    category: 'mutate',
+    description: 'Remove an image',
+    destructive: true,
+    approvalRequired: true,
+    riskLevel: 'high',
+  },
+  {
+    operation: 'createNetwork',
+    mcpToolName: 'create_network',
+    category: 'mutate',
+    description: 'Create a Docker network',
+    destructive: false,
+    approvalRequired: true,
+    riskLevel: 'medium',
+  },
+  {
+    operation: 'removeNetwork',
+    mcpToolName: 'remove_network',
+    category: 'mutate',
+    description: 'Remove a Docker network',
+    destructive: true,
+    approvalRequired: true,
+    riskLevel: 'high',
+  },
+  {
+    operation: 'createVolume',
+    mcpToolName: 'create_volume',
+    category: 'mutate',
+    description: 'Create a Docker volume',
+    destructive: false,
+    approvalRequired: true,
+    riskLevel: 'medium',
+  },
+  {
+    operation: 'removeVolume',
+    mcpToolName: 'remove_volume',
+    category: 'mutate',
+    description: 'Remove a Docker volume',
+    destructive: true,
+    approvalRequired: true,
+    riskLevel: 'high',
+  },
 ];
 
 // --- McpRoutingTable ---
@@ -82,8 +211,11 @@ export class McpRoutingTable {
     const route = this.routeMap.get(operation);
     if (!route) {
       throw new Error(
-        'Unknown MCP route operation: "' + operation + '". ' +
-        'Registered operations: ' + [...this.routeMap.keys()].join(', '),
+        'Unknown MCP route operation: "' +
+          operation +
+          '". ' +
+          'Registered operations: ' +
+          [...this.routeMap.keys()].join(', '),
       );
     }
     return route;

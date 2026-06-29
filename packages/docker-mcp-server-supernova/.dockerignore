@@ -1,0 +1,9 @@
+node_modules
+dist
+.git
+*.md
+!README.md
+tests
+tsconfig.json
+vitest.config.ts
+.DS_Store
