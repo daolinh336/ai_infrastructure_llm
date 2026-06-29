@@ -37,13 +37,17 @@ export function normalizeStatefulDatabaseReplicaVolumes(
   spec: InfrastructureSpec,
 ): InfrastructureSpec {
   const explicitSpec = expandStatefulDatabaseReplicas(spec);
-  const generatedVolumes = new Set(explicitSpec.volumes);
-
-  for (const service of explicitSpec.services) {
-    for (const volume of getGeneratedDatabaseReplicaVolumeNames(service)) {
-      generatedVolumes.add(volume);
-    }
-  }
+  const generatedReplicaVolumeNames = new Set(
+    explicitSpec.services.flatMap(getMountedDatabaseDataVolumeNames),
+  );
+  const staleGeneratedReplicaVolumeNames = getStaleGeneratedReplicaVolumeNames(
+    explicitSpec,
+    generatedReplicaVolumeNames,
+  );
+  const finalVolumes = unique([
+    ...explicitSpec.volumes.filter((volume) => !staleGeneratedReplicaVolumeNames.has(volume)),
+    ...explicitSpec.services.flatMap((service) => declaredNamedVolumes(service.volumes ?? [])),
+  ]);
 
   return {
     ...explicitSpec,
@@ -55,7 +59,7 @@ export function normalizeStatefulDatabaseReplicaVolumes(
       ...(service.environment ? { environment: { ...service.environment } } : {}),
     })),
     networks: [...explicitSpec.networks],
-    volumes: [...generatedVolumes],
+    volumes: finalVolumes,
   };
 }
 
@@ -140,6 +144,58 @@ export function getGeneratedDatabaseReplicaVolumeNames(
   );
 }
 
+function getMountedDatabaseDataVolumeNames(service: DatabaseVolumeService): string[] {
+  const target = getDatabaseDataVolumeTarget(service);
+  if (!target) return [];
+  return (service.volumes ?? [])
+    .filter((mount) => mountTarget(mount) === target)
+    .map(mountSource)
+    .filter(isNamedVolumeSource);
+}
+
+function getStaleGeneratedReplicaVolumeNames(
+  spec: InfrastructureSpec,
+  mountedDataVolumeNames: Set<string>,
+): Set<string> {
+  const databaseGroups = groupExpandedDatabaseServices(spec.services);
+  const stale = new Set<string>();
+
+  for (const [baseName, services] of databaseGroups) {
+    const sortedServices = [...services].sort((left, right) => left.ordinal - right.ordinal);
+    const firstSource = getMountedDatabaseDataVolumeNames(sortedServices[0]!.service)[0];
+    const baseVolumeName = firstSource ? firstSource.replace(/-1$/, '') : `${baseName}-data`;
+
+    for (const volume of spec.volumes) {
+      if (!volume.startsWith(`${baseVolumeName}-`)) continue;
+      if (!mountedDataVolumeNames.has(volume)) stale.add(volume);
+    }
+  }
+
+  return stale;
+}
+
+function groupExpandedDatabaseServices(
+  services: InfrastructureSpec['services'],
+): Map<string, Array<{ ordinal: number; service: InfrastructureService }>> {
+  const groups = new Map<string, Array<{ ordinal: number; service: InfrastructureService }>>();
+
+  for (const service of services) {
+    if (service.kind !== 'database') continue;
+    const match = /^(.+)-(\d+)$/.exec(service.name);
+    if (!match) continue;
+
+    const baseName = match[1]!;
+    const ordinal = Number(match[2]);
+    if (!Number.isInteger(ordinal) || ordinal < 1) continue;
+
+    const entries = groups.get(baseName) ?? [];
+    entries.push({ ordinal, service });
+    groups.set(baseName, entries);
+  }
+
+  return groups;
+}
+
 function getDatabaseReplicaVolumeName(
   service: DatabaseVolumeService,
   replicaIndex: number,
@@ -163,6 +219,14 @@ function cloneService(service: InfrastructureService): InfrastructureService {
     ...(service.environment ? { environment: { ...service.environment } } : {}),
     ...(service.volumes ? { volumes: [...service.volumes] } : {}),
   };
+}
+
+function declaredNamedVolumes(volumeMounts: string[]): string[] {
+  return volumeMounts.map(mountSource).filter(isNamedVolumeSource);
+}
+
+function isNamedVolumeSource(source: string): boolean {
+  return source.length > 0 && !source.startsWith('.') && !source.startsWith('/') && !source.includes('\\');
 }
 
 function mountSource(mount: string): string {

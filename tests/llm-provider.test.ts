@@ -4,6 +4,7 @@ import {
   getDefaultProviderName,
   getFallbackProviderName,
   OpenAiLlmProvider,
+  type OpenAiResponseCreateInput,
   type OpenAiResponsesClient,
 } from '../src/llm/provider.js';
 
@@ -53,6 +54,7 @@ describe('OpenAI provider responses', () => {
   });
 
   it('falls back to output message content when output_text is missing', async () => {
+    const capturedInputs: OpenAiResponseCreateInput[] = [];
     const provider = new OpenAiLlmProvider(
       {
         apiKey: 'test-key',
@@ -71,6 +73,8 @@ describe('OpenAI provider responses', () => {
             ],
           },
         ],
+      }, (input) => {
+        capturedInputs.push(input);
       }),
     );
 
@@ -88,6 +92,67 @@ describe('OpenAI provider responses', () => {
         },
       }),
     ).resolves.toEqual({ text: '{"accepted":true}' });
+
+    expect(capturedInputs[0]?.text?.format.schema).toMatchObject({
+      type: 'object',
+      additionalProperties: false,
+    });
+  });
+
+  it('adds additionalProperties false to nested OpenAI structured output objects', async () => {
+    const capturedInputs: OpenAiResponseCreateInput[] = [];
+    const provider = new OpenAiLlmProvider(
+      {
+        apiKey: 'test-key',
+        auxiliaryModel: 'test-aux-model',
+        reactModel: 'test-react-model',
+      },
+      createOpenAiClient({ output_text: '{"items":[]}' }, (input) => {
+        capturedInputs.push(input);
+      }),
+    );
+
+    await provider.completeStructured({
+      system: 'system',
+      user: 'user',
+      purpose: 'auxiliary',
+      schemaName: 'nested_schema',
+      schema: {
+        type: 'object',
+        properties: {
+          items: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string' },
+              },
+              required: ['name'],
+            },
+          },
+        },
+        required: ['items'],
+      },
+    });
+
+    expect(capturedInputs[0]?.text?.format.schema).toEqual({
+      type: 'object',
+      properties: {
+        items: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string' },
+            },
+            required: ['name'],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ['items'],
+      additionalProperties: false,
+    });
   });
 
   it('falls back to chat completion message content when using a compatible endpoint', async () => {
@@ -119,10 +184,12 @@ describe('OpenAI provider responses', () => {
 
 function createOpenAiClient(
   response: Awaited<ReturnType<OpenAiResponsesClient['responses']['create']>>,
+  onCreate?: (input: OpenAiResponseCreateInput) => void,
 ): OpenAiResponsesClient {
   return {
     responses: {
-      async create() {
+      async create(input) {
+        onCreate?.(input);
         return response;
       },
     },

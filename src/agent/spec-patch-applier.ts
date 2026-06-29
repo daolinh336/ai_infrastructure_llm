@@ -18,7 +18,7 @@ export function applySpecPatchPlan(
 
   for (const patch of patches) {
     const resolution = resolvePatchTargets(revised, patch);
-    const policyBlock = resolution.blockedReason ?? (allowedBlockedOps.has(patch.op) ? null : evaluatePatchPolicy(patch, resolution.matchedServices));
+    const policyBlock = resolution.blockedReason ?? (allowedBlockedOps.has(patch.op) ? null : evaluatePatchPolicy(revised, patch, resolution.matchedServices));
     const before = JSON.stringify(revised);
     revised = policyBlock === null ? applyResolvedPatch(revised, patch, resolution.matchedServices) : revised;
     results.push({
@@ -103,10 +103,12 @@ function scoreServiceSelector(
 }
 
 function evaluatePatchPolicy(
+  spec: InfrastructureSpec,
   patch: SpecPatch,
   matchedServices: InfrastructureService[],
 ): string | null {
   if (patch.op === 'remove-service') {
+    if (isAutoSafeDatabaseRemoval(spec, matchedServices)) return null;
     return 'Removing a service requires explicit user confirmation.';
   }
 
@@ -127,6 +129,16 @@ function evaluatePatchPolicy(
   }
 
   return null;
+}
+
+function isAutoSafeDatabaseRemoval(
+  spec: InfrastructureSpec,
+  matchedServices: InfrastructureService[],
+): boolean {
+  if (matchedServices.length !== 1) return false;
+  const target = matchedServices[0]!;
+  if (target.kind !== 'database') return false;
+  return !spec.services.some((service) => service.dependsOn?.includes(target.name));
 }
 
 function isRiskyVolumeMount(volume: string): boolean {

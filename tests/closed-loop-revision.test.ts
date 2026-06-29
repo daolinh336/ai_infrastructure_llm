@@ -208,6 +208,38 @@ class RawPatchStubLlmProvider extends StubLlmProvider {
   }
 }
 
+class MalformedDatabaseFeedbackIntentStubLlmProvider extends StubLlmProvider {
+  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+    if (input.schemaName === 'feedback_intent') {
+      return {
+        text: JSON.stringify({
+          target: { kind: 'database', serviceNames: ['postgres-1', 'postgres-2'], scope: 'database-group' },
+          desiredChange: { mode: 'total', totalInstances: 4 },
+          intent: 'set-instances',
+          confidence: 0.87,
+          ambiguities: [],
+          requiresUserInput: false,
+        }),
+      };
+    }
+
+    if (input.schemaName === 'spec_patch_plan') {
+      return {
+        text: JSON.stringify({
+          patches: [],
+          explanation: 'LLM patch planner failed to emit a direct patch.',
+          assumptions: [],
+          ambiguities: [],
+          requiresUserInput: true,
+          confidence: 0.2,
+        }),
+      };
+    }
+
+    return super.completeStructured(input);
+  }
+}
+
 function patchProvider(patches: SpecPatchPlan['patches'], overrides: Partial<SpecPatchPlan> = {}): FixedPatchStubLlmProvider {
   return new FixedPatchStubLlmProvider({
     patches,
@@ -839,6 +871,21 @@ function makeSpec(): InfrastructureSpec {
     ],
     networks: ['app-network'],
     volumes: [],
+  };
+}
+
+function makeThreeDatabaseSpec(): InfrastructureSpec {
+  return {
+    projectName: 'test-revision',
+    services: [
+      { kind: 'backend', name: 'api', image: 'node:20-alpine', dependsOn: ['postgres-1'] },
+      { kind: 'reverse-proxy', name: 'nginx', image: 'nginx:stable', dependsOn: ['api'] },
+      { kind: 'database', name: 'postgres-1', image: 'postgres:16', volumes: ['postgres-data-1:/var/lib/postgresql/data'] },
+      { kind: 'database', name: 'postgres-2', image: 'postgres:16', dependsOn: ['postgres-1'], volumes: ['postgres-data-2:/var/lib/postgresql/data'] },
+      { kind: 'database', name: 'postgres-3', image: 'postgres:16', dependsOn: ['postgres-1'], volumes: ['postgres-data-3:/var/lib/postgresql/data'] },
+    ],
+    networks: ['app-network'],
+    volumes: ['postgres-data-1', 'postgres-data-2', 'postgres-data-3'],
   };
 }
 
@@ -1700,6 +1747,131 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
     expect(result.revisionSummary).toContain('1 patch(es) applied');
   });
 
+  it('scales an expanded database group from deterministic user feedback when LLM patches are empty', async () => {
+    const planner = new StandardPlannerAgent(patchProvider([], {
+      explanation: 'LLM revision output did not contain a directly applicable schema-valid patch.',
+      requiresUserInput: true,
+      ambiguities: ['There are currently 3 database services.'],
+      confidence: 0.2,
+    }));
+    const req: PlannerRevisionRequest = {
+      desiredSpec: {
+        projectName: 'sample-infra',
+        services: [
+          { kind: 'reverse-proxy', name: 'nginx', image: 'nginx:stable', ports: ['80:80'], dependsOn: ['api'] },
+          { kind: 'backend', name: 'api', image: 'node:20-alpine', replicas: 2, dependsOn: ['postgres-1'] },
+          {
+            kind: 'database',
+            name: 'postgres-1',
+            image: 'postgres:16',
+            environment: { POSTGRES_DB: 'app', POSTGRES_USER: 'app', POSTGRES_PASSWORD: 'password' },
+            volumes: ['postgres-data-1:/var/lib/postgresql/data'],
+          },
+          {
+            kind: 'database',
+            name: 'postgres-2',
+            image: 'postgres:16',
+            environment: { POSTGRES_DB: 'app', POSTGRES_USER: 'app', POSTGRES_PASSWORD: 'password' },
+            dependsOn: ['postgres-1'],
+            volumes: ['postgres-data-2:/var/lib/postgresql/data'],
+          },
+          {
+            kind: 'database',
+            name: 'postgres-3',
+            image: 'postgres:16',
+            environment: { POSTGRES_DB: 'app', POSTGRES_USER: 'app', POSTGRES_PASSWORD: 'password' },
+            dependsOn: ['postgres-1'],
+            volumes: ['postgres-data-3:/var/lib/postgresql/data'],
+          },
+        ],
+        networks: ['app-network'],
+        volumes: ['postgres-data-1', 'postgres-data-2', 'postgres-data-3'],
+      },
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'i want 2 database instance', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    const result = await planner.reviseFromFeedback(req);
+
+    expect(result.revisionDecision).toBe('auto-revised');
+    expect(result.patchPlan?.patches).toEqual([
+      expect.objectContaining({ op: 'set-service-replicas', target: { kind: 'database' }, replicas: 2 }),
+    ]);
+    expect(result.revisedSpec.services.map((service) => service.name)).toEqual(['nginx', 'api', 'postgres-1', 'postgres-2']);
+    expect(result.revisedSpec.services.find((service) => service.name === 'api')?.dependsOn).toEqual(['postgres-1', 'postgres-2']);
+    expect(result.revisedSpec.volumes).toEqual(['postgres-data-1', 'postgres-data-2']);
+    expect(result.assumptions).toContain('Revision patch source: semantic feedback intent fallback replaced empty/unavailable LLM patch plan.');
+  });
+
+  it('scales up an expanded database group from deterministic user feedback by adding the next replica', async () => {
+    const planner = new StandardPlannerAgent(patchProvider([], {
+      explanation: 'LLM revision output did not contain a directly applicable schema-valid patch.',
+      requiresUserInput: true,
+      ambiguities: ['There are currently 3 database services.'],
+      confidence: 0.2,
+    }));
+    const req: PlannerRevisionRequest = {
+      desiredSpec: {
+        projectName: 'sample-infra',
+        services: [
+          { kind: 'reverse-proxy', name: 'nginx', image: 'nginx:stable', ports: ['80:80'], dependsOn: ['api'] },
+          { kind: 'backend', name: 'api', image: 'node:20-alpine', replicas: 2, dependsOn: ['postgres-1', 'postgres-2', 'postgres-3'] },
+          {
+            kind: 'database',
+            name: 'postgres-1',
+            image: 'postgres:16',
+            environment: { POSTGRES_DB: 'app', POSTGRES_USER: 'app', POSTGRES_PASSWORD: 'password' },
+            volumes: ['postgres-data-1:/var/lib/postgresql/data'],
+          },
+          {
+            kind: 'database',
+            name: 'postgres-2',
+            image: 'postgres:16',
+            environment: { POSTGRES_DB: 'app', POSTGRES_USER: 'app', POSTGRES_PASSWORD: 'password' },
+            dependsOn: ['postgres-1'],
+            volumes: ['postgres-data-2:/var/lib/postgresql/data'],
+          },
+          {
+            kind: 'database',
+            name: 'postgres-3',
+            image: 'postgres:16',
+            environment: { POSTGRES_DB: 'app', POSTGRES_USER: 'app', POSTGRES_PASSWORD: 'password' },
+            dependsOn: ['postgres-1'],
+            volumes: ['postgres-data-3:/var/lib/postgresql/data'],
+          },
+        ],
+        networks: ['app-network'],
+        volumes: ['postgres-data-1', 'postgres-data-2', 'postgres-data-3'],
+      },
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'i want 4 database instance', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    const result = await planner.reviseFromFeedback(req);
+
+    expect(result.revisionDecision).toBe('auto-revised');
+    expect(result.patchPlan?.patches).toEqual([
+      expect.objectContaining({ op: 'set-service-replicas', target: { kind: 'database' }, replicas: 4 }),
+    ]);
+    expect(result.revisedSpec.services.map((service) => service.name)).toEqual(['nginx', 'api', 'postgres-1', 'postgres-2', 'postgres-3', 'postgres-4']);
+    expect(result.revisedSpec.services.find((service) => service.name === 'postgres-4')).toMatchObject({
+      dependsOn: ['postgres-1'],
+      volumes: ['postgres-data-4:/var/lib/postgresql/data'],
+    });
+    expect(result.revisedSpec.services.find((service) => service.name === 'api')?.dependsOn).toEqual(['postgres-1', 'postgres-2', 'postgres-3', 'postgres-4']);
+    expect(result.revisedSpec.volumes).toEqual(['postgres-data-1', 'postgres-data-2', 'postgres-data-3', 'postgres-data-4']);
+  });
+
   it('resolves an nginx alias to a web service when applying a structured port mapping', async () => {
     const planner = new StandardPlannerAgent(patchProvider([
       { op: 'replace-service-port', target: { imageFamily: 'nginx' }, to: '83:83', reason: 'LLM selected the nginx image family from service catalog.' },
@@ -2290,6 +2462,94 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
     expect(result.revisedSpec.services.map((service) => service.name)).toEqual(['nginx']);
     expect(result.revisedSpec.services[0]?.dependsOn).toBeUndefined();
     expect(result.revisionDecision).toBe('auto-revised');
+  });
+
+  it('treats database reduction feedback as a replica-count change for the database group', async () => {
+    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const req: PlannerRevisionRequest = {
+      desiredSpec: makeThreeDatabaseSpec(),
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'giam xuong 2 db instance thoi', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    const result = await planner.reviseFromFeedback(req);
+
+    expect(result.revisionDecision).toBe('auto-revised');
+    expect(result.revisedSpec.services.map((service) => service.name)).toEqual(['api', 'nginx', 'postgres-1', 'postgres-2']);
+    expect(result.patchPlan?.patches).toEqual([
+      expect.objectContaining({ op: 'set-service-replicas', target: { kind: 'database' }, replicas: 2 }),
+    ]);
+    expect(result.patchResults?.[0]?.blockedReason).toBeNull();
+  });
+
+  it('normalizes malformed LLM feedback intent into a database replica patch', async () => {
+    const planner = new StandardPlannerAgent(new MalformedDatabaseFeedbackIntentStubLlmProvider());
+    const req: PlannerRevisionRequest = {
+      desiredSpec: makeThreeDatabaseSpec(),
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'i want total 4 instance database', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    const result = await planner.reviseFromFeedback(req);
+
+    expect(result.revisionDecision).toBe('auto-revised');
+    expect(result.patchPlan?.patches).toEqual([
+      expect.objectContaining({ op: 'set-service-replicas', target: { kind: 'database' }, replicas: 4 }),
+    ]);
+    expect(result.revisedSpec.services.map((service) => service.name)).toEqual([
+      'api',
+      'nginx',
+      'postgres-1',
+      'postgres-2',
+      'postgres-3',
+      'postgres-4',
+    ]);
+    expect(result.revisedSpec.volumes).toEqual([
+      'postgres-data-1',
+      'postgres-data-2',
+      'postgres-data-3',
+      'postgres-data-4',
+    ]);
+  });
+
+  it('requires user input when database replica feedback has no clear group target', async () => {
+    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const req: PlannerRevisionRequest = {
+      desiredSpec: {
+        projectName: 'test-revision',
+        services: [
+          { kind: 'database', name: 'postgres', image: 'postgres:16', replicas: 2 },
+          { kind: 'database', name: 'redis', image: 'redis:7', replicas: 2 },
+        ],
+        networks: ['app-network'],
+        volumes: ['postgres-data', 'redis-data'],
+      },
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'giam xuong 1 db instance', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    const result = await planner.reviseFromFeedback(req);
+
+    expect(result.revisionDecision).toBe('needs-user-input');
+    expect(result.revisedSpec.services.find((service) => service.name === 'postgres')?.replicas).toBe(2);
+    expect(result.revisedSpec.services.find((service) => service.name === 'redis')?.replicas).toBe(2);
+    expect(result.patchPlan?.patches).toEqual([]);
+    expect(result.patchPlan?.ambiguities).toContain('Multiple database services match the feedback.');
   });
 
   it('applies user feedback that requests a network rename and rerenders compose from spec', async () => {

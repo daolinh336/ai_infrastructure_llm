@@ -96,19 +96,30 @@ export class StandardPlannerAgent implements PlannerAgent {
         feedbackIntent = intentResult.feedbackIntent;
         assumptions.push(...intentResult.diagnostics);
       }
-      const patchPlanResult = await this.getRevisionPatchPlan(
-        spec,
-        { ...request, feedbackIntent },
-        issues,
-        findings,
-      );
-      patchPlan = patchPlanResult.patchPlan;
-      patchPlanError = patchPlanResult.error;
-      assumptions.push(...patchPlanResult.diagnostics);
+      if (patchPlan === null) {
+        const patchPlanResult = await this.getRevisionPatchPlan(
+          spec,
+          { ...request, feedbackIntent },
+          issues,
+          findings,
+        );
+        patchPlan = patchPlanResult.patchPlan;
+        patchPlanError = patchPlanResult.error;
+        assumptions.push(...patchPlanResult.diagnostics);
+      }
       if (obs.userFeedback !== null && (patchPlan === null || (patchPlan.patches.length === 0 && !isServiceTargetAmbiguityPatchPlan(patchPlan)))) {
-        const deterministicPatchPlan = buildDeterministicFeedbackPatchPlan(spec, obs.userFeedback.message, patchPlanError);
+        const deterministicPatchPlan = buildDeterministicFeedbackPatchPlan(
+          spec,
+          obs.userFeedback.message,
+          patchPlanError,
+          feedbackIntent,
+        );
         if (deterministicPatchPlan.patches.length > 0 || isServiceTargetAmbiguityPatchPlan(deterministicPatchPlan)) {
-          assumptions.push('Revision patch source: deterministic fallback replaced empty/unavailable LLM patch plan.');
+          assumptions.push(
+            feedbackIntent !== null
+              ? 'Revision patch source: semantic feedback intent fallback replaced empty/unavailable LLM patch plan.'
+              : 'Revision patch source: deterministic fallback replaced empty/unavailable LLM patch plan.',
+          );
           patchPlan = deterministicPatchPlan;
         }
       }
@@ -208,6 +219,7 @@ export class StandardPlannerAgent implements PlannerAgent {
         attemptIndex: request.attemptIndex,
         projectName: spec.projectName,
         serviceCatalog: buildRevisionServiceCatalog(spec),
+        databaseReplicaGroups: buildDatabaseReplicaGroups(spec),
         verifierObservation: buildVerifierObservationContext(request.revisionObservation),
         userFeedback: request.revisionObservation.userFeedback,
         feedbackIntent: request.feedbackIntent ?? null,
@@ -242,6 +254,7 @@ export class StandardPlannerAgent implements PlannerAgent {
           'You revise desired infrastructure by returning schema-valid JSON patches only.',
           'Patch InfrastructureSpec, not Docker API payloads and not docker-compose YAML.',
           'Use the provided serviceCatalog as the source of truth for mapping user wording to existing services.',
+          'When databaseReplicaGroups are present, treat expanded names like postgres-1/postgres-2 as one logical stateful database group for replica-count changes.',
           'Use verifierObservation, userFeedback, and runtimeRefs as observations about the same desired spec; do not ignore verifier evidence when user feedback is present.',
           'Treat userFeedback from an "other" answer as a fresh natural-language instruction, but still ground target selection in serviceCatalog and verifierObservation.',
           'Choose targets by comparing the user request with each service name, role, image family, exposed ports, dependencies, dependents, and current replicas.',
@@ -299,6 +312,7 @@ export class StandardPlannerAgent implements PlannerAgent {
         attemptIndex: request.attemptIndex,
         projectName: spec.projectName,
         serviceCatalog: buildRevisionServiceCatalog(spec),
+        databaseReplicaGroups: buildDatabaseReplicaGroups(spec),
         verifierObservation: buildVerifierObservationContext(request.revisionObservation),
         runtimeIssueReport: request.runtimeIssueReport ?? null,
         runtimeRefs: request.resourceRefs ?? null,
@@ -329,13 +343,17 @@ export class StandardPlannerAgent implements PlannerAgent {
           'Parse free-form user other feedback into one schema-valid FeedbackIntent object.',
           'Do not produce infrastructure patches. Do not edit docker-compose YAML. Only classify intent, target, desiredChange, confidence, and ambiguities.',
           'Use runtime issues and current service catalog to resolve phrases like change port, rename, replicas, image, env, volume, network, remove exposure, or YAML edit intent.',
+          'When databaseReplicaGroups are present, interpret phrases like total 4 database instances as change-replicas for the logical database group, not as separate add/remove service requests.',
           'If the target or desired value is ambiguous, set requiresUserInput=true and include concise ambiguities.',
         ].join('\n'),
         user: userPayload,
         schemaName: 'feedback_intent',
         schema: feedbackIntentJsonSchema,
       });
-      const feedbackIntent = validateFeedbackIntent(parseJsonResponse(response.text));
+      const feedbackIntent = normalizeAndValidateFeedbackIntent(
+        parseJsonResponse(response.text),
+        rawText,
+      );
       return {
         feedbackIntent,
         diagnostics: [
@@ -504,6 +522,63 @@ function buildRevisionServiceCatalog(spec: InfrastructureSpec): Array<{
   });
 }
 
+function buildDatabaseReplicaGroups(spec: InfrastructureSpec): Array<{
+  baseName: string;
+  imageFamily: string;
+  currentDesiredInstances: number;
+  serviceNames: string[];
+  volumeNames: string[];
+}> {
+  const expandedGroups = new Map<string, InfrastructureSpec['services']>();
+  const logicalGroups: Array<{
+    baseName: string;
+    imageFamily: string;
+    currentDesiredInstances: number;
+    serviceNames: string[];
+    volumeNames: string[];
+  }> = [];
+
+  for (const service of spec.services) {
+    if (service.kind !== 'database') continue;
+    const imageFamily = service.image.toLowerCase().split(':')[0]?.split('/').pop() ?? service.image.toLowerCase();
+    const parsed = parseNumberedReplicaServiceName(service.name);
+
+    if ((service.replicas ?? 1) > 1 || parsed === null) {
+      logicalGroups.push({
+        baseName: parsed?.baseName ?? service.name,
+        imageFamily,
+        currentDesiredInstances: service.replicas ?? 1,
+        serviceNames: [service.name],
+        volumeNames: declaredNamedVolumes(service.volumes ?? []),
+      });
+      continue;
+    }
+
+    const services = expandedGroups.get(parsed.baseName) ?? [];
+    services.push(service);
+    expandedGroups.set(parsed.baseName, services);
+  }
+
+  return [
+    ...logicalGroups,
+    ...[...expandedGroups.entries()]
+      .map(([baseName, services]) => {
+        const sortedServices = [...services].sort(
+          (left, right) => (parseNumberedReplicaServiceName(left.name)?.ordinal ?? 0) - (parseNumberedReplicaServiceName(right.name)?.ordinal ?? 0),
+        );
+        const first = sortedServices[0]!;
+        const imageFamily = first.image.toLowerCase().split(':')[0]?.split('/').pop() ?? first.image.toLowerCase();
+        return {
+          baseName,
+          imageFamily,
+          currentDesiredInstances: sortedServices.length,
+          serviceNames: sortedServices.map((service) => service.name),
+          volumeNames: sortedServices.flatMap((service) => declaredNamedVolumes(service.volumes ?? [])),
+        };
+      }),
+  ];
+}
+
 function buildVerifierObservationContext(obs: import('../domain/types.js').RevisionObservation): {
   status: string | null;
   scope: string | null;
@@ -582,6 +657,102 @@ function formatRevisionPatchPlanError(error: unknown): string {
 function normalizeAndValidateSpecPatchPlan(value: unknown): SpecPatchPlan {
   const normalizedPlan = normalizeSpecPatchPlanShape(value);
   return validateSpecPatchPlan(normalizedPlan);
+}
+
+function normalizeAndValidateFeedbackIntent(value: unknown, rawText: string): FeedbackIntent {
+  const record = isRecord(value) ? value : {};
+  const intent = normalizeFeedbackIntentName(record.intent ?? record.kind ?? record.action ?? record.type);
+  const targetRecord = isRecord(record.target) ? record.target : {};
+  const desiredRecord = isRecord(record.desiredChange) ? record.desiredChange : record;
+  const serviceSelector = normalizePatchTarget(
+    targetRecord.serviceSelector
+      ?? targetRecord.selector
+      ?? record.serviceSelector
+      ?? record.selector
+      ?? record.target
+      ?? record.service
+      ?? record.serviceName
+      ?? targetRecord.name,
+  );
+  const replicas = normalizeInteger(
+    desiredRecord.replicas
+      ?? desiredRecord.replicaCount
+      ?? desiredRecord.instances
+      ?? desiredRecord.totalInstances
+      ?? desiredRecord.count
+      ?? record.replicas
+      ?? record.replicaCount
+      ?? record.instances
+      ?? record.totalInstances
+      ?? record.count,
+  );
+  const desiredChange = {
+    ...(replicas !== null ? { replicas } : {}),
+    ...(normalizeInteger(desiredRecord.hostPort) !== null ? { hostPort: normalizeInteger(desiredRecord.hostPort)! } : {}),
+    ...(normalizeInteger(desiredRecord.containerPort) !== null ? { containerPort: normalizeInteger(desiredRecord.containerPort)! } : {}),
+    ...(normalizeString(desiredRecord.name) ? { name: normalizeString(desiredRecord.name)! } : {}),
+    ...(normalizeString(desiredRecord.image) ? { image: normalizeString(desiredRecord.image)! } : {}),
+    ...(isRecord(desiredRecord.environment) ? { environment: Object.fromEntries(Object.entries(desiredRecord.environment).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) } : {}),
+    ...(normalizeStringArray(desiredRecord.volumes).length > 0 ? { volumes: normalizeStringArray(desiredRecord.volumes) } : {}),
+    ...(normalizeStringArray(desiredRecord.networks).length > 0 ? { networks: normalizeStringArray(desiredRecord.networks) } : {}),
+    ...(normalizeString(desiredRecord.yamlFragment) ? { yamlFragment: normalizeString(desiredRecord.yamlFragment)! } : {}),
+  };
+
+  return validateFeedbackIntent({
+    source: 'user-other-feedback',
+    rawText: normalizeString(record.rawText) ?? rawText,
+    intent,
+    ...(serviceSelector || normalizeString(targetRecord.currentValue) || normalizeResourceKind(targetRecord.resourceKind ?? targetRecord.kind ?? targetRecord.scope)
+      ? {
+          target: {
+            ...(normalizeResourceKind(targetRecord.resourceKind ?? targetRecord.kind ?? targetRecord.scope) ? { resourceKind: normalizeResourceKind(targetRecord.resourceKind ?? targetRecord.kind ?? targetRecord.scope) } : {}),
+            ...(serviceSelector ? { serviceSelector } : {}),
+            ...(normalizeString(targetRecord.currentValue) ? { currentValue: normalizeString(targetRecord.currentValue)! } : {}),
+          },
+        }
+      : {}),
+    ...(Object.keys(desiredChange).length > 0 ? { desiredChange } : {}),
+    confidence: normalizeConfidence(record.confidence, intent === 'unknown' ? 0.25 : 0.7),
+    ambiguities: normalizeStringArray(record.ambiguities ?? record.questions),
+    requiresUserInput: typeof record.requiresUserInput === 'boolean'
+      ? record.requiresUserInput
+      : intent === 'unknown',
+  });
+}
+
+function normalizeFeedbackIntentName(value: unknown): FeedbackIntent['intent'] {
+  const intent = normalizeString(value)?.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase().replace(/_/g, '-');
+  const aliases: Record<string, FeedbackIntent['intent']> = {
+    replicas: 'change-replicas',
+    replica: 'change-replicas',
+    instances: 'change-replicas',
+    'change-instances': 'change-replicas',
+    'set-instances': 'change-replicas',
+    'set-replicas': 'change-replicas',
+    scale: 'change-replicas',
+    port: 'change-port',
+    ports: 'change-port',
+    rename: 'change-name',
+    name: 'change-name',
+    image: 'change-image',
+    env: 'change-env',
+    environment: 'change-env',
+    volume: 'change-volume',
+    network: 'change-network',
+  };
+  const normalized = intent ? (aliases[intent] ?? intent) : 'unknown';
+  const allowed = new Set<FeedbackIntent['intent']>([
+    'change-port', 'change-name', 'change-replicas', 'change-image', 'change-env', 'change-volume',
+    'change-network', 'remove-exposure', 'yaml-edit-intent', 'retry-as-is', 'cancel', 'unknown',
+  ]);
+  return allowed.has(normalized as FeedbackIntent['intent']) ? normalized as FeedbackIntent['intent'] : 'unknown';
+}
+
+function normalizeResourceKind(value: unknown): NonNullable<FeedbackIntent['target']>['resourceKind'] | null {
+  const kind = normalizeString(value)?.toLowerCase();
+  if (kind === 'project' || kind === 'service' || kind === 'container' || kind === 'port' || kind === 'image' || kind === 'volume' || kind === 'network' || kind === 'environment') return kind;
+  if (kind === 'database' || kind === 'db') return 'service';
+  return null;
 }
 
 function normalizeSpecPatchPlanShape(value: unknown): SpecPatchPlan {
@@ -829,13 +1000,22 @@ function buildDeterministicFeedbackPatchPlan(
   spec: InfrastructureSpec,
   feedback: string,
   patchPlanError: string | null,
+  feedbackIntent: FeedbackIntent | null,
 ): SpecPatchPlan {
   const patches: SpecPatch[] = [];
   const ambiguities: string[] = [];
   const normalizedFeedback = feedback.trim();
   const reason = `Deterministic fallback normalized user feedback: ${normalizedFeedback}`;
 
-  const replicaRequest = parseReplicaFeedback(normalizedFeedback);
+  if (feedbackIntent !== null) {
+    const intentPatchResult = buildPatchesFromFeedbackIntent(spec, feedbackIntent, reason);
+    patches.push(...intentPatchResult.patches);
+    ambiguities.push(...intentPatchResult.ambiguities);
+  }
+
+  const replicaRequest = patches.some((patch) => patch.op === 'set-service-replicas')
+    ? null
+    : parseReplicaFeedback(normalizedFeedback);
   if (replicaRequest !== null) {
     const target = inferFeedbackServiceSelector(spec, normalizedFeedback, { preferReplicaServices: true });
     if (target.selector !== null && target.ambiguous === false) {
@@ -922,16 +1102,74 @@ function buildDeterministicFeedbackPatchPlan(
       'Fallback only emits InfrastructureSpec patches supported by SpecPatchPlan schema.',
       'Fallback applies changes only when the target service can be inferred from the current service catalog.',
     ],
-    ambiguities: uniqueIdentifiers(ambiguities),
+    ambiguities: uniqueIdentifiers(patches.length > 0 ? [] : ambiguities),
     requiresUserInput: ambiguities.length > 0 && patches.length === 0,
     confidence: patches.length > 0 && ambiguities.length === 0 ? 0.82 : patches.length > 0 ? 0.65 : 0.25,
   });
 }
 
+function buildPatchesFromFeedbackIntent(
+  spec: InfrastructureSpec,
+  feedbackIntent: FeedbackIntent,
+  reason: string,
+): { patches: SpecPatch[]; ambiguities: string[] } {
+  const patches: SpecPatch[] = [];
+  const ambiguities: string[] = [...feedbackIntent.ambiguities];
+  const selector = feedbackIntent.target?.serviceSelector ?? null;
+
+  if (feedbackIntent.intent === 'change-replicas') {
+    const replicas = feedbackIntent.desiredChange?.replicas ?? null;
+    if (replicas === null) {
+      ambiguities.push('Requested replica/instance count was not clear.');
+      return { patches, ambiguities };
+    }
+
+    const target = selector ?? inferFeedbackServiceSelector(spec, feedbackIntent.rawText, { preferReplicaServices: true }).selector;
+    if (target !== null) {
+      patches.push({ op: 'set-service-replicas', target, replicas, reason });
+    } else {
+      ambiguities.push('Which existing service should receive the requested replica/instance count?');
+    }
+  }
+
+  if (feedbackIntent.intent === 'change-port') {
+    const hostPort = feedbackIntent.desiredChange?.hostPort ?? null;
+    if (hostPort === null || selector === null) return { patches, ambiguities };
+    const targetServices = resolveServiceSelector(spec, selector);
+    if (targetServices.length !== 1) {
+      ambiguities.push('Which existing service should receive the requested host port?');
+      return { patches, ambiguities };
+    }
+    const existingPort = targetServices[0]?.ports?.[0];
+    const existingContainerPort = Number(existingPort?.split(':')[1]);
+    const containerPort = feedbackIntent.desiredChange?.containerPort
+      ?? (Number.isInteger(existingContainerPort) ? existingContainerPort : hostPort);
+    patches.push({ op: 'replace-service-port', target: selector, to: `${hostPort}:${containerPort}`, reason });
+  }
+
+  if (feedbackIntent.intent === 'change-image' && feedbackIntent.desiredChange?.image && selector !== null) {
+    patches.push({ op: 'set-service-image', target: selector, image: feedbackIntent.desiredChange.image, reason });
+  }
+
+  if (feedbackIntent.intent === 'change-name' && feedbackIntent.desiredChange?.name) {
+    if (feedbackIntent.target?.resourceKind === 'project') {
+      patches.push({ op: 'set-project-name', name: sanitizeIdentifier(feedbackIntent.desiredChange.name), reason });
+    } else if (selector !== null) {
+      patches.push({ op: 'rename-service', target: selector, name: sanitizeIdentifier(feedbackIntent.desiredChange.name), reason });
+    }
+  }
+
+  if (feedbackIntent.intent === 'change-network' && feedbackIntent.desiredChange?.networks?.length) {
+    patches.push({ op: 'set-networks', networks: feedbackIntent.desiredChange.networks.map(sanitizeIdentifier).filter(Boolean), reason });
+  }
+
+  return { patches, ambiguities };
+}
+
 function parseReplicaFeedback(feedback: string): number | null {
   const patterns = [
     /\b(?:giam|giảm|tang|tăng|ha|hạ|nang|nâng|xuong|xuống|len|lên)\s+(?:(?:xuong|xuống|len|lên)\s+)?(?:(?:con|còn|thanh|thành|toi|tới|to)\s+)?(\d+)\s*(?:instances?|replicas?)?\b/i,
-    /\b(?:just|only|to|use|with|set|make|want|needs?|need)\s+(\d+)\s+(?:instances?|replicas?)\b/i,
+    /\b(?:just|only|to|use|with|set|make|want|needs?|need)\s+(\d+)\s+(?:[a-z0-9_-]+\s+){0,4}(?:instances?|replicas?)\b/i,
     /\b(?:instances?|replicas?)\s+(?:to|=|is|are)?\s*(\d+)\b/i,
     /\b(?:scale|replicas?)\s+[^\d]{0,30}\bto\s+(\d+)\b/i,
   ];
@@ -970,6 +1208,9 @@ function inferFeedbackServiceSelector(
   if (kind !== null) {
     const matches = spec.services.filter((service) => service.kind === kind);
     if (matches.length === 1) return { selector: { kind }, ambiguous: false, reason: null };
+    if (options.preferReplicaServices && kind === 'database' && isExpandedDatabaseReplicaGroup(matches)) {
+      return { selector: { kind }, ambiguous: false, reason: null };
+    }
     if (matches.length > 1) return { selector: null, ambiguous: true, reason: `Multiple ${kind} services match the feedback.` };
   }
 
@@ -986,6 +1227,31 @@ function inferFeedbackServiceSelector(
 
   if (spec.services.length === 1) return { selector: { name: spec.services[0]!.name }, ambiguous: false, reason: null };
   return { selector: null, ambiguous: true, reason: 'Feedback target does not clearly match exactly one current service.' };
+}
+
+function isExpandedDatabaseReplicaGroup(services: InfrastructureSpec['services']): boolean {
+  if (services.length <= 1) return false;
+
+  const groups = new Map<string, Set<number>>();
+  for (const service of services) {
+    const match = /^(.+)-(\d+)$/.exec(service.name);
+    if (!match) return false;
+
+    const baseName = match[1]!;
+    const replicaNumber = Number(match[2]);
+    if (!Number.isInteger(replicaNumber) || replicaNumber < 1) return false;
+
+    const existing = groups.get(baseName) ?? new Set<number>();
+    existing.add(replicaNumber);
+    groups.set(baseName, existing);
+  }
+
+  if (groups.size !== 1) return false;
+
+  const replicaNumbers = [...groups.values()][0]!;
+  return Array.from({ length: services.length }, (_, index) => index + 1).every((replicaNumber) =>
+    replicaNumbers.has(replicaNumber),
+  );
 }
 
 function inferFeedbackServiceKind(feedback: string, requestedImage: string | null | undefined): InfrastructureSpec['services'][number]['kind'] | null {
@@ -1294,6 +1560,26 @@ function uniqueIdentifiers(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.length > 0))];
 }
 
+function declaredNamedVolumes(volumeMounts: string[]): string[] {
+  return volumeMounts.map(mountSource).filter(isNamedVolumeSource);
+}
+
+function mountSource(mount: string): string {
+  return mount.split(':')[0] ?? '';
+}
+
+function isNamedVolumeSource(source: string): boolean {
+  return source.length > 0 && !source.startsWith('.') && !source.startsWith('/') && !source.includes('\\');
+}
+
+function parseNumberedReplicaServiceName(name: string): { baseName: string; ordinal: number } | null {
+  const match = /^(.+)-(\d+)$/.exec(name);
+  if (!match) return null;
+  const ordinal = Number(match[2]);
+  if (!Number.isInteger(ordinal) || ordinal < 1) return null;
+  return { baseName: match[1]!, ordinal };
+}
+
 function findMentionedServiceName(spec: InfrastructureSpec, issue: string): string | null {
   const normalizedIssue = issue.toLowerCase();
   const exactServiceName = spec.services.find((service) => containsIdentifier(normalizedIssue, service.name))?.name;
@@ -1439,7 +1725,7 @@ function buildPatchPlanAmbiguityClarifications(
 
 function isServiceTargetAmbiguityPatchPlan(patchPlan: SpecPatchPlan): boolean {
   return patchPlan.requiresUserInput && patchPlan.patches.length === 0 && patchPlan.ambiguities.some((ambiguity) =>
-    /which existing service|target service|which service/i.test(ambiguity),
+    /which existing service|target service|which service|multiple .*services? match/i.test(ambiguity),
   );
 }
 

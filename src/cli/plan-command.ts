@@ -393,6 +393,15 @@ export function registerPlanCommand(program: Command): void {
           for (const assumption of revisionResult.assumptions) {
             console.log(chalk.gray(`  - ${assumption}`));
           }
+          if (revisionResult.revisionDecision === 'needs-user-input') {
+            console.log(
+              chalk.yellow(
+                'Revision still needs clarification. docker-compose.yaml preview was not regenerated from the unchanged plan.',
+              ),
+            );
+            process.exitCode = 1;
+            return;
+          }
           currentResult = {
             ...currentResult,
             plan: {

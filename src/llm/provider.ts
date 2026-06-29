@@ -223,7 +223,7 @@ export class OpenAiLlmProvider implements LlmProvider {
         format: {
           type: 'json_schema',
           name: input.schemaName,
-          schema: input.schema,
+          schema: normalizeOpenAiStructuredOutputSchema(input.schema),
           strict: true,
         },
       },
@@ -239,6 +239,52 @@ export class OpenAiLlmProvider implements LlmProvider {
       ? this.config.auxiliaryModel
       : this.config.reactModel;
   }
+}
+
+function normalizeOpenAiStructuredOutputSchema(schema: JsonSchema): JsonSchema {
+  if (Array.isArray(schema)) {
+    return schema.map((item) =>
+      isJsonSchemaObject(item) ? normalizeOpenAiStructuredOutputSchema(item) : item,
+    ) as unknown as JsonSchema;
+  }
+
+  const normalized: JsonSchema = { ...schema };
+
+  for (const keyword of ['properties', 'items', 'anyOf', 'oneOf', 'allOf']) {
+    const value = normalized[keyword];
+
+    if (Array.isArray(value)) {
+      normalized[keyword] = value.map((item) =>
+        isJsonSchemaObject(item) ? normalizeOpenAiStructuredOutputSchema(item) : item,
+      );
+      continue;
+    }
+
+    if (isJsonSchemaObject(value)) {
+      if (keyword === 'properties') {
+        normalized[keyword] = Object.fromEntries(
+          Object.entries(value).map(([propertyName, propertySchema]) => [
+            propertyName,
+            isJsonSchemaObject(propertySchema)
+              ? normalizeOpenAiStructuredOutputSchema(propertySchema)
+              : propertySchema,
+          ]),
+        );
+      } else {
+        normalized[keyword] = normalizeOpenAiStructuredOutputSchema(value);
+      }
+    }
+  }
+
+  if (normalized.type === 'object') {
+    normalized.additionalProperties = false;
+  }
+
+  return normalized;
+}
+
+function isJsonSchemaObject(value: unknown): value is JsonSchema {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 export class GeminiLlmProvider implements LlmProvider {

@@ -68,6 +68,32 @@ describe('stateful database replica volumes', () => {
     expect(parsed.services.api?.depends_on).toEqual(['postgres-1', 'postgres-2', 'postgres-3']);
     expect(Object.keys(parsed.volumes)).toEqual(['postgres-data-1', 'postgres-data-2', 'postgres-data-3']);
   });
+
+  it('prunes stale generated database volumes that no rendered service mounts', () => {
+    const normalized = normalizeStatefulDatabaseReplicaVolumes({
+      projectName: 'sample-infra',
+      services: [
+        {
+          kind: 'database',
+          name: 'postgres-1',
+          image: 'postgres:16',
+          volumes: ['postgres-data-1:/var/lib/postgresql/data'],
+        },
+        {
+          kind: 'database',
+          name: 'postgres-2',
+          image: 'postgres:16',
+          dependsOn: ['postgres-1'],
+          volumes: ['postgres-data-2:/var/lib/postgresql/data'],
+        },
+      ],
+      networks: ['app-network'],
+      volumes: ['postgres-data-1', 'postgres-data-2', 'postgres-data-3', 'unrelated-data'],
+    });
+
+    expect(normalized.services.map((service) => service.name)).toEqual(['postgres-1', 'postgres-2']);
+    expect(normalized.volumes).toEqual(['postgres-data-1', 'postgres-data-2', 'unrelated-data']);
+  });
 });
 
 function baseSpec(): InfrastructureSpec {
