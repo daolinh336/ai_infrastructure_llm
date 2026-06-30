@@ -19,7 +19,7 @@ interface ComposeHealthcheck {
   interval: string;
   timeout: string;
   retries: number;
-  startPeriod?: string;
+  start_period?: string;
 }
 
 const DATABASE_HEALTHCHECKS: Record<string, ComposeHealthcheck> = {
@@ -28,28 +28,28 @@ const DATABASE_HEALTHCHECKS: Record<string, ComposeHealthcheck> = {
     interval: '10s',
     timeout: '5s',
     retries: 5,
-    startPeriod: '10s',
+    start_period: '10s',
   },
   mysql: {
     test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost'],
     interval: '10s',
     timeout: '5s',
     retries: 5,
-    startPeriod: '15s',
+    start_period: '15s',
   },
   mariadb: {
     test: ['CMD', 'healthcheck.sh', '--connect', '--innodb_initialized'],
     interval: '10s',
     timeout: '5s',
     retries: 5,
-    startPeriod: '15s',
+    start_period: '15s',
   },
   mongo: {
     test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping')"],
     interval: '10s',
     timeout: '5s',
     retries: 5,
-    startPeriod: '10s',
+    start_period: '10s',
   },
   redis: {
     test: ['CMD', 'redis-cli', 'ping'],
@@ -62,7 +62,7 @@ const DATABASE_HEALTHCHECKS: Record<string, ComposeHealthcheck> = {
     interval: '15s',
     timeout: '5s',
     retries: 5,
-    startPeriod: '30s',
+    start_period: '30s',
   },
 };
 
@@ -81,6 +81,14 @@ export function getRuntimeKeepaliveCommand(image: string): string[] | undefined 
   return command ? [...command] : undefined;
 }
 
+function getAllowedHostPorts(service: { kind: string; name: string; image: string; ports?: string[] }): string[] {
+  if (service.kind !== 'reverse-proxy') {
+    return [];
+  }
+
+  return service.ports ?? [];
+}
+
 export function renderCompose(spec: InfrastructureSpec): string {
   const validSpec = normalizeStatefulDatabaseReplicaVolumes(
     validateInfrastructureSpec(spec),
@@ -92,13 +100,14 @@ export function renderCompose(spec: InfrastructureSpec): string {
         const healthcheck = DATABASE_HEALTHCHECKS[imageBase];
         const command = getRuntimeKeepaliveCommand(service.image);
         const replicas = service.replicas ?? 1;
+        const ports = getAllowedHostPorts(service);
         return [
           service.name,
           {
             image: service.image,
             restart: 'unless-stopped',
             deploy: { replicas },
-            ...(service.ports?.length ? { ports: service.ports } : {}),
+            ...(ports.length ? { ports } : {}),
             ...(service.environment ? { environment: service.environment } : {}),
             ...(service.dependsOn?.length ? { depends_on: service.dependsOn } : {}),
             ...(service.volumes?.length ? { volumes: service.volumes } : {}),

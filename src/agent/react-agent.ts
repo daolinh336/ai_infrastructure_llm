@@ -1266,22 +1266,26 @@ function buildServiceFromDraft(
   declaredVolumes: Set<string>,
 ): InfrastructureService {
   const imageBase = getImageBase(service.image);
+  const kind = getServiceKind(imageBase);
   const name = shouldUseDefaultServiceName(service.name, imageBase, topology)
     ? getDefaultServiceName(imageBase, index, topology)
     : (service.name ?? getDefaultServiceName(imageBase, index, topology));
+  const image = getDefaultImage(service.image);
   const volumeName = isStatefulServiceImage(imageBase) ? `${name}-data` : null;
   const replicas = service.replicas ?? null;
   const shouldUseSharedDataVolume = volumeName !== null && (replicas ?? 1) <= 1;
-  const hostPort = service.port ?? getDefaultHostPort(imageBase);
+  const hostPort = canExposeHostPorts({ kind, name, image })
+    ? service.port ?? getDefaultHostPort(imageBase)
+    : null;
 
   if (shouldUseSharedDataVolume) {
     declaredVolumes.add(volumeName);
   }
 
   return {
-    kind: getServiceKind(imageBase),
+    kind,
     name,
-    image: getDefaultImage(service.image),
+    image,
     ...getDefaultEnvironment(imageBase),
     ...(replicas !== null ? { replicas } : {}),
     ...(hostPort !== null ? { ports: [`${hostPort}:${getDefaultContainerPort(imageBase, hostPort)}`] } : {}),
@@ -1470,10 +1474,11 @@ function applyClarificationAnswer(
     throw new Error('Clarification answer did not resolve to a supported planning change.');
   }
 
-  const services = context.spec.services.map((service) => ({
-    ...service,
-    dependsOn: service.dependsOn ? [...service.dependsOn] : undefined,
-  }));
+  const services = context.spec.services.map((service) => (
+    service.dependsOn
+      ? { ...service, dependsOn: [...service.dependsOn] }
+      : { ...service }
+  ));
 
   if (resolvedValue.startsWith('dependsOn:')) {
     const [, serviceName, dependencyName] = resolvedValue.split(':');
@@ -1496,7 +1501,11 @@ function applyClarificationAnswer(
     const remainingDependencies = (service.dependsOn ?? []).filter(
       (dependencyName) => !databaseNames.has(dependencyName),
     );
-    service.dependsOn = remainingDependencies.length ? remainingDependencies : undefined;
+    if (remainingDependencies.length) {
+      service.dependsOn = remainingDependencies;
+    } else {
+      delete service.dependsOn;
+    }
   } else if (resolvedValue.startsWith('removeEdge:')) {
     const [, serviceName, dependencyName] = resolvedValue.split(':');
     const service = services.find((candidate) => candidate.name === serviceName);
@@ -1506,7 +1515,11 @@ function applyClarificationAnswer(
     const remainingDependencies = (service.dependsOn ?? []).filter(
       (candidate) => candidate !== dependencyName,
     );
-    service.dependsOn = remainingDependencies.length ? remainingDependencies : undefined;
+    if (remainingDependencies.length) {
+      service.dependsOn = remainingDependencies;
+    } else {
+      delete service.dependsOn;
+    }
   } else if (resolvedValue.startsWith('setServiceImage:')) {
     const [, serviceName, ...imageParts] = resolvedValue.split(':');
     const imageRef = imageParts.join(':');
@@ -1519,10 +1532,10 @@ function applyClarificationAnswer(
     throw new Error(`Unsupported clarification value: ${resolvedValue}`);
   }
 
-  return validateInfrastructureSpec({
+  return validateInfrastructureSpec(repairInfrastructureSpec({
     ...context.spec,
     services,
-  });
+  }));
 }
 
 function inferChoiceValueFromOtherText(
@@ -1652,7 +1665,11 @@ function repairInfrastructureSpec(spec: InfrastructureSpec): InfrastructureSpec 
       originalToRepairedName.set(service.name, repairedName);
     }
 
-    const repairedPorts = service.ports?.filter(isValidPortMapping) ?? [];
+    const kind = getServiceKind(imageBase);
+    const image = getDefaultImage(service.image);
+    const repairedPorts = canExposeHostPorts({ kind, name: repairedName, image })
+      ? service.ports?.filter(isValidPortMapping) ?? []
+      : [];
     const repairedVolumes =
       service.volumes
         ?.map((mount) => repairVolumeMount(mount, service.name, repairedName))
@@ -1663,9 +1680,9 @@ function repairInfrastructureSpec(spec: InfrastructureSpec): InfrastructureSpec 
         : Math.min(Math.max(service.replicas, 1), 50);
 
     return {
-      kind: getServiceKind(imageBase),
+      kind,
       name: repairedName,
-      image: getDefaultImage(service.image),
+      image,
       ...getDefaultEnvironment(imageBase),
       ...(repairedReplicas !== undefined ? { replicas: repairedReplicas } : {}),
       ...(repairedPorts.length ? { ports: repairedPorts } : {}),
@@ -1851,6 +1868,10 @@ function getDefaultHostPort(imageBase: string): number | null {
   }
 
   return null;
+}
+
+function canExposeHostPorts(service: { kind: string; name: string; image: string }): boolean {
+  return service.kind === 'reverse-proxy';
 }
 
 function getDefaultContainerPort(imageBase: string, hostPort: number): number {

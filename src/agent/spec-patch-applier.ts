@@ -12,7 +12,7 @@ export function applySpecPatchPlan(
   patches: SpecPatch[],
   options: { allowBlockedPatchOps?: string[] } = {},
 ): { spec: InfrastructureSpec; results: ResolvedSpecPatchResult[] } {
-  let revised = cloneSpec(spec);
+  let revised = stripDisallowedHostPortsFromSpec(cloneSpec(spec));
   const results: ResolvedSpecPatchResult[] = [];
   const allowedBlockedOps = new Set(options.allowBlockedPatchOps ?? []);
 
@@ -20,7 +20,9 @@ export function applySpecPatchPlan(
     const resolution = resolvePatchTargets(revised, patch);
     const policyBlock = resolution.blockedReason ?? (allowedBlockedOps.has(patch.op) ? null : evaluatePatchPolicy(revised, patch, resolution.matchedServices));
     const before = JSON.stringify(revised);
-    revised = policyBlock === null ? applyResolvedPatch(revised, patch, resolution.matchedServices) : revised;
+    revised = policyBlock === null
+      ? stripDisallowedHostPortsFromSpec(applyResolvedPatch(revised, patch, resolution.matchedServices))
+      : revised;
     results.push({
       patch,
       matchedServiceNames: resolution.matchedServices.map((service) => service.name),
@@ -112,14 +114,6 @@ function evaluatePatchPolicy(
     return 'Removing a service requires explicit user confirmation.';
   }
 
-  if (patch.op === 'add-service' && patch.service.kind === 'database' && (patch.service.ports?.length ?? 0) > 0) {
-    return 'Adding an externally exposed database service requires explicit user confirmation.';
-  }
-
-  if ((patch.op === 'add-service-port' || patch.op === 'replace-service-port') && matchedServices.some((service) => service.kind === 'database')) {
-    return 'Exposing a database service port requires explicit user confirmation.';
-  }
-
   if (patch.op === 'add-service-volume' && isRiskyVolumeMount(patch.volume)) {
     return 'Adding a risky host or Docker socket volume mount requires explicit user confirmation.';
   }
@@ -146,6 +140,23 @@ function isRiskyVolumeMount(volume: string): boolean {
   return source === '/var/run/docker.sock' || source === '/' || source.startsWith('/etc') || source.startsWith('/var/run');
 }
 
+function canExposeHostPorts(service: InfrastructureService): boolean {
+  return service.kind === 'reverse-proxy';
+}
+
+function stripDisallowedHostPorts(service: InfrastructureService): InfrastructureService {
+  if (canExposeHostPorts(service) || !service.ports?.length) return service;
+  const { ports: _removedPorts, ...rest } = service;
+  return rest;
+}
+
+function stripDisallowedHostPortsFromSpec(spec: InfrastructureSpec): InfrastructureSpec {
+  return {
+    ...spec,
+    services: spec.services.map(stripDisallowedHostPorts),
+  };
+}
+
 function applyResolvedPatch(
   spec: InfrastructureSpec,
   patch: SpecPatch,
@@ -168,11 +179,12 @@ function applyResolvedPatch(
 
   if (patch.op === 'add-service') {
     if (spec.services.some((service) => service.name === patch.service.name)) return spec;
+    const service = stripDisallowedHostPorts(cloneService(patch.service));
     return {
       ...spec,
-      services: [...spec.services, cloneService(patch.service)],
+      services: [...spec.services, service],
       networks: spec.networks.length > 0 ? spec.networks : ['app-network'],
-      volumes: unique([...spec.volumes, ...declaredNamedVolumes(patch.service.volumes ?? [])]),
+      volumes: unique([...spec.volumes, ...declaredNamedVolumes(service.volumes ?? [])]),
     };
   }
 

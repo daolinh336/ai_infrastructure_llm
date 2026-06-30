@@ -20,8 +20,12 @@ function stripComposeReplicaSuffix(name: string): string {
   return name.replace(/[-_][1-9][0-9]*$/, '');
 }
 
-function normalizeObservedResourceName(name: string, projectName: string): string {
+function normalizeObservedContainerName(name: string, projectName: string): string {
   return stripComposeReplicaSuffix(stripProjectPrefix(name, projectName));
+}
+
+function normalizeObservedResourceName(name: string, projectName: string): string {
+  return stripProjectPrefix(name, projectName);
 }
 
 function isRunningStatus(status: string | null): boolean {
@@ -57,12 +61,12 @@ export function buildDriftReport(
     const replicas = service.replicas ?? 1;
     const matches = actual.containers.filter((container) =>
       expectedNames.includes(container.name) ||
-      (replicas <= 1 && normalizeObservedResourceName(container.name, desired.projectName) === service.name),
+      (replicas <= 1 && normalizeObservedContainerName(container.name, desired.projectName) === service.name),
     );
     const missingNames = expectedNames.filter(
       (expectedName) => !matches.some((container) =>
         container.name === expectedName ||
-        (replicas <= 1 && normalizeObservedResourceName(container.name, desired.projectName) === service.name),
+        (replicas <= 1 && normalizeObservedContainerName(container.name, desired.projectName) === service.name),
       ),
     );
 

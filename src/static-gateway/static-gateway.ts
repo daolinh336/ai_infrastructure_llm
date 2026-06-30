@@ -338,7 +338,7 @@ function normalizeDraftQueryCandidate(
       isStaticIntent(value.intent) || value.intent === null
         ? value.intent
         : classification.intent,
-    services: servicesCandidate.map(normalizeDraftServiceCandidate),
+    services: servicesCandidate.map((service) => normalizeDraftServiceCandidate(service, prompt)),
     destructive:
       typeof value.destructive === 'boolean' ? value.destructive : false,
     missingInformation: Array.isArray(value.missingInformation)
@@ -349,14 +349,17 @@ function normalizeDraftQueryCandidate(
   };
 }
 
-function normalizeDraftServiceCandidate(value: unknown): DraftServiceQuery {
+function normalizeDraftServiceCandidate(value: unknown, prompt: string): DraftServiceQuery {
   const record = isRecord(value) ? value : {};
   const image = getNullableString(record.image ?? record.technology);
+  const port = promptMentionsPort(prompt)
+    ? getNullableInteger(record.port ?? getFirstPortCandidate(record.ports))
+    : null;
 
   return {
     name: getNullableString(record.name),
     image,
-    port: getNullableInteger(record.port ?? getFirstPortCandidate(record.ports)),
+    port,
     replicas: getNullableInteger(record.replicas),
     requestedMounts: Array.isArray(record.requestedMounts)
       ? record.requestedMounts.filter(
@@ -370,6 +373,10 @@ function normalizeDraftServiceCandidate(value: unknown): DraftServiceQuery {
     cpu: getNullableNumber(record.cpu),
     memoryGb: getNullableNumber(record.memoryGb),
   };
+}
+
+function promptMentionsPort(prompt: string): boolean {
+  return /\b(?:port|ports|expose|publish|published)\b|c[oôổ]ng/i.test(prompt);
 }
 
 function getFirstPortCandidate(value: unknown): unknown {

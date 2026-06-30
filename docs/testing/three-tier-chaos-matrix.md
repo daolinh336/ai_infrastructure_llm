@@ -6,14 +6,14 @@ This catalog backs `tests/three-tier-chaos-pipeline.test.ts` and validates the n
 
 ## Boundary Matrix
 
-| Case | Values | Expected behavior |
-| --- | --- | --- |
-| Small matrix | `a=2,b=2,c=2` | 6 real containers deploy, observe cleanly, and destroy. |
-| Medium matrix | `a=3,b=3,c=3` | 9 real containers deploy with Postgres -> Node.js -> Nginx ordering. |
-| Larger matrix | `a=4,b=4,c=4` | 12 real containers validate deterministic names and actual runtime drift checks. |
-| Max requested matrix | `a=5,b=5,c=5` | 15 real containers deploy, observe, and cleanup through MCP. |
-| Fixed-port collision guard | `a=2,b=2,c=2` with Nginx `80:80` | Rejected before Docker mutation because replicated services cannot publish fixed host ports. |
-| Repair pipeline | `a=2,b=3,c=2` | Deploys real containers, deletes one backend, detects drift, repairs it, then destroys all managed resources. |
+| Case                       | Values                           | Expected behavior                                                                                             |
+| -------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Small matrix               | `a=2,b=2,c=2`                    | 6 real containers deploy, observe cleanly, and destroy.                                                       |
+| Medium matrix              | `a=3,b=3,c=3`                    | 9 real containers deploy with Postgres -> Node.js -> Nginx ordering.                                          |
+| Larger matrix              | `a=4,b=4,c=4`                    | 12 real containers validate deterministic names and actual runtime drift checks.                              |
+| Max requested matrix       | `a=5,b=5,c=5`                    | 15 real containers deploy, observe, and cleanup through MCP.                                                  |
+| Fixed-port collision guard | `a=2,b=2,c=2` with Nginx `80:80` | Rejected before Docker mutation because replicated services cannot publish fixed host ports.                  |
+| Repair pipeline            | `a=2,b=3,c=2`                    | Deploys real containers, deletes one backend, detects drift, repairs it, then destroys all managed resources. |
 
 ## Dependency Assertions
 
@@ -26,12 +26,12 @@ This catalog backs `tests/three-tier-chaos-pipeline.test.ts` and validates the n
 
 ## Real Docker Chaos Injection Scenarios
 
-| Scenario | Injection | Expected invariant |
-| --- | --- | --- |
-| Replicated fixed port race | `a=2,b=2,c=2` with Nginx `80:80` | Deploy is blocked before any real Docker resources are created. |
-| Missing backend replica | Remove `matrix-real-2-3-2-api-2` using MCP after deploy | Drift reports missing container; repair recreates that replica only. |
-| Full lifecycle | Deploy -> observe/status -> drift -> repair -> destroy | Desired state matches actual after repair; containers are absent after destroy. |
-| Scale pressure | Deploy 6, 9, 12, and 15 containers sequentially | Names, images, networks, and dependency order remain deterministic. |
+| Scenario                   | Injection                                               | Expected invariant                                                              |
+| -------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| Replicated fixed port race | `a=2,b=2,c=2` with Nginx `80:80`                        | Deploy is blocked before any real Docker resources are created.                 |
+| Missing backend replica    | Remove `matrix-real-2-3-2-api-2` using MCP after deploy | Drift reports missing container; repair recreates that replica only.            |
+| Full lifecycle             | Deploy -> observe/status -> drift -> repair -> destroy  | Desired state matches actual after repair; containers are absent after destroy. |
+| Scale pressure             | Deploy 6, 9, 12, and 15 containers sequentially         | Names, images, networks, and dependency order remain deterministic.             |
 
 ## LLM Context Prompts for Manual Agent Stress
 

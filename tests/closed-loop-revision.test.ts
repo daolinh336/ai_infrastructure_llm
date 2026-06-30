@@ -208,6 +208,29 @@ class RawPatchStubLlmProvider extends StubLlmProvider {
   }
 }
 
+class MisparsedQuantityAsPortStubLlmProvider extends StubLlmProvider {
+  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+    if (input.schemaName === 'draft_query') {
+      return {
+        text: JSON.stringify({
+          raw: 'tao cho toi 1 web dung ngix, 2 backend nodejs va 3 db dung postresql',
+          normalizedPrompt: 'tao cho toi 1 web dung ngix, 2 backend nodejs va 3 db dung postresql',
+          intent: 'create',
+          services: [
+            { name: 'web', image: 'ngix', port: null, replicas: 1, requestedMounts: [], privileged: null, networkMode: null, pidMode: null, ipcMode: null, cpu: null, memoryGb: null },
+            { name: 'backend', image: 'nodejs', port: 0, replicas: 2, requestedMounts: [], privileged: null, networkMode: null, pidMode: null, ipcMode: null, cpu: null, memoryGb: null },
+            { name: 'db', image: 'postresql', port: 0, replicas: 3, requestedMounts: [], privileged: null, networkMode: null, pidMode: null, ipcMode: null, cpu: null, memoryGb: null },
+          ],
+          destructive: false,
+          missingInformation: [],
+        }),
+      };
+    }
+
+    return super.completeStructured(input);
+  }
+}
+
 class MalformedDatabaseFeedbackIntentStubLlmProvider extends StubLlmProvider {
   override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'feedback_intent') {
@@ -294,6 +317,20 @@ describe('StaticGateway topology clarification', () => {
       expect.objectContaining({ image: 'node', replicas: 2 }),
       expect.objectContaining({ image: 'postgres', replicas: 3 }),
     ]);
+  });
+
+  it('ignores quantity numbers misparsed as ports when prompt has no port keyword', async () => {
+    const gateway = new StaticGateway(new MisparsedQuantityAsPortStubLlmProvider());
+
+    const result = await gateway.validate(
+      'tao cho toi 1 web dung ngix, 2 backend nodejs va 3 db dung postresql',
+    );
+
+    expect(result.status).toBe('validated');
+    if (result.status !== 'validated') {
+      throw new Error(`Expected validated, got ${result.status}: ${result.issues.join(', ')}`);
+    }
+    expect(result.validatedQuery.draft.services.map((service) => service.port)).toEqual([null, null, null]);
   });
 
   it('rejects harmful create requests before ReAct planning starts', async () => {
@@ -529,6 +566,34 @@ describe('ReAct planning uncertainty gate', () => {
     expect(result.plan.spec.services.find((service) => service.name === 'api')?.dependsOn).toEqual([
       'db',
     ]);
+  });
+
+  it('does not put host ports in source spec except reverse-proxy services', async () => {
+    const agent = new ReActAgent(
+      new StubLlmProvider('stub'),
+      undefined,
+      {},
+      undefined,
+      undefined,
+      { logEnabled: false },
+    );
+
+    const result = await agent.run(
+      makeValidatedQuery([
+        serviceHint({ name: 'web', image: 'nginx', port: 8080 }),
+        serviceHint({ name: 'api', image: 'node', port: 3000 }),
+        serviceHint({ name: 'db', image: 'postgres', port: 5432 }),
+      ]),
+    );
+
+    expect(result.status).toBe('planned');
+    if (result.status !== 'planned') {
+      throw new Error(`Expected planned, got ${result.status}`);
+    }
+
+    expect(result.plan.spec.services.find((service) => service.name === 'web')?.ports).toEqual(['8080:80']);
+    expect(result.plan.spec.services.find((service) => service.name === 'api')?.ports).toBeUndefined();
+    expect(result.plan.spec.services.filter((service) => service.kind === 'database').every((service) => service.ports === undefined)).toBe(true);
   });
 });
 

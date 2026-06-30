@@ -255,6 +255,44 @@ describe('StandardVerifierAgent', () => {
     expect(dependency?.evidence.join(' ')).toContain('sample-infra-postgres-2');
   });
 
+  it('does not treat numbered volume names as missing replica resources', async () => {
+    const desired: InfrastructureSpec = {
+      projectName: 'sample-infra',
+      services: [
+        {
+          kind: 'database',
+          name: 'postgres-1',
+          image: 'postgres:16',
+          volumes: ['postgres-data-1:/var/lib/postgresql/data'],
+        },
+      ],
+      networks: ['app-network'],
+      volumes: ['postgres-data-1'],
+    };
+    const actual: RuntimeActualState = {
+      source: 'mcp-readonly',
+      containers: [
+        {
+          name: 'sample-infra-postgres-1',
+          image: 'postgres:16',
+          status: 'running',
+          ports: [],
+          environment: {},
+          healthStatus: 'healthy',
+        },
+      ],
+      networks: [{ name: 'app-network', status: 'bridge' }],
+      volumes: [{ name: 'postgres-data-1', status: 'local' }],
+      images: [{ reference: 'postgres:16', id: 'sha256:postgres', status: null }],
+      lastObservedAt: new Date(0).toISOString(),
+    };
+
+    const report = await new StandardVerifierAgent().verify(desired, new FakeVerifierRuntimeReader(actual));
+
+    expect(report.findings?.some((finding) => finding.code === 'VOLUME_MISMATCH')).toBe(false);
+    expect(report.status).toBe('passed');
+  });
+
   it('reads bounded logs for stopped containers and asks for user input', async () => {
     const actual: RuntimeActualState = {
       source: 'mcp-readonly',

@@ -60,6 +60,23 @@ describe('compose replicas rendering and scale warnings', () => {
     expect(preview.services.every((service) => service.replicas === 1)).toBe(true);
     expect(preview.volumes).toEqual(['postgres-data-1', 'postgres-data-2']);
   });
+
+  it('renders host ports only for reverse-proxy services', () => {
+    const parsed = YAML.parse(renderCompose({
+      projectName: 'sample-infra',
+      services: [
+        { kind: 'reverse-proxy', name: 'nginx', image: 'nginx:stable', ports: ['80:80'] },
+        { kind: 'backend', name: 'api', image: 'node:20-alpine', ports: ['3000:3000'] },
+        { kind: 'database', name: 'postgres', image: 'postgres:16', ports: ['5432:5432'] },
+      ],
+      networks: ['app-network'],
+      volumes: [],
+    })) as { services: Record<string, { ports?: string[] }> };
+
+    expect(parsed.services.nginx?.ports).toEqual(['80:80']);
+    expect(parsed.services.api?.ports).toBeUndefined();
+    expect(parsed.services.postgres?.ports).toBeUndefined();
+  });
 });
 
 function baseSpec(): InfrastructureSpec {
