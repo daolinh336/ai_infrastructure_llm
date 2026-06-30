@@ -9,3 +9,11 @@ coverage/
 
 *.txt
 29-5-2026.txt
+
+
+docs/
+
+
+AGENTS.md
+ReAct.pdf
+tests/
