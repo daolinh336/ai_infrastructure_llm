@@ -546,8 +546,19 @@ export type FeedbackIntentName =
   | 'change-replicas'
   | 'change-image'
   | 'change-env'
+  | 'remove-env'
   | 'change-volume'
+  | 'remove-volume'
+  | 'change-dependency'
+  | 'remove-dependency'
   | 'change-network'
+  | 'rename-network'
+  | 'set-networks'
+  | 'add-service'
+  | 'remove-service'
+  | 'rename-service'
+  | 'change-status'
+  | 'change-project'
   | 'remove-exposure'
   | 'yaml-edit-intent'
   | 'retry-as-is'
@@ -572,6 +583,9 @@ export interface FeedbackIntent {
     environment?: Record<string, string>;
     volumes?: string[];
     networks?: string[];
+    dependencies?: string[];
+    desiredStatus?: NonNullable<InfrastructureService['desiredStatus']>;
+    service?: InfrastructureService;
     yamlFragment?: string;
   };
   confidence: number;
@@ -580,6 +594,7 @@ export interface FeedbackIntent {
 }
 
 export interface ServiceSelector {
+  targetKind?: 'service' | 'replica-group';
   name?: string;
   nameLike?: string;
   kind?: InfrastructureService['kind'];

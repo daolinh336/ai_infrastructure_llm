@@ -209,7 +209,10 @@ export const clarificationAnswerSchema = z
 export const planningClarificationContextSchema = z
   .object({
     query: validatedQuerySchema,
-    spec: z.lazy(() => infrastructureSpecSchema),
+    spec: z.custom<InfrastructureSpec>(
+      (value) => provisionalInfrastructureSpecSchema.safeParse(value).success,
+      'Invalid provisional infrastructure spec.',
+    ),
     assumptions: z.array(z.string().min(1)),
     uncertainties: z.array(planningUncertaintySchema).min(1),
   })
@@ -361,6 +364,15 @@ export const infrastructureSpecSchema = z
       }
     });
   });
+
+const provisionalInfrastructureSpecSchema = z
+  .object({
+    projectName: identifierSchema,
+    services: z.array(infrastructureServiceSchema).min(1, 'At least one service is required.'),
+    networks: z.array(identifierSchema),
+    volumes: z.array(identifierSchema),
+  })
+  .strict();
 
 export const planStepSchema = z
   .object({
@@ -1205,8 +1217,19 @@ const feedbackIntentSchema = z
       'change-replicas',
       'change-image',
       'change-env',
+      'remove-env',
       'change-volume',
+      'remove-volume',
+      'change-dependency',
+      'remove-dependency',
       'change-network',
+      'rename-network',
+      'set-networks',
+      'add-service',
+      'remove-service',
+      'rename-service',
+      'change-status',
+      'change-project',
       'remove-exposure',
       'yaml-edit-intent',
       'retry-as-is',
@@ -1233,6 +1256,9 @@ const feedbackIntentSchema = z
         environment: z.record(z.string(), z.string()).optional(),
         volumes: z.array(z.string().min(1)).optional(),
         networks: z.array(z.string().min(1)).optional(),
+        dependencies: z.array(identifierSchema).optional(),
+        desiredStatus: z.enum(['running', 'stopped']).optional(),
+        service: z.lazy(() => infrastructureServiceSchema).optional(),
         yamlFragment: z.string().min(1).optional(),
       })
       .strict()
@@ -1245,6 +1271,7 @@ const feedbackIntentSchema = z
 
 const serviceSelectorSchema = z
   .object({
+    targetKind: z.enum(['service', 'replica-group']).optional(),
     name: identifierSchema.optional(),
     nameLike: z.string().min(1).optional(),
     kind: z.enum(['reverse-proxy', 'backend', 'database']).optional(),
@@ -1255,7 +1282,7 @@ const serviceSelectorSchema = z
   })
   .strict()
   .superRefine((selector, context) => {
-    if (Object.keys(selector).length === 0) {
+    if (Object.keys(selector).filter((key) => key !== 'targetKind').length === 0) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['root'],

@@ -14,6 +14,7 @@ import type {
 } from '../domain/types.js';
 import { getRuntimeKeepaliveCommand, renderCompose } from '../compose/render-compose.js';
 import { resolveSecrets, type SecretResolutionResult } from '../compose/secret-resolver.js';
+import { repairExposedSecrets } from '../compose/secret-policy-repair.js';
 import { writeGeneratedSecretsFile } from '../compose/generated-secrets-writer.js';
 import { validateAgentRunResult } from '../domain/schemas.js';
 import {
@@ -22,7 +23,6 @@ import {
 } from '../domain/stateful-database-volumes.js';
 import {
   createPendingPreviewState,
-  loadState,
   saveApprovalRejection,
   saveApprovedAction,
   savePendingPreview as persistPendingPreview,
@@ -126,18 +126,22 @@ export class ExecutionEngine {
       throw new Error('Execution requires a planned agent result.');
     }
 
-    const previousState = await loadState(this.options.stateStore);
-    const previousSpec =
-      previousState?.current?.desired ?? previousState?.pendingPreview?.desired ?? null;
-    const secretResolution = resolveSecrets(validResult.plan.spec, previousSpec);
+    const secretResolution = resolveSecrets(validResult.plan.spec);
+    const secretRepair = repairExposedSecrets(secretResolution.updatedSpec, secretResolution);
     const resolvedPlan = {
       ...validResult.plan,
-      spec: normalizeStatefulDatabaseReplicaVolumes(secretResolution.updatedSpec),
+      spec: normalizeStatefulDatabaseReplicaVolumes(secretRepair.updatedSpec),
     };
 
     const composeYaml = renderCompose(resolvedPlan.spec);
     const schedule = buildDependencyAwareExecutionSchedule(resolvedPlan.spec);
-    const dryRunPreview = buildDetailedDryRunPreview(resolvedPlan, composeYaml, schedule);
+    const dryRunPreview = buildDetailedDryRunPreview(
+      resolvedPlan,
+      composeYaml,
+      schedule,
+      secretResolution,
+      secretRepair,
+    );
     const pendingPreview = createPendingPreviewState({
       request: validResult.request,
       plan: resolvedPlan,

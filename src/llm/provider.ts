@@ -17,6 +17,7 @@ import {
 
 export const DEFAULT_OPENAI_AUX_MODEL = 'gpt-5.4-mini';
 export const DEFAULT_OPENAI_REACT_MODEL = 'gpt-5.4-mini';
+export const DEFAULT_OPENAI_TEMPERATURE = 0.1;
 export const DEFAULT_GEMINI_AUX_MODEL = 'gemini-2.5-flash';
 export const DEFAULT_GEMINI_REACT_MODEL = 'gemini-2.5-flash';
 export const DEFAULT_GEMINI_BASE_URL =
@@ -48,6 +49,7 @@ export interface OpenAiProviderConfig {
   apiKey: string;
   auxiliaryModel: string;
   reactModel: string;
+  temperature: number;
   baseURL?: string | undefined;
 }
 
@@ -62,6 +64,7 @@ export interface OpenAiResponseCreateInput {
   model: string;
   instructions: string;
   input: string;
+  temperature: number;
   text?: {
     format: {
       type: 'json_schema';
@@ -207,6 +210,7 @@ export class OpenAiLlmProvider implements LlmProvider {
       model: this.getModelForPurpose(input.purpose ?? 'react'),
       instructions: input.system,
       input: input.user,
+      temperature: this.config.temperature,
     });
 
     return {
@@ -219,6 +223,7 @@ export class OpenAiLlmProvider implements LlmProvider {
       model: this.getModelForPurpose(input.purpose),
       instructions: input.system,
       input: input.user,
+      temperature: this.config.temperature,
       text: {
         format: {
           type: 'json_schema',
@@ -249,6 +254,9 @@ function normalizeOpenAiStructuredOutputSchema(schema: JsonSchema): JsonSchema {
   }
 
   const normalized: JsonSchema = { ...schema };
+  const originalRequired = Array.isArray(schema.required)
+    ? new Set(schema.required.filter((value): value is string => typeof value === 'string'))
+    : new Set<string>();
 
   for (const keyword of ['properties', 'items', 'anyOf', 'oneOf', 'allOf']) {
     const value = normalized[keyword];
@@ -263,12 +271,18 @@ function normalizeOpenAiStructuredOutputSchema(schema: JsonSchema): JsonSchema {
     if (isJsonSchemaObject(value)) {
       if (keyword === 'properties') {
         normalized[keyword] = Object.fromEntries(
-          Object.entries(value).map(([propertyName, propertySchema]) => [
-            propertyName,
-            isJsonSchemaObject(propertySchema)
+          Object.entries(value).map(([propertyName, propertySchema]) => {
+            const normalizedProperty = isJsonSchemaObject(propertySchema)
               ? normalizeOpenAiStructuredOutputSchema(propertySchema)
-              : propertySchema,
-          ]),
+              : propertySchema;
+
+            return [
+              propertyName,
+              originalRequired.has(propertyName) || !isJsonSchemaObject(normalizedProperty)
+                ? normalizedProperty
+                : makeOpenAiOptionalPropertyNullable(normalizedProperty),
+            ];
+          }),
         );
       } else {
         normalized[keyword] = normalizeOpenAiStructuredOutputSchema(value);
@@ -278,9 +292,16 @@ function normalizeOpenAiStructuredOutputSchema(schema: JsonSchema): JsonSchema {
 
   if (normalized.type === 'object') {
     normalized.additionalProperties = false;
+    if (isJsonSchemaObject(normalized.properties)) {
+      normalized.required = Object.keys(normalized.properties);
+    }
   }
 
   return normalized;
+}
+
+function makeOpenAiOptionalPropertyNullable(schema: JsonSchema): JsonSchema {
+  return schema.nullable === true ? schema : { ...schema, nullable: true };
 }
 
 function isJsonSchemaObject(value: unknown): value is JsonSchema {
@@ -459,8 +480,27 @@ export function createOpenAiConfig(
     apiKey,
     auxiliaryModel: env.OPENAI_AUX_MODEL?.trim() || DEFAULT_OPENAI_AUX_MODEL,
     reactModel: env.OPENAI_REACT_MODEL?.trim() || DEFAULT_OPENAI_REACT_MODEL,
+    temperature: parseOpenAiTemperature(env.OPENAI_TEMPERATURE),
     baseURL: env.OPENAI_BASE_URL?.trim() || undefined,
   };
+}
+
+function parseOpenAiTemperature(value: string | undefined): number {
+  const trimmedValue = value?.trim();
+
+  if (!trimmedValue) {
+    return DEFAULT_OPENAI_TEMPERATURE;
+  }
+
+  const temperature = Number(trimmedValue);
+
+  if (!Number.isFinite(temperature) || temperature < 0 || temperature > 2) {
+    throw new ProviderConfigurationError(
+      'OPENAI_TEMPERATURE must be a number between 0 and 2.',
+    );
+  }
+
+  return temperature;
 }
 
 export function createGeminiConfig(

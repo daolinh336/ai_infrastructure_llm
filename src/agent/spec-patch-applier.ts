@@ -42,6 +42,12 @@ function resolvePatchTargets(
     return { matchedServices: [], blockedReason: null };
   }
 
+  if (patch.op === 'set-service-replicas' && patch.target.targetKind === 'replica-group') {
+    const databaseGroup = resolveStatefulDatabaseReplicaGroup(spec, patch.target, []);
+    if (databaseGroup !== null) return { matchedServices: databaseGroup.services, blockedReason: null };
+    return { matchedServices: [], blockedReason: 'No matching replica group for selector.' };
+  }
+
   const matches = resolveServiceSelector(spec, patch.target);
   if (matches.length === 0) {
     if (patch.op === 'set-service-replicas' && resolveStatefulDatabaseReplicaGroup(spec, patch.target, []) !== null) {
@@ -241,66 +247,71 @@ function applyResolvedPatch(
     });
   }
 
+  const services = spec.services.map((service) => {
+    if (service.name !== target.name) return service;
+
+    if (patch.op === 'set-service-replicas') {
+      return { ...service, replicas: patch.replicas };
+    }
+    if (patch.op === 'replace-service-port') {
+      const existingPorts = service.ports ?? [];
+      const ports = patch.from
+        ? existingPorts.map((port) => (port === patch.from ? patch.to : port))
+        : existingPorts.length > 0
+          ? existingPorts.map((port, index) => (index === 0 ? patch.to : port))
+          : [patch.to];
+      return { ...service, ports: unique(ports) };
+    }
+    if (patch.op === 'add-service-port') {
+      return { ...service, ports: unique([...(service.ports ?? []), patch.port]) };
+    }
+    if (patch.op === 'remove-service-port') {
+      const ports = patch.port ? (service.ports ?? []).filter((port) => port !== patch.port) : [];
+      const { ports: _removedPorts, ...rest } = service;
+      return ports.length > 0 ? { ...service, ports } : rest;
+    }
+    if (patch.op === 'set-service-image') {
+      return { ...service, kind: inferServiceKind(patch.image), image: patch.image };
+    }
+    if (patch.op === 'set-service-env') {
+      return { ...service, environment: { ...(service.environment ?? {}), [patch.key]: patch.value } };
+    }
+    if (patch.op === 'remove-service-env') {
+      if (!service.environment?.[patch.key]) return service;
+      const environment = { ...service.environment };
+      delete environment[patch.key];
+      const { environment: _removedEnv, ...rest } = service;
+      return Object.keys(environment).length > 0 ? { ...service, environment } : rest;
+    }
+    if (patch.op === 'add-service-volume') {
+      return { ...service, volumes: unique([...(service.volumes ?? []), patch.volume]) };
+    }
+    if (patch.op === 'remove-service-volume') {
+      const volumes = (service.volumes ?? []).filter((volume) => volume !== patch.volume);
+      const { volumes: _removedVolumes, ...rest } = service;
+      return volumes.length > 0 ? { ...service, volumes } : rest;
+    }
+    if (patch.op === 'add-service-dependency') {
+      return { ...service, dependsOn: unique([...(service.dependsOn ?? []), patch.dependencyName]) };
+    }
+    if (patch.op === 'remove-service-dependency') {
+      const dependsOn = (service.dependsOn ?? []).filter((dependency) => dependency !== patch.dependencyName);
+      const { dependsOn: _removedDependsOn, ...rest } = service;
+      return dependsOn.length > 0 ? { ...service, dependsOn } : rest;
+    }
+    if (patch.op === 'set-service-desired-status') {
+      return { ...service, desiredStatus: patch.desiredStatus };
+    }
+
+    return service;
+  });
+
   return {
     ...spec,
-    services: spec.services.map((service) => {
-      if (service.name !== target.name) return service;
-
-      if (patch.op === 'set-service-replicas') {
-        return { ...service, replicas: patch.replicas };
-      }
-      if (patch.op === 'replace-service-port') {
-        const existingPorts = service.ports ?? [];
-        const ports = patch.from
-          ? existingPorts.map((port) => (port === patch.from ? patch.to : port))
-          : existingPorts.length > 0
-            ? existingPorts.map((port, index) => (index === 0 ? patch.to : port))
-            : [patch.to];
-        return { ...service, ports: unique(ports) };
-      }
-      if (patch.op === 'add-service-port') {
-        return { ...service, ports: unique([...(service.ports ?? []), patch.port]) };
-      }
-      if (patch.op === 'remove-service-port') {
-        const ports = patch.port ? (service.ports ?? []).filter((port) => port !== patch.port) : [];
-        const { ports: _removedPorts, ...rest } = service;
-        return ports.length > 0 ? { ...service, ports } : rest;
-      }
-      if (patch.op === 'set-service-image') {
-        return { ...service, kind: inferServiceKind(patch.image), image: patch.image };
-      }
-      if (patch.op === 'set-service-env') {
-        return { ...service, environment: { ...(service.environment ?? {}), [patch.key]: patch.value } };
-      }
-      if (patch.op === 'remove-service-env') {
-        if (!service.environment?.[patch.key]) return service;
-        const environment = { ...service.environment };
-        delete environment[patch.key];
-        const { environment: _removedEnv, ...rest } = service;
-        return Object.keys(environment).length > 0 ? { ...service, environment } : rest;
-      }
-      if (patch.op === 'add-service-volume') {
-        return { ...service, volumes: unique([...(service.volumes ?? []), patch.volume]) };
-      }
-      if (patch.op === 'remove-service-volume') {
-        const volumes = (service.volumes ?? []).filter((volume) => volume !== patch.volume);
-        const { volumes: _removedVolumes, ...rest } = service;
-        return volumes.length > 0 ? { ...service, volumes } : rest;
-      }
-      if (patch.op === 'add-service-dependency') {
-        return { ...service, dependsOn: unique([...(service.dependsOn ?? []), patch.dependencyName]) };
-      }
-      if (patch.op === 'remove-service-dependency') {
-        const dependsOn = (service.dependsOn ?? []).filter((dependency) => dependency !== patch.dependencyName);
-        const { dependsOn: _removedDependsOn, ...rest } = service;
-        return dependsOn.length > 0 ? { ...service, dependsOn } : rest;
-      }
-      if (patch.op === 'set-service-desired-status') {
-        return { ...service, desiredStatus: patch.desiredStatus };
-      }
-
-      return service;
-    }),
+    services,
+    ...(patch.op === 'add-service-volume'
+      ? { volumes: unique([...spec.volumes, ...declaredNamedVolumes([patch.volume])]) }
+      : {}),
   };
 }
 
@@ -351,6 +362,7 @@ function matchesReplicaGroupSelector(
   matchedServices: InfrastructureService[],
 ): boolean {
   const imageFamilies = new Set(group.services.map((service) => imageFamily(service.image)));
+  if (selector.targetKind === 'service') return false;
   if (selector.name && selector.name !== group.baseName && !group.services.some((service) => service.name === selector.name)) return false;
   if (selector.nameLike) {
     const needle = selector.nameLike.toLowerCase();
@@ -373,6 +385,23 @@ function resizeStatefulDatabaseReplicaGroup(
   const groupNames = new Set(group.services.map((service) => service.name));
   const groupVolumeSources = new Set(group.services.flatMap((service) => (service.volumes ?? []).map(mountSource)));
   const first = group.services[0]!;
+
+  if (replicas === 1) {
+    const keptService = toSinglePhysicalDatabaseService(first, groupNames);
+    const services = spec.services.flatMap((service) => {
+      if (groupNames.has(service.name)) return service.name === first.name ? [keptService] : [];
+      return [rewriteServiceDependencies(service, groupNames, first.name)];
+    });
+    return {
+      ...spec,
+      services,
+      volumes: unique([
+        ...spec.volumes.filter((volume) => !groupVolumeSources.has(volume)),
+        ...declaredNamedVolumes(keptService.volumes ?? []),
+      ]),
+    };
+  }
+
   const logicalDatabase = toLogicalDatabaseService(first, group.baseName, replicas, groupNames);
   let inserted = false;
   const logicalServices = spec.services.flatMap((service) => {
@@ -385,11 +414,32 @@ function resizeStatefulDatabaseReplicaGroup(
     return [rewriteServiceDependencies(service, groupNames, group.baseName)];
   });
 
-  return expandStatefulDatabaseReplicas({
+  const resized = expandStatefulDatabaseReplicas({
     ...spec,
     services: logicalServices,
     volumes: spec.volumes.filter((volume) => !groupVolumeSources.has(volume)),
   });
+
+  return {
+    ...resized,
+    volumes: unique([
+      ...resized.volumes,
+      ...resized.services.flatMap((service) => declaredNamedVolumes(service.volumes ?? [])),
+    ]),
+  };
+}
+
+function toSinglePhysicalDatabaseService(
+  service: InfrastructureService,
+  groupNames: Set<string>,
+): InfrastructureService {
+  const { replicas: _replicas, ...rest } = cloneService(service);
+  const dependsOn = (rest.dependsOn ?? []).filter((dependency) => !groupNames.has(dependency));
+  const { dependsOn: _dependsOn, ...serviceWithoutDependsOn } = rest;
+  return {
+    ...serviceWithoutDependsOn,
+    ...(dependsOn.length > 0 ? { dependsOn } : {}),
+  };
 }
 
 function toLogicalDatabaseService(

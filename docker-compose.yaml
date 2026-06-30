@@ -1,31 +1,31 @@
 services:
-  web:
+  nginx:
     image: nginx:stable
     restart: unless-stopped
     deploy:
       replicas: 1
     ports:
-      - 64:80
+      - 80:80
     environment: {}
     depends_on:
-      - backend
+      - api
     networks:
       - app-network
-  backend:
+  api:
     image: node:20-alpine
     restart: unless-stopped
     deploy:
       replicas: 2
     environment: {}
     depends_on:
-      - db-1
+      - postgres-1
     command:
       - tail
       - -f
       - /dev/null
     networks:
       - app-network
-  db-1:
+  postgres-1:
     image: postgres:16
     restart: unless-stopped
     deploy:
@@ -33,55 +33,9 @@ services:
     environment:
       POSTGRES_DB: app
       POSTGRES_USER: abcabcabc
-      POSTGRES_PASSWORD: abcabcabc
+      POSTGRES_PASSWORD: pw-bf687965917e65b38f8817df
     volumes:
-      - db-data-1:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - pg_isready -U app
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - app-network
-  db-2:
-    image: postgres:16
-    restart: unless-stopped
-    deploy:
-      replicas: 1
-    environment:
-      POSTGRES_DB: app
-      POSTGRES_USER: abcabcabc
-      POSTGRES_PASSWORD: abcabcabc
-    depends_on:
-      - db-1
-    volumes:
-      - db-data-2:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - pg_isready -U app
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - app-network
-  db-3:
-    image: postgres:16
-    restart: unless-stopped
-    deploy:
-      replicas: 1
-    environment:
-      POSTGRES_DB: app
-      POSTGRES_USER: abcabcabc
-      POSTGRES_PASSWORD: abcabcabc
-    depends_on:
-      - db-1
-    volumes:
-      - db-data-3:/var/lib/postgresql/data
+      - postgres-data-1:/var/lib/postgresql/data
     healthcheck:
       test:
         - CMD-SHELL
@@ -95,6 +49,4 @@ services:
 networks:
   app-network: {}
 volumes:
-  db-data-1: {}
-  db-data-2: {}
-  db-data-3: {}
+  postgres-data-1: {}

@@ -15,7 +15,7 @@ import type {
 } from '../domain/types.js';
 import { validateFeedbackIntent, validateInfrastructureSpec, validateSpecPatchPlan } from '../domain/schemas.js';
 import { feedbackIntentJsonSchema, specPatchPlanJsonSchema } from '../domain/structured-output-schemas.js';
-import { expandStatefulDatabaseReplicas } from '../domain/stateful-database-volumes.js';
+import { expandStatefulDatabaseReplicas, isStatefulDatabaseService } from '../domain/stateful-database-volumes.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import type { PlannerAgent } from './agent-interfaces.js';
 import { applySpecPatchPlan, resolveServiceSelector } from './spec-patch-applier.js';
@@ -123,6 +123,18 @@ export class StandardPlannerAgent implements PlannerAgent {
           patchPlan = deterministicPatchPlan;
         }
       }
+      if (patchPlan !== null && obs.userFeedback !== null) {
+        const normalizedPatchPlan = normalizeStatefulDatabaseReplicaPatchPlan(
+          spec,
+          patchPlan,
+          obs.userFeedback.message,
+          feedbackIntent,
+        );
+        if (normalizedPatchPlan !== patchPlan) {
+          patchPlan = normalizedPatchPlan;
+          assumptions.push('Revision patch source: normalized stateful database total/group feedback to a logical database replica patch.');
+        }
+      }
       if (patchPlan !== null && (patchPlan.patches.length > 0 || isServiceTargetAmbiguityPatchPlan(patchPlan))) {
         const plannedRevision = applySpecPatchPlan(spec, patchPlan.patches, {
           allowBlockedPatchOps: extractAllowedPatchOps(issues),
@@ -218,7 +230,9 @@ export class StandardPlannerAgent implements PlannerAgent {
       const userPayload = JSON.stringify({
         attemptIndex: request.attemptIndex,
         projectName: spec.projectName,
-        serviceCatalog: buildRevisionServiceCatalog(spec),
+        logicalServiceCatalog: buildLogicalRevisionServiceCatalog(spec),
+        physicalServiceCatalog: buildPhysicalRevisionServiceCatalog(spec),
+        serviceCatalog: buildLogicalRevisionServiceCatalog(spec),
         databaseReplicaGroups: buildDatabaseReplicaGroups(spec),
         verifierObservation: buildVerifierObservationContext(request.revisionObservation),
         userFeedback: request.revisionObservation.userFeedback,
@@ -244,6 +258,7 @@ export class StandardPlannerAgent implements PlannerAgent {
           targetResolution: 'Prefer selectors by exact name, nameLike, kind, imageFamily, exposesHostPort, dependsOn, dependentOf instead of guessing a concrete name when the user uses an alias.',
           portInference: 'When the user gives host:container, use it exactly. When the user gives one port and the target service already has exactly one mapping, preserve the existing container port unless the user explicitly says both sides should change.',
           schemaNormalization: 'Always convert natural-language feedback to one or more SpecPatch objects when the intent and target can be inferred from current services. Do not leave patches empty just because wording is informal.',
+          replicaGroupTargeting: 'For logical database replica groups, set patch.target.targetKind="replica-group", patch.target.name to databaseReplicaGroups.baseName, and include kind="database" plus imageFamily.',
           feedbackIntent: 'If feedbackIntent is present, treat it as the structured parse of user other feedback and convert it to SpecPatch objects. If feedbackIntent is absent but userFeedback exists, infer intent from userFeedback and observations.',
         },
       });
@@ -253,15 +268,17 @@ export class StandardPlannerAgent implements PlannerAgent {
           'REVISION_PATCH_PLANNER_V1',
           'You revise desired infrastructure by returning schema-valid JSON patches only.',
           'Patch InfrastructureSpec, not Docker API payloads and not docker-compose YAML.',
-          'Use the provided serviceCatalog as the source of truth for mapping user wording to existing services.',
+          'Use logicalServiceCatalog as the default source of truth for mapping user wording to existing services.',
+          'Use physicalServiceCatalog only when the user explicitly names an expanded physical service like postgres-2.',
           'When databaseReplicaGroups are present, treat expanded names like postgres-1/postgres-2 as one logical stateful database group for replica-count changes.',
+          'For stateful database total/group/overall instance changes, emit one set-service-replicas patch with targetKind="replica-group", name=databaseReplicaGroups.baseName, kind="database", and imageFamily; do not emit separate patches for each physical service.',
           'Use verifierObservation, userFeedback, and runtimeRefs as observations about the same desired spec; do not ignore verifier evidence when user feedback is present.',
-          'Treat userFeedback from an "other" answer as a fresh natural-language instruction, but still ground target selection in serviceCatalog and verifierObservation.',
+          'Treat userFeedback from an "other" answer as a fresh natural-language instruction, but still ground target selection in logicalServiceCatalog, physicalServiceCatalog, and verifierObservation.',
           'Choose targets by comparing the user request with each service name, role, image family, exposed ports, dependencies, dependents, and current replicas.',
           'If prior clarification feedback contains targetService:<name>, apply the requested change to that exact existing service name.',
           'Understand natural language flexibly: map names, roles, image families, counts, and port intent into the closest valid SpecPatch.',
           'Normalize free-form user feedback into schema-valid patches: ports, replicas, images, env vars, volumes, dependencies, service names, service status, project name, networks, add/remove services.',
-          'Use semantic selectors that reflect the matched service evidence, such as exact name, kind, imageFamily, exposed port, dependency, or dependent relationship.',
+          'Use targetKind="service" for ordinary single services and targetKind="replica-group" only for logical stateful replica groups.',
           'When multiple current services could match, return requiresUserInput=true with a short ambiguity instead of guessing. The app will present service options to the user.',
         ].join('\n'),
         user: userPayload,
@@ -311,7 +328,9 @@ export class StandardPlannerAgent implements PlannerAgent {
         rawText,
         attemptIndex: request.attemptIndex,
         projectName: spec.projectName,
-        serviceCatalog: buildRevisionServiceCatalog(spec),
+        logicalServiceCatalog: buildLogicalRevisionServiceCatalog(spec),
+        physicalServiceCatalog: buildPhysicalRevisionServiceCatalog(spec),
+        serviceCatalog: buildLogicalRevisionServiceCatalog(spec),
         databaseReplicaGroups: buildDatabaseReplicaGroups(spec),
         verifierObservation: buildVerifierObservationContext(request.revisionObservation),
         runtimeIssueReport: request.runtimeIssueReport ?? null,
@@ -491,11 +510,15 @@ function collectRevisionIssues(obs: import('../domain/types.js').RevisionObserva
   return issues;
 }
 
-function buildRevisionServiceCatalog(spec: InfrastructureSpec): Array<{
+function buildPhysicalRevisionServiceCatalog(spec: InfrastructureSpec): Array<{
   name: string;
   role: InfrastructureSpec['services'][number]['kind'];
   image: string;
   imageFamily: string;
+  stateful: boolean;
+  replicaGroup: string | null;
+  ordinal: number | null;
+  physicalInstances: number;
   currentDesiredInstances: number;
   exposedPorts: string[];
   dependsOn: string[];
@@ -505,11 +528,16 @@ function buildRevisionServiceCatalog(spec: InfrastructureSpec): Array<{
 }> {
   return spec.services.map((service) => {
     const imageFamily = service.image.toLowerCase().split(':')[0]?.split('/').pop() ?? service.image.toLowerCase();
+    const parsed = parseNumberedReplicaServiceName(service.name);
     return {
       name: service.name,
       role: service.kind,
       image: service.image,
       imageFamily,
+      stateful: isStatefulDatabaseService(service),
+      replicaGroup: service.kind === 'database' ? parsed?.baseName ?? null : null,
+      ordinal: service.kind === 'database' ? parsed?.ordinal ?? null : null,
+      physicalInstances: 1,
       currentDesiredInstances: service.replicas ?? 1,
       exposedPorts: service.ports ?? [],
       dependsOn: service.dependsOn ?? [],
@@ -520,6 +548,67 @@ function buildRevisionServiceCatalog(spec: InfrastructureSpec): Array<{
       environmentKeys: Object.keys(service.environment ?? {}),
     };
   });
+}
+
+function buildLogicalRevisionServiceCatalog(spec: InfrastructureSpec): Array<{
+  name: string;
+  role: InfrastructureSpec['services'][number]['kind'];
+  image: string;
+  imageFamily: string;
+  stateful: boolean;
+  currentDesiredInstances: number;
+  expandedServices: string[];
+  exposedPorts: string[];
+  dependsOn: string[];
+  dependents: string[];
+  volumes: string[];
+  environmentKeys: string[];
+}> {
+  const databaseGroups = buildDatabaseReplicaGroups(spec);
+  const groupedPhysicalNames = new Set(databaseGroups.flatMap((group) => group.serviceNames));
+  const logicalCatalog = spec.services
+    .filter((service) => !groupedPhysicalNames.has(service.name))
+    .map((service) => {
+      const imageFamily = getServiceImageFamily(service);
+      return {
+        name: service.name,
+        role: service.kind,
+        image: service.image,
+        imageFamily,
+        stateful: isStatefulDatabaseService(service),
+        currentDesiredInstances: service.replicas ?? 1,
+        expandedServices: [service.name],
+        exposedPorts: service.ports ?? [],
+        dependsOn: service.dependsOn ?? [],
+        dependents: getServiceDependents(spec, service.name),
+        volumes: service.volumes ?? [],
+        environmentKeys: Object.keys(service.environment ?? {}),
+      };
+    });
+
+  return [
+    ...logicalCatalog,
+    ...databaseGroups.map((group) => {
+      const representative = group.serviceNames
+        .map((name) => spec.services.find((service) => service.name === name))
+        .find((service): service is InfrastructureSpec['services'][number] => service !== undefined);
+      return {
+        name: group.baseName,
+        role: 'database' as const,
+        image: representative?.image ?? group.imageFamily,
+        imageFamily: group.imageFamily,
+        stateful: true,
+        currentDesiredInstances: group.currentDesiredInstances,
+        expandedServices: group.serviceNames,
+        exposedPorts: uniqueIdentifiers(group.serviceNames.flatMap((name) => spec.services.find((service) => service.name === name)?.ports ?? [])),
+        dependsOn: uniqueIdentifiers(group.serviceNames.flatMap((name) => spec.services.find((service) => service.name === name)?.dependsOn ?? [])
+          .filter((dependency) => !group.serviceNames.includes(dependency))),
+        dependents: uniqueIdentifiers(group.serviceNames.flatMap((name) => getServiceDependents(spec, name))),
+        volumes: uniqueIdentifiers(group.serviceNames.flatMap((name) => spec.services.find((service) => service.name === name)?.volumes ?? [])),
+        environmentKeys: uniqueIdentifiers(group.serviceNames.flatMap((name) => Object.keys(spec.services.find((service) => service.name === name)?.environment ?? {}))),
+      };
+    }),
+  ];
 }
 
 function buildDatabaseReplicaGroups(spec: InfrastructureSpec): Array<{
@@ -577,6 +666,16 @@ function buildDatabaseReplicaGroups(spec: InfrastructureSpec): Array<{
         };
       }),
   ];
+}
+
+function getServiceImageFamily(service: InfrastructureSpec['services'][number]): string {
+  return service.image.toLowerCase().split(':')[0]?.split('/').pop() ?? service.image.toLowerCase();
+}
+
+function getServiceDependents(spec: InfrastructureSpec, serviceName: string): string[] {
+  return spec.services
+    .filter((candidate) => candidate.dependsOn?.includes(serviceName))
+    .map((candidate) => candidate.name);
 }
 
 function buildVerifierObservationContext(obs: import('../domain/types.js').RevisionObservation): {
@@ -692,9 +791,12 @@ function normalizeAndValidateFeedbackIntent(value: unknown, rawText: string): Fe
     ...(normalizeInteger(desiredRecord.containerPort) !== null ? { containerPort: normalizeInteger(desiredRecord.containerPort)! } : {}),
     ...(normalizeString(desiredRecord.name) ? { name: normalizeString(desiredRecord.name)! } : {}),
     ...(normalizeString(desiredRecord.image) ? { image: normalizeString(desiredRecord.image)! } : {}),
-    ...(isRecord(desiredRecord.environment) ? { environment: Object.fromEntries(Object.entries(desiredRecord.environment).filter((entry): entry is [string, string] => typeof entry[1] === 'string')) } : {}),
+    ...(Object.keys(normalizeEnvironmentRecord(desiredRecord.environment)).length > 0 ? { environment: normalizeEnvironmentRecord(desiredRecord.environment) } : {}),
     ...(normalizeStringArray(desiredRecord.volumes).length > 0 ? { volumes: normalizeStringArray(desiredRecord.volumes) } : {}),
     ...(normalizeStringArray(desiredRecord.networks).length > 0 ? { networks: normalizeStringArray(desiredRecord.networks) } : {}),
+    ...(normalizeStringArray(desiredRecord.dependencies ?? desiredRecord.dependsOn).length > 0 ? { dependencies: normalizeStringArray(desiredRecord.dependencies ?? desiredRecord.dependsOn).map(sanitizeIdentifier).filter(Boolean) } : {}),
+    ...(normalizeDesiredStatus(desiredRecord.desiredStatus ?? desiredRecord.status) ? { desiredStatus: normalizeDesiredStatus(desiredRecord.desiredStatus ?? desiredRecord.status)! } : {}),
+    ...(normalizeInfrastructureService(desiredRecord.service ?? record.service) ? { service: normalizeInfrastructureService(desiredRecord.service ?? record.service)! } : {}),
     ...(normalizeString(desiredRecord.yamlFragment) ? { yamlFragment: normalizeString(desiredRecord.yamlFragment)! } : {}),
   };
 
@@ -737,13 +839,31 @@ function normalizeFeedbackIntentName(value: unknown): FeedbackIntent['intent'] {
     image: 'change-image',
     env: 'change-env',
     environment: 'change-env',
+    'set-env': 'change-env',
+    'remove-env': 'remove-env',
+    'delete-env': 'remove-env',
     volume: 'change-volume',
+    volumes: 'change-volume',
+    'add-volume': 'change-volume',
+    'remove-volume': 'remove-volume',
+    dependency: 'change-dependency',
+    dependencies: 'change-dependency',
+    'add-dependency': 'change-dependency',
+    'remove-dependency': 'remove-dependency',
     network: 'change-network',
+    networks: 'set-networks',
+    project: 'change-project',
+    'project-name': 'change-project',
+    status: 'change-status',
+    service: 'add-service',
+    'delete-service': 'remove-service',
   };
   const normalized = intent ? (aliases[intent] ?? intent) : 'unknown';
   const allowed = new Set<FeedbackIntent['intent']>([
-    'change-port', 'change-name', 'change-replicas', 'change-image', 'change-env', 'change-volume',
-    'change-network', 'remove-exposure', 'yaml-edit-intent', 'retry-as-is', 'cancel', 'unknown',
+    'change-port', 'change-name', 'change-replicas', 'change-image', 'change-env', 'remove-env',
+    'change-volume', 'remove-volume', 'change-dependency', 'remove-dependency', 'change-network',
+    'rename-network', 'set-networks', 'add-service', 'remove-service', 'rename-service', 'change-status',
+    'change-project', 'remove-exposure', 'yaml-edit-intent', 'retry-as-is', 'cancel', 'unknown',
   ]);
   return allowed.has(normalized as FeedbackIntent['intent']) ? normalized as FeedbackIntent['intent'] : 'unknown';
 }
@@ -866,11 +986,65 @@ function normalizeSpecPatchShape(value: unknown): SpecPatch[] {
     return networks.length > 0 ? [{ op, networks: uniqueIdentifiers(networks), reason }] : [];
   }
 
-  if (op === 'add-service' && isRecord(value.service)) {
-    return [{ op, service: value.service as SpecPatch & never, reason }].filter((patch) => validatePotentialPatch(patch));
+  if (op === 'add-service') {
+    const service = normalizeInfrastructureService(value.service ?? value);
+    return service ? [{ op, service, reason }].filter((patch) => validatePotentialPatch(patch)) : [];
   }
 
   return [];
+}
+
+function normalizeInfrastructureService(value: unknown): InfrastructureSpec['services'][number] | null {
+  if (!isRecord(value)) return null;
+  const kind = normalizeString(value.kind ?? value.role);
+  const name = normalizeIdentifierString(value.name ?? value.serviceName);
+  const image = normalizeRevisionImage(normalizeString(value.image) ?? '');
+  if ((kind !== 'reverse-proxy' && kind !== 'backend' && kind !== 'database') || !name || !image) return null;
+
+  const environment = normalizeEnvironmentRecord(value.environment ?? value.env);
+  const desiredStatus = normalizeDesiredStatus(value.desiredStatus ?? value.status);
+  const replicas = normalizeInteger(value.replicas ?? value.replicaCount ?? value.instances);
+  const ports = normalizeStringArray(value.ports ?? value.port).flatMap((port) => normalizePortMapping(port) ?? []);
+  const dependsOn = normalizeStringArray(value.dependsOn ?? value.dependencies).map(sanitizeIdentifier).filter(Boolean);
+  const volumes = normalizeStringArray(value.volumes ?? value.mounts);
+
+  return {
+    kind,
+    name,
+    image,
+    ...(desiredStatus ? { desiredStatus } : {}),
+    ...(replicas !== null && replicas >= 1 && replicas <= 50 ? { replicas } : {}),
+    ...(ports.length > 0 ? { ports: uniqueIdentifiers(ports) } : {}),
+    ...(Object.keys(environment).length > 0 ? { environment } : {}),
+    ...(dependsOn.length > 0 ? { dependsOn: uniqueIdentifiers(dependsOn) } : {}),
+    ...(volumes.length > 0 ? { volumes } : {}),
+  };
+}
+
+function normalizeEnvironmentRecord(value: unknown): Record<string, string> {
+  if (Array.isArray(value)) {
+    return Object.fromEntries(value.flatMap((entry) => {
+      if (!isRecord(entry)) return [];
+      const key = normalizeString(entry.key ?? entry.name);
+      const envValue = normalizeString(entry.value ?? entry.to);
+      return key && envValue ? [[key, envValue] as [string, string]] : [];
+    }));
+  }
+
+  if (!isRecord(value)) return {};
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, envValue]) => {
+      const normalizedValue = normalizeString(envValue);
+      return normalizedValue ? [[key, normalizedValue] as [string, string]] : [];
+    }),
+  );
+}
+
+function normalizeDesiredStatus(value: unknown): NonNullable<InfrastructureSpec['services'][number]['desiredStatus']> | null {
+  const status = normalizeString(value)?.toLowerCase();
+  if (status === 'running' || status === 'run' || status === 'start' || status === 'started') return 'running';
+  if (status === 'stopped' || status === 'stop' || status === 'down') return 'stopped';
+  return null;
 }
 
 function validatePotentialPatch(patch: unknown): patch is SpecPatch {
@@ -931,12 +1105,14 @@ function normalizePatchTarget(value: unknown): ServiceSelector | null {
   if (typeof value === 'string') return { name: sanitizeIdentifier(value) };
   if (!isRecord(value)) return null;
   const selector: ServiceSelector = {};
+  const targetKind = normalizeString(value.targetKind ?? value.targetType ?? value.resourceKind);
   const name = normalizeIdentifierString(value.name ?? value.serviceName);
-  const nameLike = normalizeString(value.nameLike ?? value.alias);
+  const nameLike = normalizeString(value.nameLike ?? value.alias)?.replace(/^\/+/, '');
   const kind = normalizeString(value.kind ?? value.role);
   const imageFamily = normalizeString(value.imageFamily ?? value.image);
   const dependsOn = normalizeIdentifierString(value.dependsOn);
   const dependentOf = normalizeIdentifierString(value.dependentOf);
+  if (targetKind === 'service' || targetKind === 'replica-group') selector.targetKind = targetKind;
   if (name) selector.name = name;
   if (nameLike) selector.nameLike = nameLike;
   if (kind === 'reverse-proxy' || kind === 'backend' || kind === 'database') selector.kind = kind;
@@ -944,7 +1120,7 @@ function normalizePatchTarget(value: unknown): ServiceSelector | null {
   if (typeof value.exposesHostPort === 'boolean') selector.exposesHostPort = value.exposesHostPort;
   if (dependsOn) selector.dependsOn = dependsOn;
   if (dependentOf) selector.dependentOf = dependentOf;
-  return Object.keys(selector).length > 0 ? selector : null;
+  return Object.keys(selector).some((key) => key !== 'targetKind') ? selector : null;
 }
 
 function normalizePortMapping(value: unknown): string | null {
@@ -1013,15 +1189,29 @@ function buildDeterministicFeedbackPatchPlan(
     ambiguities.push(...intentPatchResult.ambiguities);
   }
 
-  const replicaRequest = patches.some((patch) => patch.op === 'set-service-replicas')
-    ? null
-    : parseReplicaFeedback(normalizedFeedback);
-  if (replicaRequest !== null) {
+  const replicaRequests = patches.some((patch) => patch.op === 'set-service-replicas')
+    ? []
+    : parseReplicaFeedbackRequests(normalizedFeedback);
+  if (replicaRequests.length > 0) {
+    for (const replicaRequest of replicaRequests) {
+      const target = inferFeedbackServiceSelector(spec, replicaRequest.targetText, { preferReplicaServices: true });
+      if (target.selector !== null && target.ambiguous === false) {
+        patches.push({ op: 'set-service-replicas', target: target.selector, replicas: replicaRequest.replicas, reason });
+      } else {
+        ambiguities.push(target.reason ?? `Which existing service should receive ${replicaRequest.replicas} replica(s)?`);
+      }
+    }
+  } else {
+    const replicaRequest = patches.some((patch) => patch.op === 'set-service-replicas')
+      ? null
+      : parseReplicaFeedback(normalizedFeedback);
+    if (replicaRequest !== null) {
     const target = inferFeedbackServiceSelector(spec, normalizedFeedback, { preferReplicaServices: true });
     if (target.selector !== null && target.ambiguous === false) {
       patches.push({ op: 'set-service-replicas', target: target.selector, replicas: replicaRequest, reason });
     } else {
       ambiguities.push(target.reason ?? 'Which existing service should receive the requested replica/instance count?');
+    }
     }
   }
 
@@ -1151,7 +1341,7 @@ function buildPatchesFromFeedbackIntent(
     patches.push({ op: 'set-service-image', target: selector, image: feedbackIntent.desiredChange.image, reason });
   }
 
-  if (feedbackIntent.intent === 'change-name' && feedbackIntent.desiredChange?.name) {
+  if ((feedbackIntent.intent === 'change-name' || feedbackIntent.intent === 'rename-service') && feedbackIntent.desiredChange?.name) {
     if (feedbackIntent.target?.resourceKind === 'project') {
       patches.push({ op: 'set-project-name', name: sanitizeIdentifier(feedbackIntent.desiredChange.name), reason });
     } else if (selector !== null) {
@@ -1159,15 +1349,146 @@ function buildPatchesFromFeedbackIntent(
     }
   }
 
-  if (feedbackIntent.intent === 'change-network' && feedbackIntent.desiredChange?.networks?.length) {
+  if (feedbackIntent.intent === 'change-project' && feedbackIntent.desiredChange?.name) {
+    patches.push({ op: 'set-project-name', name: sanitizeIdentifier(feedbackIntent.desiredChange.name), reason });
+  }
+
+  if (feedbackIntent.intent === 'add-service' && feedbackIntent.desiredChange?.service) {
+    patches.push({ op: 'add-service', service: feedbackIntent.desiredChange.service, reason });
+  }
+
+  if (feedbackIntent.intent === 'remove-service' && selector !== null) {
+    patches.push({ op: 'remove-service', target: selector, reason });
+  }
+
+  if (feedbackIntent.intent === 'change-env' && selector !== null && feedbackIntent.desiredChange?.environment) {
+    for (const [key, value] of Object.entries(feedbackIntent.desiredChange.environment)) {
+      patches.push({ op: 'set-service-env', target: selector, key, value, reason });
+    }
+  }
+
+  if (feedbackIntent.intent === 'remove-env' && selector !== null) {
+    const keys = Object.keys(feedbackIntent.desiredChange?.environment ?? {});
+    const explicitKey = normalizeString(feedbackIntent.target?.currentValue);
+    for (const key of uniqueIdentifiers([...keys, ...(explicitKey ? [explicitKey] : [])])) {
+      patches.push({ op: 'remove-service-env', target: selector, key, reason });
+    }
+  }
+
+  if ((feedbackIntent.intent === 'change-volume' || feedbackIntent.intent === 'remove-volume') && selector !== null) {
+    const volumes = feedbackIntent.desiredChange?.volumes ?? [];
+    for (const volume of volumes) {
+      patches.push({ op: feedbackIntent.intent === 'change-volume' ? 'add-service-volume' : 'remove-service-volume', target: selector, volume, reason });
+    }
+  }
+
+  if ((feedbackIntent.intent === 'change-dependency' || feedbackIntent.intent === 'remove-dependency') && selector !== null) {
+    const dependencies = feedbackIntent.desiredChange?.dependencies ?? [];
+    for (const dependencyName of dependencies) {
+      patches.push({ op: feedbackIntent.intent === 'change-dependency' ? 'add-service-dependency' : 'remove-service-dependency', target: selector, dependencyName, reason });
+    }
+  }
+
+  if (feedbackIntent.intent === 'change-status' && selector !== null && feedbackIntent.desiredChange?.desiredStatus) {
+    patches.push({ op: 'set-service-desired-status', target: selector, desiredStatus: feedbackIntent.desiredChange.desiredStatus, reason });
+  }
+
+  if ((feedbackIntent.intent === 'change-network' || feedbackIntent.intent === 'set-networks') && feedbackIntent.desiredChange?.networks?.length) {
     patches.push({ op: 'set-networks', networks: feedbackIntent.desiredChange.networks.map(sanitizeIdentifier).filter(Boolean), reason });
+  }
+
+  if (feedbackIntent.intent === 'rename-network' && feedbackIntent.desiredChange?.name) {
+    patches.push({
+      op: 'rename-network',
+      ...(feedbackIntent.target?.currentValue ? { from: sanitizeIdentifier(feedbackIntent.target.currentValue) } : {}),
+      to: sanitizeIdentifier(feedbackIntent.desiredChange.name),
+      reason,
+    });
   }
 
   return { patches, ambiguities };
 }
 
+function normalizeStatefulDatabaseReplicaPatchPlan(
+  spec: InfrastructureSpec,
+  patchPlan: SpecPatchPlan,
+  feedback: string,
+  feedbackIntent: FeedbackIntent | null,
+): SpecPatchPlan {
+  const requestedReplicas = feedbackIntent?.desiredChange?.replicas ?? parseReplicaFeedback(feedback);
+  if (requestedReplicas === null || requestedReplicas < 1 || requestedReplicas > 50) return patchPlan;
+  if (!isDatabaseGroupTotalFeedback(feedback, feedbackIntent)) return patchPlan;
+
+  const group = resolveSingleStatefulDatabaseGroupForFeedback(spec, feedback, patchPlan.patches);
+  if (group === null) return patchPlan;
+
+  const logicalPatch: SpecPatch = {
+    op: 'set-service-replicas',
+    target: { targetKind: 'replica-group', name: group.baseName, kind: 'database', imageFamily: group.imageFamily },
+    replicas: requestedReplicas,
+    reason: `Normalize stateful database group total feedback to logical ${group.baseName} replica count.`,
+  };
+
+  const nonReplicaPatches = patchPlan.patches.filter((patch) => patch.op !== 'set-service-replicas');
+  return {
+    ...patchPlan,
+    patches: [logicalPatch, ...nonReplicaPatches],
+    explanation: patchPlan.explanation,
+    assumptions: uniqueIdentifiers([
+      ...patchPlan.assumptions,
+      `Stateful database group "${group.baseName}" is represented by ${group.serviceNames.join(', ')}; total instances means logical replicas.`,
+    ]),
+    ambiguities: patchPlan.ambiguities.filter((ambiguity) => !/database|replica|instance/i.test(ambiguity)),
+    requiresUserInput: false,
+    confidence: Math.max(patchPlan.confidence, 0.82),
+  };
+}
+
+function isDatabaseGroupTotalFeedback(feedback: string, feedbackIntent: FeedbackIntent | null): boolean {
+  const normalizedFeedback = feedback.toLowerCase();
+  const mentionsDatabase = inferFeedbackServiceKind(normalizedFeedback, null) === 'database';
+  const mentionsTotal = /\b(total|overall|group|all|entire|logical|database\s+group|db\s+group)\b/i.test(normalizedFeedback)
+    || /\b(tong|tổng|nhom|nhóm|tat\s*ca|tất\s*cả)\b/i.test(normalizedFeedback);
+  const intentTargetsDatabase = feedbackIntent?.intent === 'change-replicas'
+    && (feedbackIntent.target?.serviceSelector?.kind === 'database' || feedbackIntent.target?.resourceKind === 'service');
+  return (mentionsDatabase && mentionsTotal) || Boolean(intentTargetsDatabase && mentionsDatabase);
+}
+
+function resolveSingleStatefulDatabaseGroupForFeedback(
+  spec: InfrastructureSpec,
+  feedback: string,
+  patches: SpecPatch[],
+): ReturnType<typeof buildDatabaseReplicaGroups>[number] | null {
+  const groups = buildDatabaseReplicaGroups(spec).filter((group) => group.serviceNames.length > 0);
+  if (groups.length === 0) return null;
+
+  const normalizedFeedback = feedback.toLowerCase();
+  const patchTargets = patches
+    .filter((patch): patch is Extract<SpecPatch, { op: 'set-service-replicas' }> => patch.op === 'set-service-replicas')
+    .map((patch) => patch.target);
+  const candidates = groups.filter((group) => {
+    const mentionedByFeedback = containsIdentifier(normalizedFeedback, group.baseName)
+      || containsIdentifier(normalizedFeedback, group.imageFamily)
+      || group.serviceNames.some((serviceName) => containsIdentifier(normalizedFeedback, serviceName));
+    const mentionedByPatch = patchTargets.some((target) =>
+      target.kind === 'database'
+      || target.imageFamily === group.imageFamily
+      || target.name === group.baseName
+      || (target.name !== undefined && group.serviceNames.includes(target.name))
+      || (target.nameLike !== undefined && (group.baseName.includes(target.nameLike) || group.imageFamily.includes(target.nameLike))),
+    );
+    return mentionedByFeedback || mentionedByPatch;
+  });
+
+  if (candidates.length === 1) return candidates[0]!;
+  if (candidates.length > 1) return null;
+  return groups.length === 1 ? groups[0]! : null;
+}
+
 function parseReplicaFeedback(feedback: string): number | null {
   const patterns = [
+    /\b(?:total|overall|group|database\s+group|db\s+group)\b[^\d]{0,80}\b(?:is|are|to|=|thanh|thành|con|còn)?\s*(\d+)\b/i,
+    /\b(?:tong|tổng|nhom|nhóm)\b[^\d]{0,80}\b(?:la|là|thanh|thành|con|còn)?\s*(\d+)\b/i,
     /\b(?:giam|giảm|tang|tăng|ha|hạ|nang|nâng|xuong|xuống|len|lên)\s+(?:(?:xuong|xuống|len|lên)\s+)?(?:(?:con|còn|thanh|thành|toi|tới|to)\s+)?(\d+)\s*(?:instances?|replicas?)?\b/i,
     /\b(?:just|only|to|use|with|set|make|want|needs?|need)\s+(\d+)\s+(?:[a-z0-9_-]+\s+){0,4}(?:instances?|replicas?)\b/i,
     /\b(?:instances?|replicas?)\s+(?:to|=|is|are)?\s*(\d+)\b/i,
@@ -1180,6 +1501,38 @@ function parseReplicaFeedback(feedback: string): number | null {
     if (Number.isInteger(replicas) && replicas >= 1 && replicas <= 50) return replicas;
   }
   return null;
+}
+
+function parseReplicaFeedbackRequests(feedback: string): Array<{ replicas: number; targetText: string }> {
+  const requests: Array<{ replicas: number; targetText: string }> = [];
+  const serviceWords = '(?:backend|api|nodejs?|server|db|database|databse|postgres(?:ql)?|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka|web|nginx|proxy|reverse-proxy|frontend)';
+  const word = '(?!and\\b|va\\b|v[àa]\\b|,)[A-Za-z0-9_.-]+';
+  const patterns = [
+    new RegExp(`\\b(\\d+)\\s*(?:instances?|replicas?|containers?)\\s*(?:of|for)?\\s*(${word}(?:\\s+${word}){0,3})`, 'gi'),
+    new RegExp(`\\b(${serviceWords})\\b[^\\d,;]{0,30}?\\b(\\d+)\\s*(?:instances?|replicas?|containers?)?`, 'gi'),
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of feedback.matchAll(pattern)) {
+      const countText = match[1];
+      const targetText = match[2];
+      if (!countText || !targetText) continue;
+      const replicas = Number(countText);
+      if (!Number.isInteger(replicas) || replicas < 1 || replicas > 50) continue;
+      if (!containsServiceHint(targetText)) continue;
+      const normalizedTarget = targetText.trim();
+      const alreadyParsed = requests.some((request) =>
+        request.replicas === replicas && request.targetText.toLowerCase() === normalizedTarget.toLowerCase(),
+      );
+      if (!alreadyParsed) requests.push({ replicas, targetText: normalizedTarget });
+    }
+  }
+
+  return requests;
+}
+
+function containsServiceHint(text: string): boolean {
+  return /\b(api|backend|node|nodejs|server|db|database|databse|postgres|postgresql|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka|web|nginx|proxy|reverse-proxy|frontend)\b/i.test(text);
 }
 
 function parseImageFeedback(feedback: string): string | null {
@@ -1256,7 +1609,7 @@ function isExpandedDatabaseReplicaGroup(services: InfrastructureSpec['services']
 
 function inferFeedbackServiceKind(feedback: string, requestedImage: string | null | undefined): InfrastructureSpec['services'][number]['kind'] | null {
   const imageKind = requestedImage ? inferServiceKind(requestedImage) : null;
-  if (/\b(db|database|postgres|postgresql|mysql|mariadb|mongo|redis)\b/i.test(feedback) || imageKind === 'database') return 'database';
+  if (/\b(db|database|databse|postgres|postgresql|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka)\b/i.test(feedback) || imageKind === 'database') return 'database';
   if (/\b(web|nginx|proxy|reverse-proxy|frontend|httpd|traefik|haproxy|caddy)\b/i.test(feedback) || imageKind === 'reverse-proxy') return 'reverse-proxy';
   if (/\b(api|backend|node|nodejs|server)\b/i.test(feedback)) return 'backend';
   return null;

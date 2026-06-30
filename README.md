@@ -116,6 +116,7 @@ OPENAI_API_KEY=your_openai_key
 OPENAI_BASE_URL=https://api.vietapi.tech/v1
 OPENAI_REACT_MODEL=gpt-5.5
 OPENAI_AUX_MODEL=gpt-5.5
+OPENAI_TEMPERATURE=0.1
 
 GEMINI_API_KEY=your_gemini_key
 GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta

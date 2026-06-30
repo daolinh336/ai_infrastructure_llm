@@ -136,6 +136,7 @@ export const reactReasoningOutputJsonSchema = {
 const serviceSelectorJsonSchema = {
   type: 'object',
   properties: {
+    targetKind: { type: 'string', enum: ['service', 'replica-group'] },
     name: { type: 'string', minLength: 1 },
     nameLike: { type: 'string', minLength: 1 },
     kind: { type: 'string', enum: ['reverse-proxy', 'backend', 'database'] },
@@ -151,6 +152,20 @@ const patchBaseProperties = {
   reason: { type: 'string', minLength: 1 },
 };
 
+const environmentEntryJsonSchema = {
+  type: 'object',
+  properties: {
+    key: { type: 'string', minLength: 1 },
+    value: { type: 'string', minLength: 1 },
+  },
+  required: ['key', 'value'],
+} satisfies JsonSchema;
+
+const environmentEntriesJsonSchema = {
+  type: 'array',
+  items: environmentEntryJsonSchema,
+} satisfies JsonSchema;
+
 export const feedbackIntentJsonSchema = {
   type: 'object',
   properties: {
@@ -164,8 +179,19 @@ export const feedbackIntentJsonSchema = {
         'change-replicas',
         'change-image',
         'change-env',
+        'remove-env',
         'change-volume',
+        'remove-volume',
+        'change-dependency',
+        'remove-dependency',
         'change-network',
+        'rename-network',
+        'set-networks',
+        'add-service',
+        'remove-service',
+        'rename-service',
+        'change-status',
+        'change-project',
         'remove-exposure',
         'yaml-edit-intent',
         'retry-as-is',
@@ -192,9 +218,26 @@ export const feedbackIntentJsonSchema = {
         name: { type: 'string', minLength: 1 },
         replicas: { type: 'integer', minimum: 1, maximum: 50 },
         image: { type: 'string', minLength: 1 },
-        environment: { type: 'object', additionalProperties: { type: 'string' } },
+        environment: environmentEntriesJsonSchema,
         volumes: { type: 'array', items: { type: 'string', minLength: 1 } },
         networks: { type: 'array', items: { type: 'string', minLength: 1 } },
+        dependencies: { type: 'array', items: { type: 'string', minLength: 1 } },
+        desiredStatus: { type: 'string', enum: ['running', 'stopped'] },
+        service: {
+          type: 'object',
+          properties: {
+            kind: { type: 'string', enum: ['reverse-proxy', 'backend', 'database'] },
+            name: { type: 'string', minLength: 1 },
+            image: { type: 'string', minLength: 1 },
+            desiredStatus: { type: 'string', enum: ['running', 'stopped'] },
+            replicas: { type: 'integer', minimum: 1, maximum: 50 },
+            ports: { type: 'array', items: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' } },
+            environment: environmentEntriesJsonSchema,
+            dependsOn: { type: 'array', items: { type: 'string', minLength: 1 } },
+            volumes: { type: 'array', items: { type: 'string', minLength: 1 } },
+          },
+          required: ['kind', 'name', 'image'],
+        },
         yamlFragment: { type: 'string', minLength: 1 },
       },
     },
@@ -214,7 +257,7 @@ const infrastructureServiceJsonSchema = {
     desiredStatus: { type: 'string', enum: ['running', 'stopped'] },
     replicas: { type: 'integer', minimum: 1, maximum: 50 },
     ports: { type: 'array', items: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' } },
-    environment: { type: 'object', additionalProperties: { type: 'string' } },
+    environment: environmentEntriesJsonSchema,
     dependsOn: { type: 'array', items: { type: 'string', minLength: 1 } },
     volumes: { type: 'array', items: { type: 'string', minLength: 1 } },
   },

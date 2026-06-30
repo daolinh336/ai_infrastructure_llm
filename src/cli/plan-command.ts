@@ -154,7 +154,7 @@ export function registerPlanCommand(program: Command): void {
       });
       let result = await agent.run(gatewayResult.validatedQuery);
 
-      if (result.status === 'clarification') {
+      while (result.status === 'clarification') {
         console.log(chalk.yellow('Clarification required by ReAct Agent.'));
         console.log(result.clarificationQuestion);
         if (result.clarificationChoices?.length) {
@@ -195,19 +195,21 @@ export function registerPlanCommand(program: Command): void {
             answer,
           );
 
+          if (resumedResult.status === 'clarification') {
+            console.log();
+            console.log(
+              chalk.yellow('Still needs clarification. Continuing in same run.'),
+            );
+            result = resumedResult;
+            continue;
+          }
+
           if (resumedResult.status !== 'planned') {
             console.log();
-            if (resumedResult.status === 'clarification') {
-              console.log(
-                chalk.yellow('Still needs clarification after first answer.'),
-              );
-              console.log(resumedResult.clarificationQuestion);
-            } else {
-              console.log(
-                chalk.red('ReAct Agent blocked after clarification.'),
-              );
-              console.log(`- Reason: ${resumedResult.blockReason}`);
-            }
+            console.log(
+              chalk.red('ReAct Agent blocked after clarification.'),
+            );
+            console.log(`- Reason: ${resumedResult.blockReason}`);
             return;
           }
 
@@ -313,7 +315,7 @@ export function registerPlanCommand(program: Command): void {
         );
         console.log(
           chalk.gray(
-            '💡 .env only seeds passwords for NEW services; deployed services keep passwords in state/Docker.',
+            'Tip: .env values are used whenever present; missing passwords are auto-generated.',
           ),
         );
         console.log();
@@ -467,7 +469,7 @@ export function registerPlanCommand(program: Command): void {
           );
           console.log(
             chalk.gray(
-              '  💡 .env only seeds new services; deployed services keep passwords in state/Docker.',
+              '  Tip: .env values are used whenever present; missing passwords are auto-generated.',
             ),
           );
         }

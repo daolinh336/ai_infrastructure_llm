@@ -264,6 +264,33 @@ class MalformedDatabaseFeedbackIntentTestLlmProvider extends TestLlmProvider {
   }
 }
 
+class FixedFeedbackIntentTestLlmProvider extends TestLlmProvider {
+  constructor(private readonly feedbackIntent: unknown) {
+    super();
+  }
+
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
+    if (input.schemaName === 'feedback_intent') {
+      return { text: JSON.stringify(this.feedbackIntent) };
+    }
+
+    if (input.schemaName === 'spec_patch_plan') {
+      return {
+        text: JSON.stringify({
+          patches: [],
+          explanation: 'Force deterministic conversion from FeedbackIntent. Any final patch comes from local mapping.',
+          assumptions: [],
+          ambiguities: [],
+          requiresUserInput: false,
+          confidence: 0.7,
+        }),
+      };
+    }
+
+    return super.completeStructured(input);
+  }
+}
+
 function patchProvider(patches: SpecPatchPlan['patches'], overrides: Partial<SpecPatchPlan> = {}): FixedPatchTestLlmProvider {
   return new FixedPatchTestLlmProvider({
     patches,
@@ -657,6 +684,58 @@ describe('ReAct image-selection confirmation', () => {
     expect(
       resumedResult.plan.spec.services.some((service) => service.image === 'nginx:stable'),
     ).toBe(true);
+  });
+
+  it('keeps inferred backend and database services when confirming a web image', async () => {
+    const agent = new ReActAgent(
+      new TestLlmProvider(),
+      undefined,
+      {},
+      undefined,
+      undefined,
+      { logEnabled: false },
+    );
+
+    const firstResult = await agent.run(
+      makeGenericValidatedQuery('tao cho toi 1 web dung nginx, 2 backend nodejs va 3 db dung postgresql', [
+        serviceHint({ name: 'web', image: null, replicas: 1 }),
+        serviceHint({ name: 'backend', image: null, replicas: 2 }),
+        serviceHint({ name: 'db', image: null, replicas: 3 }),
+      ]),
+    );
+
+    expect(firstResult.status).toBe('clarification');
+    if (firstResult.status !== 'clarification' || !firstResult.clarificationContext) {
+      throw new Error(`Expected clarification with context, got ${firstResult.status}`);
+    }
+
+    const resumedResult = await agent.continueFromClarification(firstResult.clarificationContext, {
+      uncertaintyId: firstResult.uncertainties![0]!.id,
+      selectedChoiceId: '1',
+      otherText: null,
+      submittedAt: new Date().toISOString(),
+    });
+
+    expect(resumedResult.status).toBe('clarification');
+    if (resumedResult.status !== 'clarification' || !resumedResult.clarificationContext) {
+      throw new Error(`Expected database clarification, got ${resumedResult.status}`);
+    }
+    expect(resumedResult.uncertainties?.[0]?.id).toBe('depends-on:backend:database-target');
+
+    const plannedResult = await agent.continueFromClarification(resumedResult.clarificationContext, {
+      uncertaintyId: resumedResult.uncertainties![0]!.id,
+      selectedChoiceId: '1',
+      otherText: null,
+      submittedAt: new Date().toISOString(),
+    });
+
+    expect(plannedResult.status).toBe('planned');
+    if (plannedResult.status !== 'planned') {
+      throw new Error(`Expected planned, got ${plannedResult.status}`);
+    }
+    expect(plannedResult.plan.spec.services.some((service) => service.kind === 'reverse-proxy')).toBe(true);
+    expect(plannedResult.plan.spec.services.some((service) => service.kind === 'backend')).toBe(true);
+    expect(plannedResult.plan.spec.services.filter((service) => service.kind === 'database')).toHaveLength(3);
   });
 
   it('applies an alternative image when the user selects a different choice', async () => {
@@ -2184,7 +2263,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
 
     expect(result.revisionDecision).toBe('auto-revised');
     expect(result.patchPlan?.patches).toEqual([
-      expect.objectContaining({ op: 'set-service-replicas', target: { kind: 'database' }, replicas: 4 }),
+      expect.objectContaining({ op: 'set-service-replicas', target: expect.objectContaining({ kind: 'database' }), replicas: 4 }),
     ]);
     expect(result.revisedSpec.services.map((service) => service.name)).toEqual(['nginx', 'api', 'postgres-1', 'postgres-2', 'postgres-3', 'postgres-4']);
     expect(result.revisedSpec.services.find((service) => service.name === 'postgres-4')).toMatchObject({
@@ -2694,6 +2773,47 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
     expect(result.revisionDecision).toBe('auto-revised');
   });
 
+  it('applies multiple replica changes from one fallback feedback sentence', async () => {
+    const planner = new StandardPlannerAgent(new InvalidPatchTestLlmProvider());
+    const req: PlannerRevisionRequest = {
+      desiredSpec: {
+        projectName: 'sample-infra',
+        services: [
+          { kind: 'reverse-proxy', name: 'nginx', image: 'nginx:stable', ports: ['80:80'], dependsOn: ['api'] },
+          { kind: 'backend', name: 'api', image: 'node:20-alpine', replicas: 2, dependsOn: ['postgres-1', 'postgres-2', 'postgres-3'] },
+          { kind: 'database', name: 'postgres-1', image: 'postgres:16', volumes: ['postgres-data-1:/var/lib/postgresql/data'] },
+          { kind: 'database', name: 'postgres-2', image: 'postgres:16', dependsOn: ['postgres-1'], volumes: ['postgres-data-2:/var/lib/postgresql/data'] },
+          { kind: 'database', name: 'postgres-3', image: 'postgres:16', dependsOn: ['postgres-1'], volumes: ['postgres-data-3:/var/lib/postgresql/data'] },
+        ],
+        networks: ['app-network'],
+        volumes: ['postgres-data-1', 'postgres-data-2', 'postgres-data-3'],
+      },
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: {
+          message: 'i want 1 instance of backend and 2 instance databse',
+          submittedAt: new Date().toISOString(),
+        },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    const result = await planner.reviseFromFeedback(req);
+
+    expect(result.patchPlan?.patches).toMatchObject([
+      { op: 'set-service-replicas', target: { kind: 'backend' }, replicas: 1 },
+      { op: 'set-service-replicas', target: { kind: 'database' }, replicas: 2 },
+    ]);
+    expect(result.revisedSpec.services.find((service) => service.name === 'api')?.replicas).toBe(1);
+    expect(result.revisedSpec.services.map((service) => service.name)).toEqual(['nginx', 'api', 'postgres-1', 'postgres-2']);
+    expect(result.revisedSpec.services.find((service) => service.name === 'api')?.dependsOn).toEqual(['postgres-1', 'postgres-2']);
+    expect(result.revisedSpec.volumes).toEqual(['postgres-data-1', 'postgres-data-2']);
+    expect(result.revisionSummary).toContain('2 patch(es) applied.');
+    expect(result.revisionDecision).toBe('auto-revised');
+  });
+
   it('applies user feedback that requests adding a cache service through structured patches', async () => {
     const planner = new StandardPlannerAgent(patchProvider([
       { op: 'add-service', service: { kind: 'database', name: 'redis', image: 'redis:7-alpine' }, reason: 'LLM mapped cache request to Redis service.' },
@@ -2718,6 +2838,183 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
     expect(result.revisedSpec.services.find((service) => service.name === 'redis')?.image).toBe('redis:7-alpine');
     expect(result.patchPlan?.patches[0]?.op).toBe('add-service');
     expect(result.revisionDecision).toBe('auto-revised');
+  });
+
+  it('normalizes feedback intent add-service environment entries before applying patches', async () => {
+    const planner = new StandardPlannerAgent(new FixedFeedbackIntentTestLlmProvider({
+      source: 'user-other-feedback',
+      rawText: 'add redis with env',
+      intent: 'add-service',
+      desiredChange: {
+        service: {
+          kind: 'database',
+          name: 'redis',
+          image: 'redis:7-alpine',
+          environment: [{ key: 'REDIS_MODE', value: 'cache' }],
+        },
+      },
+      confidence: 0.9,
+      ambiguities: [],
+      requiresUserInput: false,
+    }));
+
+    const result = await planner.reviseFromFeedback({
+      desiredSpec: makeSpec(),
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'add redis with env', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    });
+
+    expect(result.patchPlan?.patches).toMatchObject([
+      { op: 'add-service', service: { name: 'redis', environment: { REDIS_MODE: 'cache' } } },
+    ]);
+    expect(result.revisedSpec.services.find((service) => service.name === 'redis')?.environment).toEqual({ REDIS_MODE: 'cache' });
+    expect(result.revisionDecision).toBe('auto-revised');
+  });
+
+  it('converts feedback intent env entries into set-service-env patches', async () => {
+    const planner = new StandardPlannerAgent(new FixedFeedbackIntentTestLlmProvider({
+      source: 'user-other-feedback',
+      rawText: 'set api env',
+      intent: 'change-env',
+      target: { resourceKind: 'environment', serviceSelector: { name: 'api' } },
+      desiredChange: {
+        environment: [
+          { key: 'NODE_ENV', value: 'production' },
+          { key: 'LOG_LEVEL', value: 'debug' },
+        ],
+      },
+      confidence: 0.94,
+      ambiguities: [],
+      requiresUserInput: false,
+    }));
+
+    const result = await planner.reviseFromFeedback({
+      desiredSpec: makeSpec(),
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'set api env', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    });
+
+    expect(result.patchPlan?.patches).toMatchObject([
+      { op: 'set-service-env', target: { name: 'api' }, key: 'NODE_ENV', value: 'production' },
+      { op: 'set-service-env', target: { name: 'api' }, key: 'LOG_LEVEL', value: 'debug' },
+    ]);
+    expect(result.revisedSpec.services.find((service) => service.name === 'api')?.environment).toEqual({
+      NODE_ENV: 'production',
+      LOG_LEVEL: 'debug',
+    });
+  });
+
+  it('converts feedback intent remove-env into remove-service-env patches', async () => {
+    const planner = new StandardPlannerAgent(new FixedFeedbackIntentTestLlmProvider({
+      source: 'user-other-feedback',
+      rawText: 'remove api debug env',
+      intent: 'remove-env',
+      target: { resourceKind: 'environment', serviceSelector: { name: 'api' }, currentValue: 'DEBUG' },
+      confidence: 0.9,
+      ambiguities: [],
+      requiresUserInput: false,
+    }));
+    const spec = makeSpec();
+    spec.services[0] = { ...spec.services[0]!, environment: { DEBUG: 'true', NODE_ENV: 'production' } };
+
+    const result = await planner.reviseFromFeedback({
+      desiredSpec: spec,
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'remove api debug env', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    });
+
+    expect(result.patchPlan?.patches).toMatchObject([
+      { op: 'remove-service-env', target: { name: 'api' }, key: 'DEBUG' },
+    ]);
+    expect(result.revisedSpec.services.find((service) => service.name === 'api')?.environment).toEqual({ NODE_ENV: 'production' });
+  });
+
+  it('converts feedback intent volume dependency status project and network changes', async () => {
+    const cases: Array<{ intent: unknown; expectedPatch: unknown; assertSpec: (spec: InfrastructureSpec) => void }> = [
+      {
+        intent: {
+          source: 'user-other-feedback', rawText: 'add api volume', intent: 'change-volume',
+          target: { resourceKind: 'volume', serviceSelector: { name: 'api' } },
+          desiredChange: { volumes: ['api-data:/data'] }, confidence: 0.9, ambiguities: [], requiresUserInput: false,
+        },
+        expectedPatch: { op: 'add-service-volume', target: { name: 'api' }, volume: 'api-data:/data' },
+        assertSpec: (spec) => expect(spec.services.find((service) => service.name === 'api')?.volumes).toEqual(['api-data:/data']),
+      },
+      {
+        intent: {
+          source: 'user-other-feedback', rawText: 'add nginx dependency on api', intent: 'change-dependency',
+          target: { resourceKind: 'service', serviceSelector: { name: 'nginx' } },
+          desiredChange: { dependencies: ['api'] }, confidence: 0.9, ambiguities: [], requiresUserInput: false,
+        },
+        expectedPatch: { op: 'add-service-dependency', target: { name: 'nginx' }, dependencyName: 'api' },
+        assertSpec: (spec) => expect(spec.services.find((service) => service.name === 'nginx')?.dependsOn).toEqual(['api']),
+      },
+      {
+        intent: {
+          source: 'user-other-feedback', rawText: 'stop api', intent: 'change-status',
+          target: { resourceKind: 'service', serviceSelector: { name: 'api' } },
+          desiredChange: { desiredStatus: 'stopped' }, confidence: 0.9, ambiguities: [], requiresUserInput: false,
+        },
+        expectedPatch: { op: 'set-service-desired-status', target: { name: 'api' }, desiredStatus: 'stopped' },
+        assertSpec: (spec) => expect(spec.services.find((service) => service.name === 'api')?.desiredStatus).toBe('stopped'),
+      },
+      {
+        intent: {
+          source: 'user-other-feedback', rawText: 'rename project', intent: 'change-project',
+          target: { resourceKind: 'project' }, desiredChange: { name: 'demo-prod' }, confidence: 0.9, ambiguities: [], requiresUserInput: false,
+        },
+        expectedPatch: { op: 'set-project-name', name: 'demo-prod' },
+        assertSpec: (spec) => expect(spec.projectName).toBe('demo-prod'),
+      },
+      {
+        intent: {
+          source: 'user-other-feedback', rawText: 'rename network', intent: 'rename-network',
+          target: { resourceKind: 'network', currentValue: 'app-network' }, desiredChange: { name: 'prod-network' }, confidence: 0.9, ambiguities: [], requiresUserInput: false,
+        },
+        expectedPatch: { op: 'rename-network', from: 'app-network', to: 'prod-network' },
+        assertSpec: (spec) => expect(spec.networks).toEqual(['prod-network']),
+      },
+      {
+        intent: {
+          source: 'user-other-feedback', rawText: 'set networks', intent: 'set-networks',
+          target: { resourceKind: 'network' }, desiredChange: { networks: ['frontend', 'backend'] }, confidence: 0.9, ambiguities: [], requiresUserInput: false,
+        },
+        expectedPatch: { op: 'set-networks', networks: ['frontend', 'backend'] },
+        assertSpec: (spec) => expect(spec.networks).toEqual(['frontend', 'backend']),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const planner = new StandardPlannerAgent(new FixedFeedbackIntentTestLlmProvider(testCase.intent));
+      const result = await planner.reviseFromFeedback({
+        desiredSpec: makeSpec(),
+        revisionObservation: {
+          verificationReport: null,
+          userFeedback: { message: String((testCase.intent as { rawText: string }).rawText), submittedAt: new Date().toISOString() },
+          driftSummary: null,
+        },
+        stateSnapshot: null,
+        attemptIndex: 0,
+      });
+
+      expect(result.patchPlan?.patches[0]).toMatchObject(testCase.expectedPatch as Record<string, unknown>);
+      testCase.assertSpec(result.revisedSpec);
+    }
   });
 
   it('blocks risky structured patches and returns clarification context', async () => {
@@ -2810,6 +3107,156 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
     expect(result.patchResults?.[0]?.blockedReason).toBeNull();
   });
 
+  it('treats database group total feedback as one logical replica patch down to suffix 1', async () => {
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
+    const req: PlannerRevisionRequest = {
+      desiredSpec: makeThreeDatabaseSpec(),
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'i mean total instance in database group is 1, not each is one', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    const result = await planner.reviseFromFeedback(req);
+
+    expect(result.revisionDecision).toBe('auto-revised');
+    expect(result.patchPlan?.patches).toEqual([
+      expect.objectContaining({
+        op: 'set-service-replicas',
+        target: expect.objectContaining({ targetKind: 'replica-group', name: 'postgres', kind: 'database', imageFamily: 'postgres' }),
+        replicas: 1,
+      }),
+    ]);
+    expect(result.revisedSpec.services.map((service) => service.name)).toEqual(['api', 'nginx', 'postgres-1']);
+    expect(result.revisedSpec.services.find((service) => service.name === 'api')?.dependsOn).toEqual(['postgres-1']);
+    expect(result.revisedSpec.volumes).toEqual(['postgres-data-1']);
+  });
+
+  it('applies LLM replica-group target patches without physical service ambiguity', async () => {
+    const planner = new StandardPlannerAgent(patchProvider([
+      {
+        op: 'set-service-replicas',
+        target: { targetKind: 'replica-group', name: 'postgres', kind: 'database', imageFamily: 'postgres' },
+        replicas: 4,
+        reason: 'LLM targeted the logical postgres replica group.',
+      },
+    ]));
+    const req: PlannerRevisionRequest = {
+      desiredSpec: makeThreeDatabaseSpec(),
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'set database group to total 4 instances', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    const result = await planner.reviseFromFeedback(req);
+
+    expect(result.revisionDecision).toBe('auto-revised');
+    expect(result.patchResults?.[0]?.blockedReason).toBeNull();
+    expect(result.patchResults?.[0]?.matchedServiceNames).toEqual(['postgres-1', 'postgres-2', 'postgres-3']);
+    expect(result.revisedSpec.services.map((service) => service.name)).toEqual([
+      'api',
+      'nginx',
+      'postgres-1',
+      'postgres-2',
+      'postgres-3',
+      'postgres-4',
+    ]);
+  });
+
+  it('repairs per-physical database replica patches into one logical group patch for total feedback', async () => {
+    const planner = new StandardPlannerAgent(patchProvider([
+      {
+        op: 'set-service-replicas',
+        target: { name: 'postgres-1' },
+        replicas: 1,
+        reason: 'LLM incorrectly targeted physical replica 1.',
+      },
+      {
+        op: 'set-service-replicas',
+        target: { name: 'postgres-2' },
+        replicas: 1,
+        reason: 'LLM incorrectly targeted physical replica 2.',
+      },
+      {
+        op: 'set-service-replicas',
+        target: { name: 'postgres-3' },
+        replicas: 1,
+        reason: 'LLM incorrectly targeted physical replica 3.',
+      },
+    ]));
+    const req: PlannerRevisionRequest = {
+      desiredSpec: makeThreeDatabaseSpec(),
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'total instance in database group is 1', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    const result = await planner.reviseFromFeedback(req);
+
+    expect(result.revisionDecision).toBe('auto-revised');
+    expect(result.patchPlan?.patches).toEqual([
+      expect.objectContaining({
+        op: 'set-service-replicas',
+        target: expect.objectContaining({ targetKind: 'replica-group', name: 'postgres', kind: 'database', imageFamily: 'postgres' }),
+        replicas: 1,
+      }),
+    ]);
+    expect(result.revisedSpec.services.map((service) => service.name)).toEqual(['api', 'nginx', 'postgres-1']);
+    expect(result.revisedSpec.volumes).toEqual(['postgres-data-1']);
+  });
+
+  it('sends logical and physical service catalogs to revision patch planning', async () => {
+    const provider = new RecordingPatchTestLlmProvider({
+      patches: [],
+      explanation: 'No patch needed for payload inspection.',
+      assumptions: [],
+      ambiguities: [],
+      requiresUserInput: true,
+      confidence: 0.1,
+    });
+    const planner = new StandardPlannerAgent(provider);
+    const req: PlannerRevisionRequest = {
+      desiredSpec: makeThreeDatabaseSpec(),
+      revisionObservation: {
+        verificationReport: null,
+        userFeedback: { message: 'which database services exist?', submittedAt: new Date().toISOString() },
+        driftSummary: null,
+      },
+      stateSnapshot: null,
+      attemptIndex: 0,
+    };
+
+    await planner.reviseFromFeedback(req);
+
+    const payload = JSON.parse(provider.patchRequests[0] ?? '{}');
+    expect(payload.logicalServiceCatalog).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'postgres',
+        role: 'database',
+        imageFamily: 'postgres',
+        stateful: true,
+        currentDesiredInstances: 3,
+        expandedServices: ['postgres-1', 'postgres-2', 'postgres-3'],
+      }),
+    ]));
+    expect(payload.physicalServiceCatalog).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'postgres-1', replicaGroup: 'postgres', ordinal: 1, physicalInstances: 1 }),
+      expect.objectContaining({ name: 'postgres-2', replicaGroup: 'postgres', ordinal: 2, physicalInstances: 1 }),
+      expect.objectContaining({ name: 'postgres-3', replicaGroup: 'postgres', ordinal: 3, physicalInstances: 1 }),
+    ]));
+  });
+
   it('normalizes malformed LLM feedback intent into a database replica patch', async () => {
     const planner = new StandardPlannerAgent(new MalformedDatabaseFeedbackIntentTestLlmProvider());
     const req: PlannerRevisionRequest = {
@@ -2827,7 +3274,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
 
     expect(result.revisionDecision).toBe('auto-revised');
     expect(result.patchPlan?.patches).toEqual([
-      expect.objectContaining({ op: 'set-service-replicas', target: { kind: 'database' }, replicas: 4 }),
+      expect.objectContaining({ op: 'set-service-replicas', target: expect.objectContaining({ kind: 'database' }), replicas: 4 }),
     ]);
     expect(result.revisedSpec.services.map((service) => service.name)).toEqual([
       'api',

@@ -241,7 +241,9 @@ export class ReActAgent {
   ): Promise<AgentRunResult> {
     const validContext = validatePlanningClarificationContext(context);
     const validAnswer = validateClarificationAnswer(answer);
-    const resolvedSpec = applyClarificationAnswer(validContext, validAnswer);
+    const resolution = applyClarificationAnswer(validContext, validAnswer);
+    const resolvedQuery = resolution.query;
+    const resolvedSpec = resolution.spec ?? validateInfrastructureSpec(buildSpecFromDraft(resolvedQuery));
     const remainingUncertainties = detectPlanningUncertainties(resolvedSpec).filter(
       (uncertainty) => uncertainty.severity === 'blocking',
     );
@@ -265,8 +267,9 @@ export class ReActAgent {
         clarificationChoices: primaryUncertainty.choices,
         allowOther: primaryUncertainty.allowOther,
         uncertainties: remainingUncertainties,
-        clarificationContext: {
+      clarificationContext: {
           ...validContext,
+          query: resolvedQuery,
           spec: resolvedSpec,
           uncertainties: remainingUncertainties,
         },
@@ -276,7 +279,7 @@ export class ReActAgent {
     }
 
     return this.buildPlannedResultFromValidatedSpec(
-      validContext.query,
+      resolvedQuery,
       resolvedSpec,
       [
         ...validContext.assumptions,
@@ -969,7 +972,11 @@ function buildImageSelectionClarification(
       ...query.draft,
       services: query.draft.services.map((service) =>
         service.image === null
-          ? { ...service, image: recommendedImage, name: service.name ?? 'web' }
+          ? {
+              ...service,
+              image: inferRecommendedImageForService(query, service, reasoning),
+              name: service.name ?? 'web',
+            }
           : service,
       ),
     },
@@ -1024,9 +1031,9 @@ function buildImageSelectionClarification(
     allowOther: uncertainty.allowOther,
     uncertainties: [uncertainty],
     clarificationContext: {
-      query,
+      query: provisionalQuery,
       spec: provisionalSpec,
-      assumptions: inferPlanAssumptions(query, provisionalSpec),
+      assumptions: inferPlanAssumptions(provisionalQuery, provisionalSpec),
       uncertainties: [uncertainty],
     },
     observations,
@@ -1057,6 +1064,28 @@ function inferRecommendedImage(
   }
 
   return 'nginx:stable';
+}
+
+function inferRecommendedImageForService(
+  query: ValidatedQuery,
+  service: DraftServiceQuery,
+  reasoning: ReActReasoningOutput | null,
+): string {
+  const serviceText = service.name?.toLowerCase() ?? '';
+
+  if (/\b(db|database|postgres|postgresql|postresql)\b/.test(serviceText)) {
+    return 'postgres:16';
+  }
+
+  if (/\b(backend|api|node|nodejs|server)\b/.test(serviceText)) {
+    return 'node:20-alpine';
+  }
+
+  if (/\b(web|website|nginx|ngix|proxy|reverse proxy)\b/.test(serviceText)) {
+    return 'nginx:stable';
+  }
+
+  return inferRecommendedImage(query, reasoning);
 }
 
 function buildImageSelectionCandidates(
@@ -1164,7 +1193,7 @@ function buildUnsupportedImageClarification(
     allowOther: true,
     uncertainties: [uncertainty],
     clarificationContext: {
-      query,
+      query: provisionalQuery,
       spec: provisionalSpec,
       assumptions: [
         ...inferPlanAssumptions(provisionalQuery, provisionalSpec),
@@ -1456,7 +1485,7 @@ function detectPlanningUncertainties(spec: InfrastructureSpec): PlanningUncertai
 function applyClarificationAnswer(
   context: PlanningClarificationContext,
   answer: ClarificationAnswer,
-): InfrastructureSpec {
+): { query: ValidatedQuery; spec: InfrastructureSpec | null } {
   const uncertainty = context.uncertainties.find(
     (candidate) => candidate.id === answer.uncertaintyId,
   );
@@ -1474,15 +1503,19 @@ function applyClarificationAnswer(
     throw new Error('Clarification answer did not resolve to a supported planning change.');
   }
 
-  const services = context.spec.services.map((service) => (
+  const specServices = context.spec.services.map((service) => (
     service.dependsOn
       ? { ...service, dependsOn: [...service.dependsOn] }
       : { ...service }
   ));
+  const draftServices = context.query.draft.services.map((service) => ({
+    ...service,
+    requestedMounts: [...service.requestedMounts],
+  }));
 
   if (resolvedValue.startsWith('dependsOn:')) {
     const [, serviceName, dependencyName] = resolvedValue.split(':');
-    const service = services.find((candidate) => candidate.name === serviceName);
+    const service = specServices.find((candidate) => candidate.name === serviceName);
     if (!service || !dependencyName) {
       throw new Error(`Invalid clarification dependency value: ${resolvedValue}`);
     }
@@ -1494,7 +1527,7 @@ function applyClarificationAnswer(
         .filter((service) => service.kind === 'database')
         .map((service) => service.name),
     );
-    const service = services.find((candidate) => candidate.name === serviceName);
+    const service = specServices.find((candidate) => candidate.name === serviceName);
     if (!service) {
       throw new Error(`Invalid clarification no-database value: ${resolvedValue}`);
     }
@@ -1508,7 +1541,7 @@ function applyClarificationAnswer(
     }
   } else if (resolvedValue.startsWith('removeEdge:')) {
     const [, serviceName, dependencyName] = resolvedValue.split(':');
-    const service = services.find((candidate) => candidate.name === serviceName);
+    const service = specServices.find((candidate) => candidate.name === serviceName);
     if (!service || !dependencyName) {
       throw new Error(`Invalid clarification remove-edge value: ${resolvedValue}`);
     }
@@ -1523,7 +1556,7 @@ function applyClarificationAnswer(
   } else if (resolvedValue.startsWith('setServiceImage:')) {
     const [, serviceName, ...imageParts] = resolvedValue.split(':');
     const imageRef = imageParts.join(':');
-    const service = services.find((candidate) => candidate.name === serviceName);
+    const service = draftServices.find((candidate) => candidate.name === serviceName);
     if (!service || !imageRef) {
       throw new Error(`Invalid clarification setServiceImage value: ${resolvedValue}`);
     }
@@ -1532,10 +1565,26 @@ function applyClarificationAnswer(
     throw new Error(`Unsupported clarification value: ${resolvedValue}`);
   }
 
-  return validateInfrastructureSpec(repairInfrastructureSpec({
-    ...context.spec,
-    services,
-  }));
+  if (!resolvedValue.startsWith('setServiceImage:')) {
+    return {
+      query: context.query,
+      spec: validateInfrastructureSpec(repairInfrastructureSpec({
+        ...context.spec,
+        services: specServices,
+      })),
+    };
+  }
+
+  return {
+    query: validateValidatedQuery({
+      ...context.query,
+      draft: {
+        ...context.query.draft,
+        services: draftServices,
+      },
+    }),
+    spec: null,
+  };
 }
 
 function inferChoiceValueFromOtherText(

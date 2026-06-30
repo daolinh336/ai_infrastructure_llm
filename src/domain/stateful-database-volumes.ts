@@ -25,6 +25,10 @@ export function getDatabaseDataVolumeTarget(service: DatabaseVolumeService): str
   return DATABASE_DATA_TARGETS[getImageReferenceBase(service.image)] ?? '/data';
 }
 
+export function isStatefulDatabaseService(service: DatabaseVolumeService): boolean {
+  return getDatabaseDataVolumeTarget(service) !== null;
+}
+
 export function hasSharedDatabaseDataVolume(service: DatabaseVolumeService): boolean {
   const replicas = service.replicas ?? 1;
   const target = getDatabaseDataVolumeTarget(service);
@@ -194,6 +198,22 @@ function groupExpandedDatabaseServices(
   }
 
   return groups;
+}
+
+export function getStatefulDatabaseShrinkRemovalOrder(
+  spec: InfrastructureSpec,
+  baseName: string,
+  targetReplicas: number,
+): Array<{ ordinal: number; serviceName: string; volumeNames: string[] }> {
+  const entries = groupExpandedDatabaseServices(spec.services).get(baseName) ?? [];
+  return entries
+    .filter((entry) => entry.ordinal > targetReplicas)
+    .sort((left, right) => right.ordinal - left.ordinal)
+    .map((entry) => ({
+      ordinal: entry.ordinal,
+      serviceName: entry.service.name,
+      volumeNames: getMountedDatabaseDataVolumeNames(entry.service),
+    }));
 }
 
 function getDatabaseReplicaVolumeName(

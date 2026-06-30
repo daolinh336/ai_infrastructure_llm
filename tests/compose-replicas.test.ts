@@ -35,6 +35,58 @@ describe('compose replicas rendering and scale warnings', () => {
     );
   });
 
+  it('reports auto-generated, safe env, and weak env secrets', () => {
+    const spec: InfrastructureSpec = {
+      projectName: 'sample-infra',
+      services: [
+        {
+          kind: 'database',
+          name: 'postgres-generated',
+          image: 'postgres:16',
+          environment: { POSTGRES_PASSWORD: 'pw-generatedsecret' },
+        },
+        {
+          kind: 'database',
+          name: 'postgres-env-safe',
+          image: 'postgres:16',
+          environment: { POSTGRES_PASSWORD: 'safe-env-password-2026' },
+        },
+        {
+          kind: 'database',
+          name: 'postgres-env-weak',
+          image: 'postgres:16',
+          environment: { POSTGRES_PASSWORD: 'abcabcabc' },
+        },
+      ],
+      networks: ['app-network'],
+      volumes: [],
+    };
+
+    const findings = evaluateDryRunPolicy(spec, undefined, {
+      services: [
+        {
+          serviceName: 'postgres-generated',
+          secrets: [{ key: 'POSTGRES_PASSWORD', envVarName: 'POSTGRES_PASSWORD', value: 'pw-generatedsecret', source: 'auto-generated' }],
+        },
+        {
+          serviceName: 'postgres-env-safe',
+          secrets: [{ key: 'POSTGRES_PASSWORD', envVarName: 'POSTGRES_PASSWORD', value: 'safe-env-password-2026', source: 'env-file' }],
+        },
+        {
+          serviceName: 'postgres-env-weak',
+          secrets: [{ key: 'POSTGRES_PASSWORD', envVarName: 'POSTGRES_PASSWORD', value: 'abcabcabc', source: 'env-file' }],
+        },
+      ],
+      updatedSpec: spec,
+    });
+
+    expect(findings).toContainEqual(expect.objectContaining({ code: 'auto-generated-secret', resourceName: 'postgres-generated' }));
+    expect(findings).toContainEqual(expect.objectContaining({ code: 'env-secret-used', resourceName: 'postgres-env-safe' }));
+    expect(findings).toContainEqual(expect.objectContaining({ code: 'weak-env-secret', resourceName: 'postgres-env-weak' }));
+    expect(JSON.stringify(findings)).not.toContain('safe-env-password-2026');
+    expect(JSON.stringify(findings)).not.toContain('abcabcabc');
+  });
+
   it('renders database scale requests as explicit service impacts', () => {
     const spec: InfrastructureSpec = {
       projectName: 'sample-infra',

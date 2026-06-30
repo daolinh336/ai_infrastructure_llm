@@ -18,6 +18,7 @@ import type {
   VerificationFinding,
   VerificationReport,
   DetailedDryRunPreview,
+  DryRunPolicyFinding,
   ExecutionScheduleStep,
   PreflightReport,
   ProgressEvent,
@@ -184,17 +185,20 @@ export function printDetailedDryRunPreview(
     console.log(
       `  readiness enforced now: ${service.readinessEnforced ? 'yes' : 'no, preview only'}`,
     );
-    for (const warning of service.warnings) {
+    for (const warning of service.warnings.filter(isUserFacingServiceWarning)) {
       console.log(`  warning: ${warning}`);
     }
   }
   console.log();
 
   console.log(chalk.cyan('Policy findings:'));
-  if (!preview.policyFindings.length) {
+  const visiblePolicyFindings = preview.policyFindings.filter((finding) =>
+    isUserFacingPolicyFinding(finding, preview),
+  );
+  if (!visiblePolicyFindings.length) {
     console.log('- none');
   }
-  for (const finding of preview.policyFindings) {
+  for (const finding of visiblePolicyFindings) {
     const target = finding.resourceName ? ` (${finding.resourceName})` : '';
     console.log(`- [${finding.severity}] ${finding.code}${target}: ${finding.message}`);
   }
@@ -206,6 +210,76 @@ export function printDetailedDryRunPreview(
   }
   console.log();
 }
+
+function isUserFacingServiceWarning(warning: string): boolean {
+  return /stateful databases must use isolated per-replica services and volumes/i.test(warning);
+}
+
+function isUserFacingPolicyFinding(
+  finding: DryRunPolicyFinding,
+  preview: DetailedDryRunPreview,
+): boolean {
+  switch (finding.code) {
+    case 'auto-generated-secret':
+    case 'env-secret-used':
+    case 'secret-policy-auto-repaired':
+    case 'weak-env-secret':
+    case 'weak-hardcoded-secret':
+      return true;
+    case 'schedule-readiness-warning':
+      return isTopologyDependencyWarning(finding.message);
+    case 'replica-preview':
+      return getFindingServiceKind(finding, preview) === 'database';
+    case 'exposed-host-port':
+      return isSensitiveHostPortFinding(finding, preview);
+    default:
+      return false;
+  }
+}
+
+function isTopologyDependencyWarning(message: string): boolean {
+  return (
+    /must be healthy before backend service/i.test(message) ||
+    /readiness is required before reverse proxy service/i.test(message) ||
+    /dependency|depends on|topology/i.test(message)
+  ) && !/planned wait condition|preview does not enforce runtime healthchecks/i.test(message);
+}
+
+function isSensitiveHostPortFinding(
+  finding: DryRunPolicyFinding,
+  preview: DetailedDryRunPreview,
+): boolean {
+  if (getFindingServiceKind(finding, preview) === 'database') {
+    return true;
+  }
+
+  const ports = finding.message.match(/\d+/g)?.map(Number) ?? [];
+  return ports.some((port) => SENSITIVE_HOST_PORTS.has(port));
+}
+
+function getFindingServiceKind(
+  finding: DryRunPolicyFinding,
+  preview: DetailedDryRunPreview,
+): DetailedDryRunPreview['services'][number]['kind'] | null {
+  if (!finding.resourceName) {
+    return null;
+  }
+
+  return preview.services.find((service) => service.name === finding.resourceName)?.kind ?? null;
+}
+
+const SENSITIVE_HOST_PORTS = new Set([
+  5432,
+  3306,
+  33060,
+  27017,
+  6379,
+  9200,
+  9300,
+  5672,
+  15672,
+  9092,
+]);
 
 export function printPreflightReport(preflight: PreflightReport): void {
   const statusColor = preflight.status === 'passed' ? chalk.green : chalk.red;
