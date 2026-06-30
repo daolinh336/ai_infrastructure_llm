@@ -1,4 +1,4 @@
-export type ProviderName = 'stub' | 'openai' | 'gemini';
+export type ProviderName = 'openai' | 'gemini';
 
 export type LlmPurpose = 'auxiliary' | 'react';
 

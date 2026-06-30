@@ -154,7 +154,7 @@ export const requestMetadataSchema = z
 export const cliInputSchema = z.object({
   prompt: z.string().min(1, 'Prompt must not be empty.'),
   dryRun: z.boolean().default(false),
-  provider: z.enum(['stub', 'openai', 'gemini']).default('openai'),
+  provider: z.enum(['openai', 'gemini']).default('openai'),
 });
 
 export const reactReasoningOutputSchema = z

@@ -39,7 +39,7 @@ export interface LlmResponse {
 }
 
 export interface LlmProvider {
-  readonly name: ProviderName;
+  readonly name: ProviderName | 'test';
   complete(input: LlmRequest): Promise<LlmResponse>;
   completeStructured(input: StructuredLlmRequest): Promise<LlmResponse>;
 }
@@ -130,55 +130,55 @@ export class ProviderConfigurationError extends Error {
   }
 }
 
-export class StubLlmProvider implements LlmProvider {
-  constructor(public readonly name: ProviderName = 'stub') {}
+export class TestLlmProvider implements LlmProvider {
+  readonly name = 'test';
 
   async complete(input: LlmRequest): Promise<LlmResponse> {
     if (input.system.includes('INTENT_CLASSIFIER_V1')) {
       return {
-        text: JSON.stringify(classifyIntentForStub(input.user)),
+        text: JSON.stringify(classifyIntentForTest(input.user)),
       };
     }
 
     if (input.system.includes('STRUCTURED_QUERY_PARSER_V1')) {
       return {
-        text: JSON.stringify(parseDraftQueryForStub(input.user)),
+        text: JSON.stringify(parseDraftQueryForTest(input.user)),
       };
     }
 
     return {
-      text: [`[stub:${this.name}]`, input.system, input.user].join('\n\n'),
+      text: ['[test-llm-provider]', input.system, input.user].join('\n\n'),
     };
   }
 
   async completeStructured(input: StructuredLlmRequest): Promise<LlmResponse> {
     if (input.schemaName === 'intent_classification') {
       return {
-        text: JSON.stringify(classifyIntentForStub(input.user)),
+        text: JSON.stringify(classifyIntentForTest(input.user)),
       };
     }
 
     if (input.schemaName === 'draft_query') {
       return {
-        text: JSON.stringify(parseDraftQueryForStub(input.user)),
+        text: JSON.stringify(parseDraftQueryForTest(input.user)),
       };
     }
 
     if (input.schemaName === 'react_reasoning_output') {
       return {
-        text: JSON.stringify(createReActReasoningForStub()),
+        text: JSON.stringify(createReActReasoningForTest()),
       };
     }
 
     if (input.schemaName === 'spec_patch_plan') {
       return {
-        text: JSON.stringify(createSpecPatchPlanForStub(input.user)),
+        text: JSON.stringify(createSpecPatchPlanForTest(input.user)),
       };
     }
 
     if (input.schemaName === 'feedback_intent') {
       return {
-        text: JSON.stringify(createFeedbackIntentForStub(input.user)),
+        text: JSON.stringify(createFeedbackIntentForTest(input.user)),
       };
     }
 
@@ -349,7 +349,7 @@ export class GeminiLlmProvider implements LlmProvider {
 }
 
 export class FallbackLlmProvider implements LlmProvider {
-  readonly name: ProviderName;
+  readonly name: ProviderName | 'test';
 
   constructor(
     private readonly primary: LlmProvider,
@@ -426,8 +426,6 @@ function createSingleProvider(
   env: NodeJS.ProcessEnv,
 ): LlmProvider {
   switch (name) {
-    case 'stub':
-      return new StubLlmProvider('stub');
     case 'openai':
       return new OpenAiLlmProvider(createOpenAiConfig(env));
     case 'gemini':
@@ -502,12 +500,12 @@ export function getFallbackProviderName(
 }
 
 function parseProviderName(value: string): ProviderName {
-  if (value === 'stub' || value === 'openai' || value === 'gemini') {
+  if (value === 'openai' || value === 'gemini') {
     return value;
   }
 
   throw new ProviderConfigurationError(
-    `Unknown provider "${value}". Supported providers: stub, openai, gemini.`,
+    `Unknown provider "${value}". Supported providers: openai, gemini.`,
   );
 }
 
@@ -600,7 +598,7 @@ function getErrorMessage(error: unknown): string {
   return String(error);
 }
 
-function classifyIntentForStub(prompt: string): IntentClassification {
+function classifyIntentForTest(prompt: string): IntentClassification {
   const normalizedPrompt = prompt.toLowerCase();
 
   if (/\b(hack|exploit|malware|facebook)\b/i.test(prompt) || isHarmfulControlRequest(prompt)) {
@@ -652,7 +650,7 @@ function isHarmfulControlRequest(prompt: string): boolean {
     /(world\s*domination|dominate\s+the\s+world|take\s+over\s+the\s+world)/i.test(prompt);
 }
 
-function parseDraftQueryForStub(rawInput: string): DraftQuery {
+function parseDraftQueryForTest(rawInput: string): DraftQuery {
   const parsedInput = parseParserInput(rawInput);
   const raw = parsedInput.raw;
   const intent = parsedInput.intent ?? detectIntent(raw);
@@ -677,9 +675,9 @@ function parseDraftQueryForStub(rawInput: string): DraftQuery {
   };
 }
 
-function createReActReasoningForStub(): ReActReasoningOutput {
+function createReActReasoningForTest(): ReActReasoningOutput {
   return {
-    summary: 'Stub ReAct reasoning accepted the ValidatedQuery.',
+    summary: 'Test ReAct reasoning accepted the ValidatedQuery.',
     nextAction: 'continue_planning',
     rationale:
       'Continue with deterministic internal tools for state loading, plan building, validation, and compose preview.',
@@ -689,18 +687,18 @@ function createReActReasoningForStub(): ReActReasoningOutput {
   };
 }
 
-function createSpecPatchPlanForStub(_rawInput: string): SpecPatchPlan {
+function createSpecPatchPlanForTest(_rawInput: string): SpecPatchPlan {
   return {
     patches: [],
-    explanation: 'Stub provider does not synthesize revision patches. Configure a real LLM provider for natural-language revision.',
-    assumptions: ['No regex or hard-coded stub mapping is used for spec patch planning.'],
+    explanation: 'Test provider does not synthesize revision patches. Configure OpenAI or Gemini for natural-language revision.',
+    assumptions: ['No regex or hard-coded test mapping is used for spec patch planning.'],
     ambiguities: ['A real LLM provider is required to convert feedback into a schema-valid SpecPatchPlan.'],
     requiresUserInput: true,
     confidence: 0,
   };
 }
 
-function createFeedbackIntentForStub(rawInput: string): import('../domain/types.js').FeedbackIntent {
+function createFeedbackIntentForTest(rawInput: string): import('../domain/types.js').FeedbackIntent {
   return {
     source: 'user-other-feedback',
     rawText: rawInput,

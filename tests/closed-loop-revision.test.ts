@@ -17,6 +17,7 @@ import type {
   CleanupReport,
   InfrastructureSpec,
   InfrastructureStateSnapshot,
+  PlannerRevisionResult,
   PlannerRevisionRequest,
   RevisionObservation,
   RuntimeActualState,
@@ -27,7 +28,7 @@ import type {
 } from '../src/domain/types.js';
 import { ReActAgent } from '../src/agent/react-agent.js';
 import { StandardPlannerAgent } from '../src/agent/standard-planner-agent.js';
-import { StubLlmProvider } from '../src/llm/provider.js';
+import { TestLlmProvider } from '../src/llm/provider.js';
 import { StaticGateway } from '../src/static-gateway/static-gateway.js';
 import {
   ClosedLoopGuard,
@@ -47,12 +48,12 @@ import { ExecutionEngine } from '../src/execution/execution-engine.js';
 import { savePendingPreview } from '../src/state/sqlite-state-store.js';
 import { runClosedLoopDeploy } from '../src/cli/deploy-loop.js';
 
-class RecordingStubLlmProvider extends StubLlmProvider {
+class RecordingTestLlmProvider extends TestLlmProvider {
   readonly intentRequests: string[] = [];
   readonly draftRequests: string[] = [];
   readonly reactRequests: string[] = [];
 
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'intent_classification') {
       this.intentRequests.push(input.user);
     }
@@ -69,12 +70,12 @@ class RecordingStubLlmProvider extends StubLlmProvider {
   }
 }
 
-class FixedDraftStubLlmProvider extends StubLlmProvider {
+class FixedDraftTestLlmProvider extends TestLlmProvider {
   constructor(private readonly draft: DraftQuery) {
-    super('stub');
+    super();
   }
 
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'draft_query') {
       return { text: JSON.stringify(this.draft) };
     }
@@ -83,8 +84,8 @@ class FixedDraftStubLlmProvider extends StubLlmProvider {
   }
 }
 
-class ComponentsDraftStubLlmProvider extends StubLlmProvider {
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+class ComponentsDraftTestLlmProvider extends TestLlmProvider {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'draft_query') {
       return {
         text: JSON.stringify({
@@ -102,12 +103,12 @@ class ComponentsDraftStubLlmProvider extends StubLlmProvider {
   }
 }
 
-class FixedPatchStubLlmProvider extends StubLlmProvider {
+class FixedPatchTestLlmProvider extends TestLlmProvider {
   constructor(private readonly patchPlan: SpecPatchPlan) {
-    super('stub');
+    super();
   }
 
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'spec_patch_plan') {
       return { text: JSON.stringify(this.patchPlan) };
     }
@@ -116,14 +117,14 @@ class FixedPatchStubLlmProvider extends StubLlmProvider {
   }
 }
 
-class RecordingPatchStubLlmProvider extends StubLlmProvider {
+class RecordingPatchTestLlmProvider extends TestLlmProvider {
   readonly patchRequests: string[] = [];
 
   constructor(private readonly patchPlan: SpecPatchPlan) {
-    super('stub');
+    super();
   }
 
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'spec_patch_plan') {
       this.patchRequests.push(input.user);
       return { text: JSON.stringify(this.patchPlan) };
@@ -133,11 +134,11 @@ class RecordingPatchStubLlmProvider extends StubLlmProvider {
   }
 }
 
-class FeedbackIntentPatchStubLlmProvider extends StubLlmProvider {
+class FeedbackIntentPatchTestLlmProvider extends TestLlmProvider {
   readonly feedbackIntentRequests: string[] = [];
   readonly patchRequests: string[] = [];
 
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'feedback_intent') {
       this.feedbackIntentRequests.push(input.user);
       return {
@@ -184,8 +185,8 @@ class FeedbackIntentPatchStubLlmProvider extends StubLlmProvider {
   }
 }
 
-class InvalidPatchStubLlmProvider extends StubLlmProvider {
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+class InvalidPatchTestLlmProvider extends TestLlmProvider {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'spec_patch_plan') {
       return { text: JSON.stringify({ not: 'a patch plan' }) };
     }
@@ -194,12 +195,12 @@ class InvalidPatchStubLlmProvider extends StubLlmProvider {
   }
 }
 
-class RawPatchStubLlmProvider extends StubLlmProvider {
+class RawPatchTestLlmProvider extends TestLlmProvider {
   constructor(private readonly rawPatchPlan: unknown) {
-    super('stub');
+    super();
   }
 
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'spec_patch_plan') {
       return { text: JSON.stringify(this.rawPatchPlan) };
     }
@@ -208,8 +209,8 @@ class RawPatchStubLlmProvider extends StubLlmProvider {
   }
 }
 
-class MisparsedQuantityAsPortStubLlmProvider extends StubLlmProvider {
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+class MisparsedQuantityAsPortTestLlmProvider extends TestLlmProvider {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'draft_query') {
       return {
         text: JSON.stringify({
@@ -231,8 +232,8 @@ class MisparsedQuantityAsPortStubLlmProvider extends StubLlmProvider {
   }
 }
 
-class MalformedDatabaseFeedbackIntentStubLlmProvider extends StubLlmProvider {
-  override async completeStructured(input: Parameters<StubLlmProvider['completeStructured']>[0]) {
+class MalformedDatabaseFeedbackIntentTestLlmProvider extends TestLlmProvider {
+  override async completeStructured(input: Parameters<TestLlmProvider['completeStructured']>[0]) {
     if (input.schemaName === 'feedback_intent') {
       return {
         text: JSON.stringify({
@@ -263,8 +264,8 @@ class MalformedDatabaseFeedbackIntentStubLlmProvider extends StubLlmProvider {
   }
 }
 
-function patchProvider(patches: SpecPatchPlan['patches'], overrides: Partial<SpecPatchPlan> = {}): FixedPatchStubLlmProvider {
-  return new FixedPatchStubLlmProvider({
+function patchProvider(patches: SpecPatchPlan['patches'], overrides: Partial<SpecPatchPlan> = {}): FixedPatchTestLlmProvider {
+  return new FixedPatchTestLlmProvider({
     patches,
     explanation: 'Test provider returned schema-valid patches.',
     assumptions: ['Patch intent is supplied as structured LLM output for this test.'],
@@ -277,7 +278,7 @@ function patchProvider(patches: SpecPatchPlan['patches'], overrides: Partial<Spe
 
 describe('StaticGateway topology clarification', () => {
   it('sends the full request to the LLM intent gate before accepting infrastructure scope', async () => {
-    const provider = new RecordingStubLlmProvider();
+    const provider = new RecordingTestLlmProvider();
     const gateway = new StaticGateway(provider);
 
     const result = await gateway.validate('tao 1 terminator');
@@ -289,7 +290,7 @@ describe('StaticGateway topology clarification', () => {
   });
 
   it('sends accepted infrastructure requests to the LLM structured parser', async () => {
-    const provider = new RecordingStubLlmProvider();
+    const provider = new RecordingTestLlmProvider();
     const gateway = new StaticGateway(provider);
 
     const result = await gateway.validate('Create nginx and node');
@@ -302,7 +303,7 @@ describe('StaticGateway topology clarification', () => {
   });
 
   it('normalizes component-shaped structured parser output before validation', async () => {
-    const gateway = new StaticGateway(new ComponentsDraftStubLlmProvider());
+    const gateway = new StaticGateway(new ComponentsDraftTestLlmProvider());
 
     const result = await gateway.validate(
       'tao cho toi 1 web dung ngix, 2 backend nodejs va 3 db dung postresql',
@@ -320,7 +321,7 @@ describe('StaticGateway topology clarification', () => {
   });
 
   it('ignores quantity numbers misparsed as ports when prompt has no port keyword', async () => {
-    const gateway = new StaticGateway(new MisparsedQuantityAsPortStubLlmProvider());
+    const gateway = new StaticGateway(new MisparsedQuantityAsPortTestLlmProvider());
 
     const result = await gateway.validate(
       'tao cho toi 1 web dung ngix, 2 backend nodejs va 3 db dung postresql',
@@ -334,7 +335,7 @@ describe('StaticGateway topology clarification', () => {
   });
 
   it('rejects harmful create requests before ReAct planning starts', async () => {
-    const provider = new RecordingStubLlmProvider();
+    const provider = new RecordingTestLlmProvider();
     const gateway = new StaticGateway(provider);
 
     const result = await gateway.validate('tao cho toi 1 model AI co the chinh phuc the gioi');
@@ -349,7 +350,7 @@ describe('StaticGateway topology clarification', () => {
   });
 
   it('asks before connecting a reverse proxy directly to a database', async () => {
-    const gateway = new StaticGateway(new StubLlmProvider('stub'));
+    const gateway = new StaticGateway(new TestLlmProvider());
 
     const result = await gateway.validate('Create nginx and mysql');
 
@@ -362,7 +363,7 @@ describe('StaticGateway topology clarification', () => {
   });
 
   it('allows backend plus database without requiring nginx', async () => {
-    const gateway = new StaticGateway(new StubLlmProvider('stub'));
+    const gateway = new StaticGateway(new TestLlmProvider());
 
     const result = await gateway.validate('Create node and postgres');
 
@@ -370,7 +371,7 @@ describe('StaticGateway topology clarification', () => {
   });
 
   it('allows reverse proxy plus backend without requiring a database', async () => {
-    const gateway = new StaticGateway(new StubLlmProvider('stub'));
+    const gateway = new StaticGateway(new TestLlmProvider());
 
     const result = await gateway.validate('Create nginx and node');
 
@@ -379,7 +380,7 @@ describe('StaticGateway topology clarification', () => {
 
   it('rejects high replicas even when the image is unresolved', async () => {
     const gateway = new StaticGateway(
-      new FixedDraftStubLlmProvider({
+      new FixedDraftTestLlmProvider({
         raw: 'Create a web service and 1000 database containers',
         normalizedPrompt: 'Create a web service and 1000 database containers',
         intent: 'create',
@@ -411,7 +412,7 @@ describe('StaticGateway topology clarification', () => {
   });
 
   it('rejects explicit huge container counts even if the parser misses replicas', async () => {
-    const gateway = new StaticGateway(new StubLlmProvider('stub'));
+    const gateway = new StaticGateway(new TestLlmProvider());
 
     const result = await gateway.validate('Create a static web service with 1000 containers');
 
@@ -428,7 +429,7 @@ describe('ReAct planning uncertainty gate', () => {
 
     try {
       const firstAgent = new ReActAgent(
-        new StubLlmProvider('stub'),
+        new TestLlmProvider(),
         undefined,
         stateStore,
         undefined,
@@ -446,7 +447,7 @@ describe('ReAct planning uncertainty gate', () => {
       const dryRun = await new ExecutionEngine({ stateStore }).dryRun(firstResult);
       await savePendingPreview(dryRun.pendingPreview, stateStore);
 
-      const recordingProvider = new RecordingStubLlmProvider();
+      const recordingProvider = new RecordingTestLlmProvider();
       const secondAgent = new ReActAgent(
         recordingProvider,
         undefined,
@@ -471,7 +472,7 @@ describe('ReAct planning uncertainty gate', () => {
 
   it('asks when a reverse proxy has multiple possible backend targets', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -501,7 +502,7 @@ describe('ReAct planning uncertainty gate', () => {
 
   it('continues planning after user selects a clarification choice', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -540,7 +541,7 @@ describe('ReAct planning uncertainty gate', () => {
 
   it('continues without asking for a single clear proxy/backend/database chain', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -570,7 +571,7 @@ describe('ReAct planning uncertainty gate', () => {
 
   it('does not put host ports in source spec except reverse-proxy services', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -600,7 +601,7 @@ describe('ReAct planning uncertainty gate', () => {
 describe('ReAct image-selection confirmation', () => {
   it('asks the user to confirm a default image for a generic static-web request', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -625,7 +626,7 @@ describe('ReAct image-selection confirmation', () => {
 
   it('continues planning after the user confirms the default image', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -660,7 +661,7 @@ describe('ReAct image-selection confirmation', () => {
 
   it('applies an alternative image when the user selects a different choice', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -702,7 +703,7 @@ describe('ReAct image-selection confirmation', () => {
 
   it('offers 1/2/3 choices when the requested image is unsupported', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -728,7 +729,7 @@ describe('ReAct image-selection confirmation', () => {
 
   it('continues planning after the user picks a suggested replacement for an unsupported image', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -761,7 +762,7 @@ describe('ReAct image-selection confirmation', () => {
 
   it('accepts Other for an unsupported image and keeps the custom value', async () => {
     const agent = new ReActAgent(
-      new StubLlmProvider('stub'),
+      new TestLlmProvider(),
       undefined,
       {},
       undefined,
@@ -1097,6 +1098,70 @@ function makeApprovedAction(validatedSpec: InfrastructureSpec): ApprovedAction {
   };
 }
 
+function makeActualState(containers: RuntimeActualState['containers'] = []): RuntimeActualState {
+  return {
+    source: 'mcp-readonly',
+    containers,
+    networks: [],
+    volumes: [],
+    images: [],
+    lastObservedAt: new Date().toISOString(),
+  };
+}
+
+function makeDeployResult(approvedAction: ApprovedAction, operationId = 'op-test') {
+  return {
+    networksCreated: [],
+    imagesPulled: [],
+    containersStarted: [],
+    startedAt: new Date().toISOString(),
+    operationId,
+    attemptScope: {
+      operationId,
+      approvedActionId: approvedAction.id,
+      projectName: approvedAction.validatedSpec.projectName,
+      attemptIndex: 0,
+      createdAt: new Date().toISOString(),
+    },
+  };
+}
+
+function makeRevisionResult(
+  revisedSpec: InfrastructureSpec,
+  revisionDecision: NonNullable<PlannerRevisionResult['revisionDecision']>,
+  revisionSummary = 'Planner still needs a target service.',
+): PlannerRevisionResult {
+  return {
+    revisedSpec,
+    revisionSummary,
+    assumptions: ['test revision assumption'],
+    revisionDecision,
+    ...(revisionDecision === 'needs-user-input'
+      ? {
+          clarificationContext: [
+            {
+              id: 'test-clarification',
+              severity: 'warning',
+              field: 'topology',
+              message: 'Planner needs a target service.',
+              reason: 'Multiple services could match.',
+              affectedServices: revisedSpec.services.map((service) => service.name),
+              choices: [
+                {
+                  id: '1',
+                  label: 'Use api',
+                  description: 'Apply the revision to api.',
+                  value: 'targetService:api',
+                },
+              ],
+              allowOther: true,
+            },
+          ],
+        }
+      : {}),
+  };
+}
+
 describe('Pre-deploy conflict diagnostics', () => {
   it('verifies against the approved revised spec instead of the original plan spec', async () => {
     const originalSpec = {
@@ -1165,6 +1230,199 @@ describe('Pre-deploy conflict diagnostics', () => {
     expect(observedSpecs[0]).toEqual(revisedSpec);
   });
 
+  it('stops before deploy when pre-deploy conflict revision still needs user input', async () => {
+    const spec = makeSpec();
+    const approvedAction = makeApprovedAction(spec);
+    const deployWithDocker = vi.fn(async () => makeDeployResult(approvedAction));
+    const reviseFromFeedback = vi.fn(async (_request: PlannerRevisionRequest): Promise<PlannerRevisionResult> =>
+      makeRevisionResult(spec, 'needs-user-input'),
+    );
+    const clarificationFeedbacks: Array<UserFeedback | null> = [
+      { message: 'Use api', submittedAt: new Date().toISOString() },
+      null,
+    ];
+    const requestRevisionClarification = vi.fn(async (): Promise<UserFeedback | null> =>
+      clarificationFeedbacks.shift() ?? null,
+    );
+
+    const result = await runClosedLoopDeploy({
+      agent: {
+        verifyAfterApply: vi.fn(async () => makeVerificationReport([])),
+        reviseFromFeedback,
+      },
+      engine: {
+        deployWithDocker,
+        cleanupAttemptScope: vi.fn(),
+      },
+      mcpClient: {
+        observeActualState: vi.fn(async () => makeActualState([{ name: 'test-revision-api', image: 'node:20-alpine', status: 'running', ports: [] }])),
+        observeActualStateWithInspect: vi.fn(async () => makeActualState()),
+      } as unknown as DockerMcpGateway,
+      closedLoopGuard: new ClosedLoopGuard({ ...DEFAULT_CLOSED_LOOP_CONFIG, maxVerifyReviseIterations: 3 }),
+      approvedAction,
+      plan: { summary: 'test', spec, assumptions: [], steps: [] },
+      requestRuntimeApproval: vi.fn(),
+      requestRevisionClarification,
+      saveVerifiedRuntimeSnapshot: vi.fn(),
+    });
+
+    expect(result.status).toBe('failed');
+    expect(deployWithDocker).not.toHaveBeenCalled();
+    expect(reviseFromFeedback).toHaveBeenCalledTimes(2);
+    expect(requestRevisionClarification).toHaveBeenCalledTimes(2);
+    expect(result.revisionHistory[0]?.revisionDecision).toBe('needs-user-input');
+    expect(result.revisionHistory[0]?.userFeedback?.message).toBe('Use api');
+  });
+
+  it('stops after deploy error when revision remains ambiguous after clarification', async () => {
+    const spec = makeSpec();
+    const approvedAction = makeApprovedAction(spec);
+    const deployWithDocker = vi.fn(async () => {
+      throw new Error('MCP tool error: port allocation failed');
+    });
+    const reviseFromFeedback = vi.fn(async (_request: PlannerRevisionRequest): Promise<PlannerRevisionResult> =>
+      makeRevisionResult(spec, 'needs-user-input'),
+    );
+    const clarificationFeedbacks: Array<UserFeedback | null> = [
+      { message: 'Use nginx', submittedAt: new Date().toISOString() },
+      null,
+    ];
+    const requestRevisionClarification = vi.fn(async (): Promise<UserFeedback | null> =>
+      clarificationFeedbacks.shift() ?? null,
+    );
+
+    const result = await runClosedLoopDeploy({
+      agent: {
+        verifyAfterApply: vi.fn(async () => makeVerificationReport([])),
+        reviseFromFeedback,
+      },
+      engine: {
+        deployWithDocker,
+        cleanupAttemptScope: vi.fn(),
+      },
+      mcpClient: {
+        observeActualState: vi.fn(async () => makeActualState()),
+        observeActualStateWithInspect: vi.fn(async () => makeActualState()),
+      } as unknown as DockerMcpGateway,
+      closedLoopGuard: new ClosedLoopGuard({ ...DEFAULT_CLOSED_LOOP_CONFIG, maxVerifyReviseIterations: 3 }),
+      approvedAction,
+      plan: { summary: 'test', spec, assumptions: [], steps: [] },
+      requestRuntimeApproval: vi.fn(async (): Promise<ApprovalDecision> => ({ choice: 'approved', userFeedback: null })),
+      requestRevisionClarification,
+      saveVerifiedRuntimeSnapshot: vi.fn(),
+    });
+
+    expect(result.status).toBe('failed');
+    expect(deployWithDocker).toHaveBeenCalledTimes(1);
+    expect(reviseFromFeedback).toHaveBeenCalledTimes(2);
+    expect(requestRevisionClarification).toHaveBeenCalledTimes(2);
+    expect(result.revisionHistory[0]?.revisionDecision).toBe('needs-user-input');
+  });
+
+  it('cleans up and stops when post-deploy verifier revision still needs user input', async () => {
+    const spec = makeSpec();
+    const approvedAction = makeApprovedAction(spec);
+    const deployWithDocker = vi.fn(async () => makeDeployResult(approvedAction, 'op-verify'));
+    const cleanupAttemptScope = vi.fn(async (): Promise<CleanupReport> => ({
+      trigger: 'deploy-failed',
+      attempted: [],
+      succeeded: [],
+      failed: [],
+      leftovers: [],
+    }));
+    const reviseFromFeedback = vi.fn(async (_request: PlannerRevisionRequest): Promise<PlannerRevisionResult> =>
+      makeRevisionResult(spec, 'needs-user-input'),
+    );
+    const clarificationFeedbacks: Array<UserFeedback | null> = [
+      { message: 'Use api', submittedAt: new Date().toISOString() },
+      null,
+    ];
+    const requestRevisionClarification = vi.fn(async (): Promise<UserFeedback | null> =>
+      clarificationFeedbacks.shift() ?? null,
+    );
+
+    const result = await runClosedLoopDeploy({
+      agent: {
+        verifyAfterApply: vi.fn(async () => makeVerificationReport(['CONTAINER_UNHEALTHY: api failed readiness'])),
+        reviseFromFeedback,
+      },
+      engine: {
+        deployWithDocker,
+        cleanupAttemptScope,
+      },
+      mcpClient: {
+        observeActualState: vi.fn(async () => makeActualState()),
+        observeActualStateWithInspect: vi.fn(async () => makeActualState()),
+      } as unknown as DockerMcpGateway,
+      closedLoopGuard: new ClosedLoopGuard({ ...DEFAULT_CLOSED_LOOP_CONFIG, maxVerifyReviseIterations: 3 }),
+      approvedAction,
+      plan: { summary: 'test', spec, assumptions: [], steps: [] },
+      requestRuntimeApproval: vi.fn(async (): Promise<ApprovalDecision> => ({ choice: 'approved', userFeedback: null })),
+      requestRevisionClarification,
+      saveVerifiedRuntimeSnapshot: vi.fn(),
+    });
+
+    expect(result.status).toBe('failed');
+    expect(deployWithDocker).toHaveBeenCalledTimes(1);
+    expect(cleanupAttemptScope).toHaveBeenCalledTimes(1);
+    expect(reviseFromFeedback).toHaveBeenCalledTimes(2);
+    expect(result.revisionHistory[0]?.revisionDecision).toBe('needs-user-input');
+  });
+
+  it('continues after clarification resolves a needs-user-input pre-deploy revision', async () => {
+    const originalSpec = makeSpec();
+    const revisedSpec = {
+      ...makeSpec(),
+      services: makeSpec().services.map((service) =>
+        service.name === 'nginx' ? { ...service, name: 'edge' } : service,
+      ),
+    };
+    const approvedAction = makeApprovedAction(originalSpec);
+    const deployWithDocker = vi.fn(async (action: ApprovedAction) => makeDeployResult(action, 'op-resolved'));
+    const revisionResults = [
+      makeRevisionResult(originalSpec, 'needs-user-input'),
+      makeRevisionResult(revisedSpec, 'auto-revised', 'Clarification resolved target service.'),
+    ];
+    const reviseFromFeedback = vi.fn(async (_request: PlannerRevisionRequest): Promise<PlannerRevisionResult> =>
+      revisionResults.shift() ?? makeRevisionResult(revisedSpec, 'auto-revised', 'Clarification resolved target service.'),
+    );
+    const requestRevisionClarification = vi.fn(async (): Promise<UserFeedback | null> => ({
+      message: 'User selected Use api: targetService:api',
+      submittedAt: new Date().toISOString(),
+    }));
+
+    const result = await runClosedLoopDeploy({
+      agent: {
+        verifyAfterApply: vi.fn(async () => makeVerificationReport([])),
+        reviseFromFeedback,
+      },
+      engine: {
+        deployWithDocker,
+        cleanupAttemptScope: vi.fn(),
+      },
+      mcpClient: {
+        observeActualState: vi
+          .fn()
+          .mockResolvedValueOnce(makeActualState([{ name: 'test-revision-api', image: 'node:20-alpine', status: 'running', ports: [] }]))
+          .mockResolvedValue(makeActualState()),
+        observeActualStateWithInspect: vi.fn(async () => makeActualState()),
+      } as unknown as DockerMcpGateway,
+      closedLoopGuard: new ClosedLoopGuard({ ...DEFAULT_CLOSED_LOOP_CONFIG, maxVerifyReviseIterations: 3 }),
+      approvedAction,
+      plan: { summary: 'test', spec: originalSpec, assumptions: [], steps: [] },
+      requestRuntimeApproval: vi.fn(),
+      requestRevisionClarification,
+      saveVerifiedRuntimeSnapshot: vi.fn(),
+    });
+
+    expect(result.status).toBe('passed');
+    expect(requestRevisionClarification).toHaveBeenCalledTimes(1);
+    expect(reviseFromFeedback).toHaveBeenCalledTimes(2);
+    expect(deployWithDocker).toHaveBeenCalledTimes(1);
+    expect(result.currentApprovedAction.validatedSpec).toEqual(revisedSpec);
+    expect(result.revisionHistory[0]?.revisionDecision).toBe('auto-revised');
+  });
+
 
   it('normalizes deploy port allocation errors and uses structured other feedback before redeploy', async () => {
     const spec: InfrastructureSpec = {
@@ -1175,7 +1433,7 @@ describe('Pre-deploy conflict diagnostics', () => {
       networks: ['app-network'],
       volumes: [],
     };
-    const provider = new FeedbackIntentPatchStubLlmProvider();
+    const provider = new FeedbackIntentPatchTestLlmProvider();
     const planner = new StandardPlannerAgent(provider);
     const deploySpecs: InfrastructureSpec[] = [];
     const runtimeReports: PlannerRevisionRequest['runtimeIssueReport'][] = [];
@@ -1274,7 +1532,7 @@ describe('Pre-deploy conflict diagnostics', () => {
       networks: ['app-network'],
       volumes: [],
     };
-    const planner = new StandardPlannerAgent(new FixedPatchStubLlmProvider({
+    const planner = new StandardPlannerAgent(new FixedPatchTestLlmProvider({
       patches: [
         {
           op: 'rename-service',
@@ -1650,7 +1908,7 @@ describe('PlannerRevisionRequest schema', () => {
 
 describe('StandardPlannerAgent.proposeSpec runtime context', () => {
   it('uses redacted planner summaries to avoid existing names and occupied ports', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const runtimeReader: PlannerRuntimeReader = {
       async listUsedHostPorts() {
         return [{ hostPort: '8080', containerName: 'create-web-api-web' }];
@@ -1697,7 +1955,7 @@ describe('StandardPlannerAgent.proposeSpec runtime context', () => {
 
 describe('StandardPlannerAgent.reviseFromFeedback', () => {
   it('produces a revised spec from verifier feedback', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: makeSpec(),
       revisionObservation: {
@@ -1715,7 +1973,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('merges verifier issues + user feedback into the revision', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: makeSpec(),
       revisionObservation: {
@@ -1731,7 +1989,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('re-validates the spec and returns a valid InfrastructureSpec', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: makeSpec(),
       revisionObservation: {
@@ -1972,7 +2230,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('falls back to a schema-valid port patch when structured revision output is invalid', async () => {
-    const planner = new StandardPlannerAgent(new InvalidPatchStubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new InvalidPatchTestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: {
         projectName: 'sample-infra',
@@ -2043,7 +2301,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('falls back to a schema-valid host-port patch when structured output is invalid', async () => {
-    const planner = new StandardPlannerAgent(new InvalidPatchStubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new InvalidPatchTestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: {
         projectName: 'sample-infra',
@@ -2117,7 +2375,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('falls back to a schema-valid db replica patch when LLM output is invalid', async () => {
-    const planner = new StandardPlannerAgent(new InvalidPatchStubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new InvalidPatchTestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: {
         projectName: 'sample-infra',
@@ -2163,7 +2421,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('falls back for Vietnamese no-accent database scale feedback', async () => {
-    const planner = new StandardPlannerAgent(new InvalidPatchStubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new InvalidPatchTestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: {
         projectName: 'sample-infra',
@@ -2204,7 +2462,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('normalizes non-contract LLM patch aliases before applying feedback', async () => {
-    const planner = new StandardPlannerAgent(new RawPatchStubLlmProvider({
+    const planner = new StandardPlannerAgent(new RawPatchTestLlmProvider({
       patches: [
         {
           op: 'update-service-replicas',
@@ -2255,7 +2513,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('normalizes camelCase LLM replica patch output with selector target', async () => {
-    const planner = new StandardPlannerAgent(new RawPatchStubLlmProvider({
+    const planner = new StandardPlannerAgent(new RawPatchTestLlmProvider({
       patches: [
         {
           op: 'setReplicas',
@@ -2347,7 +2605,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('uses an other clarification target with verifier context still present', async () => {
-    const provider = new RecordingPatchStubLlmProvider({
+    const provider = new RecordingPatchTestLlmProvider({
       patches: [{ op: 'set-service-replicas', target: { name: 'postgres' }, replicas: 1, reason: 'Real LLM mapped user feedback to the selected service.' }],
       explanation: 'Apply selected database replica count.',
       assumptions: ['The selected targetService value identifies postgres.'],
@@ -2463,7 +2721,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('blocks risky structured patches and returns clarification context', async () => {
-    const planner = new StandardPlannerAgent(new FixedPatchStubLlmProvider({
+    const planner = new StandardPlannerAgent(new FixedPatchTestLlmProvider({
       patches: [
         {
           op: 'remove-service',
@@ -2497,7 +2755,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('applies a risky structured patch after explicit allow feedback', async () => {
-    const planner = new StandardPlannerAgent(new FixedPatchStubLlmProvider({
+    const planner = new StandardPlannerAgent(new FixedPatchTestLlmProvider({
       patches: [
         {
           op: 'remove-service',
@@ -2530,7 +2788,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('treats database reduction feedback as a replica-count change for the database group', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: makeThreeDatabaseSpec(),
       revisionObservation: {
@@ -2553,7 +2811,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('normalizes malformed LLM feedback intent into a database replica patch', async () => {
-    const planner = new StandardPlannerAgent(new MalformedDatabaseFeedbackIntentStubLlmProvider());
+    const planner = new StandardPlannerAgent(new MalformedDatabaseFeedbackIntentTestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: makeThreeDatabaseSpec(),
       revisionObservation: {
@@ -2588,7 +2846,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('requires user input when database replica feedback has no clear group target', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: {
         projectName: 'test-revision',
@@ -2716,7 +2974,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('applies verifier observe for missing network by patching spec networks', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: { ...makeSpec(), networks: [] },
       revisionObservation: {
@@ -2734,7 +2992,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('asks for user input when feedback has no safe deterministic patch', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: makeSpec(),
       revisionObservation: {
@@ -2790,7 +3048,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('auto-resolves structured host port conflicts to the next safe port', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: {
         projectName: 'sample-infra',
@@ -2832,7 +3090,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('skips multiple occupied ports when auto-resolving conflicts', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: {
         projectName: 'sample-infra',
@@ -2889,7 +3147,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('asks user when image-not-found has no supported fallback', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: makeSpec(),
       revisionObservation: {
@@ -2925,7 +3183,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
   });
 
   it('keeps runtime drift as a repair decision instead of blindly changing spec', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const desiredSpec = makeSpec();
     const req: PlannerRevisionRequest = {
       desiredSpec,
@@ -2960,7 +3218,7 @@ describe('StandardPlannerAgent.reviseFromFeedback', () => {
     expect(result.revisionDecision).toBe('no-safe-resolution');
   });
   it('marks ambiguous unhealthy findings as needing user input', async () => {
-    const planner = new StandardPlannerAgent(new StubLlmProvider('stub'));
+    const planner = new StandardPlannerAgent(new TestLlmProvider());
     const req: PlannerRevisionRequest = {
       desiredSpec: makeSpec(),
       revisionObservation: {

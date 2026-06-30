@@ -69,7 +69,7 @@ export function registerPlanCommand(program: Command): void {
     )
     .option(
       '--provider <provider>',
-      'LLM provider to use (stub|openai|gemini)',
+      'LLM provider to use (openai|gemini)',
       process.env.INFRA_AGENT_PROVIDER ?? 'openai',
     )
     .action(async (prompt, options) => {
@@ -101,19 +101,7 @@ export function registerPlanCommand(program: Command): void {
         phase: 'cli',
         message: 'acting... create provider and static gateway.',
       });
-      const effectiveProvider =
-        deployRequested &&
-        input.provider === 'stub' &&
-        process.env.OPENAI_API_KEY?.trim()
-          ? 'openai'
-          : input.provider;
-      if (effectiveProvider !== input.provider) {
-        reportProgress({
-          phase: 'cli',
-          message: `acting... OPENAI_API_KEY found; using provider "${effectiveProvider}" for deploy-time ReAct revision.`,
-        });
-      }
-      const provider = createProvider(effectiveProvider);
+      const provider = createProvider(input.provider);
       const gateway = new StaticGateway(provider, reportProgress);
 
       reportProgress({

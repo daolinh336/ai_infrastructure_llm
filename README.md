@@ -107,7 +107,7 @@ INFRA_DOCKER_PULL_RETRY_BACKOFF_FACTOR=2
 
 ## LLM providers
 
-Supported provider names are `stub`, `openai`, and `gemini`.
+Supported runtime provider names are `openai` and `gemini`.
 
 ```bash
 INFRA_AGENT_PROVIDER=openai
@@ -127,7 +127,7 @@ Provider notes:
 
 - OpenAI uses the `openai` package and can use an OpenAI-compatible `OPENAI_BASE_URL`.
 - Gemini uses direct Google `generateContent` HTTP calls through `GEMINI_BASE_URL`.
-- The stub provider is deterministic and useful for local tests, but it still uses heuristic parsing for some prompt and feedback paths.
+- Tests use `TestLlmProvider` fixtures; the CLI runtime path expects OpenAI or Gemini structured output.
 
 ## Runtime limits
 

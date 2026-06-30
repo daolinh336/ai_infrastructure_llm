@@ -25,6 +25,8 @@ import {
   detectPreDeployConflicts,
 } from './shared.js';
 
+const MAX_REVISION_CLARIFICATION_ROUNDS = 3;
+
 export interface ClosedLoopAgentPort {
   verifyAfterApply(plan: ExecutionPlan, mcpClient: DockerMcpGateway): Promise<VerificationReport>;
   reviseFromFeedback(request: PlannerRevisionRequest): Promise<{
@@ -77,6 +79,12 @@ export interface ClosedLoopDeployResult {
   successfulDeployResult?: Awaited<ReturnType<ClosedLoopEnginePort['deployWithDocker']>>;
 }
 
+type RevisionResult = Awaited<ReturnType<ClosedLoopAgentPort['reviseFromFeedback']>>;
+
+type RevisionResolutionResult =
+  | { status: 'resolved'; revisionResult: RevisionResult; userFeedback: UserFeedback | null }
+  | { status: 'blocked'; revisionResult: RevisionResult; userFeedback: UserFeedback | null; reason: string };
+
 export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Promise<ClosedLoopDeployResult> {
   let currentApprovedAction = options.approvedAction;
   let currentPlan = {
@@ -113,29 +121,25 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         resourceRefs,
         attemptIndex,
       };
-      let revisionFeedback = revisionRequest.revisionObservation.userFeedback;
-      let revisionResult = await options.agent.reviseFromFeedback(revisionRequest);
-      if (revisionResult.revisionDecision === 'needs-user-input') {
-        const clarificationFeedback = await options.requestRevisionClarification(revisionResult);
-        if (clarificationFeedback) {
-          revisionFeedback = clarificationFeedback;
-          revisionResult = await options.agent.reviseFromFeedback({
-            ...revisionRequest,
-            revisionObservation: {
-              ...revisionRequest.revisionObservation,
-              userFeedback: clarificationFeedback,
-            },
-          });
-        }
-      }
+      const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest);
+      const revisionResolution = await resolveRevisionWithClarifications(
+        options,
+        revisionRequest,
+        initialRevisionResult,
+      );
+      const revisionResult = revisionResolution.revisionResult;
       revisionHistory.push({
         attemptIndex,
         revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
         revisionSummary: revisionResult.revisionSummary,
         findings: conflictReport.findings ?? [],
-        userFeedback: revisionFeedback,
+        userFeedback: revisionResolution.userFeedback,
         createdAt: new Date().toISOString(),
       });
+      if (revisionResolution.status === 'blocked') {
+        log(revisionResolution.reason);
+        return { status: 'failed', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+      }
       currentPlan = {
         ...currentPlan,
         spec: revisionResult.revisedSpec,
@@ -171,7 +175,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
       }
 
-      let revisionObservation: RevisionObservation = {
+      const revisionObservation: RevisionObservation = {
         verificationReport,
         userFeedback: runtimeDecision.userFeedback,
         driftSummary: null,
@@ -185,22 +189,25 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         resourceRefs: buildResourceRefs(currentApprovedAction.validatedSpec.projectName, preDeployActual, currentApprovedAction.validatedSpec),
         attemptIndex,
       };
-      let revisionResult = await options.agent.reviseFromFeedback(revisionRequest);
-      if (revisionResult.revisionDecision === 'needs-user-input') {
-        const clarificationFeedback = await options.requestRevisionClarification(revisionResult);
-        if (clarificationFeedback) {
-          revisionObservation = { ...revisionObservation, userFeedback: clarificationFeedback };
-          revisionResult = await options.agent.reviseFromFeedback({ ...revisionRequest, revisionObservation });
-        }
-      }
+      const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest);
+      const revisionResolution = await resolveRevisionWithClarifications(
+        options,
+        revisionRequest,
+        initialRevisionResult,
+      );
+      const revisionResult = revisionResolution.revisionResult;
       revisionHistory.push({
         attemptIndex,
         revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
         revisionSummary: revisionResult.revisionSummary,
         findings: verificationReport.findings ?? [],
-        userFeedback: revisionObservation.userFeedback,
+        userFeedback: revisionResolution.userFeedback,
         createdAt: new Date().toISOString(),
       });
+      if (revisionResolution.status === 'blocked') {
+        log(revisionResolution.reason);
+        return { status: 'failed', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+      }
       currentPlan = {
         ...currentPlan,
         spec: revisionResult.revisedSpec,
@@ -251,7 +258,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
     }
 
-    let revisionObservation: RevisionObservation = {
+    const revisionObservation: RevisionObservation = {
       verificationReport,
       userFeedback: runtimeDecision.userFeedback,
       driftSummary: driftReport.status !== 'none' ? driftReport.summary : null,
@@ -263,23 +270,26 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       resourceRefs,
       attemptIndex,
     };
-    let revisionResult = await options.agent.reviseFromFeedback(revisionRequest);
-    if (revisionResult.revisionDecision === 'needs-user-input') {
-      const clarificationFeedback = await options.requestRevisionClarification(revisionResult);
-      if (clarificationFeedback) {
-        revisionObservation = { ...revisionObservation, userFeedback: clarificationFeedback };
-        revisionResult = await options.agent.reviseFromFeedback({ ...revisionRequest, revisionObservation });
-      }
-    }
+    const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest);
+    const revisionResolution = await resolveRevisionWithClarifications(
+      options,
+      revisionRequest,
+      initialRevisionResult,
+    );
+    const revisionResult = revisionResolution.revisionResult;
     revisionHistory.push({
       attemptIndex,
       revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
       revisionSummary: revisionResult.revisionSummary,
       findings: verificationReport.findings ?? [],
-      userFeedback: revisionObservation.userFeedback,
+      userFeedback: revisionResolution.userFeedback,
       createdAt: new Date().toISOString(),
     });
     await options.engine.cleanupAttemptScope(options.mcpClient, deployResult.attemptScope);
+    if (revisionResolution.status === 'blocked') {
+      log(revisionResolution.reason);
+      return { status: 'failed', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+    }
     currentPlan = {
       ...currentPlan,
       spec: revisionResult.revisedSpec,
@@ -288,6 +298,47 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
     currentApprovedAction = { ...currentApprovedAction, validatedSpec: revisionResult.revisedSpec };
     log(`Attempt ${attemptIndex} post-deploy verification failed; cleaned up and revised before redeploy.`);
   }
+}
+
+async function resolveRevisionWithClarifications(
+  options: Pick<ClosedLoopDeployOptions, 'agent' | 'requestRevisionClarification'>,
+  revisionRequest: PlannerRevisionRequest,
+  initialRevisionResult: RevisionResult,
+): Promise<RevisionResolutionResult> {
+  let revisionResult = initialRevisionResult;
+  let userFeedback = revisionRequest.revisionObservation.userFeedback;
+
+  for (let round = 0; revisionResult.revisionDecision === 'needs-user-input'; round += 1) {
+    if (round >= MAX_REVISION_CLARIFICATION_ROUNDS) {
+      return {
+        status: 'blocked',
+        revisionResult,
+        userFeedback,
+        reason: `Planner still needs user input after ${MAX_REVISION_CLARIFICATION_ROUNDS} clarification round(s); stopping deploy loop.`,
+      };
+    }
+
+    const clarificationFeedback = await options.requestRevisionClarification(revisionResult);
+    if (clarificationFeedback === null) {
+      return {
+        status: 'blocked',
+        revisionResult,
+        userFeedback,
+        reason: 'Planner still needs user input after clarification; stopping deploy loop before redeploy.',
+      };
+    }
+
+    userFeedback = clarificationFeedback;
+    revisionResult = await options.agent.reviseFromFeedback({
+      ...revisionRequest,
+      revisionObservation: {
+        ...revisionRequest.revisionObservation,
+        userFeedback: clarificationFeedback,
+      },
+    });
+  }
+
+  return { status: 'resolved', revisionResult, userFeedback };
 }
 
 function tickGuard(
