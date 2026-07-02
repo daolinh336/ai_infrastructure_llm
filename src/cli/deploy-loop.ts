@@ -11,9 +11,11 @@ import type {
   RevisionObservation,
   RuntimeIssueReport,
   RuntimeActualState,
+  SpecPatchPlan,
   UserFeedback,
   VerificationFinding,
   VerificationReport,
+  ResolvedSpecPatchResult,
 } from '../domain/types.js';
 import { validateInfrastructureSpec, validateVerificationReport } from '../domain/schemas.js';
 import type { ExecutionEngine } from '../execution/execution-engine.js';
@@ -24,6 +26,7 @@ import {
   createConflictVerificationReport,
   detectPreDeployConflicts,
 } from './shared.js';
+import { getTrustedReplacementImages, type TrustedImageRole } from '../domain/supported-images.js';
 
 const MAX_REVISION_CLARIFICATION_ROUNDS = 3;
 
@@ -34,6 +37,8 @@ export interface ClosedLoopAgentPort {
     revisionSummary: string;
     assumptions: string[];
     revisionDecision?: RevisionHistoryRecord['revisionDecision'];
+    patchPlan?: SpecPatchPlan;
+    patchResults?: ResolvedSpecPatchResult[];
     clarificationContext?: import('../domain/types.js').PlanningUncertainty[];
   }>;
 }
@@ -56,7 +61,7 @@ export interface ClosedLoopDeployOptions {
   closedLoopGuard: ClosedLoopGuard;
   approvedAction: ApprovedAction;
   plan: ExecutionPlan;
-  requestRuntimeApproval(report: VerificationReport, attemptIndex: number): Promise<ApprovalDecision>;
+  requestRuntimeApproval(report: VerificationReport, attemptIndex: number, revisionPreview?: RevisionResult): Promise<ApprovalDecision>;
   requestRevisionClarification(revisionResult: Awaited<ReturnType<ClosedLoopAgentPort['reviseFromFeedback']>>): Promise<UserFeedback | null>;
   saveVerifiedRuntimeSnapshot(input: {
     approvedAction: ApprovedAction;
@@ -154,6 +159,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         ...currentApprovedAction,
         validatedSpec: revisionResult.revisedSpec,
       };
+      logPlannerRevision(log, revisionResult);
       log('Pre-deploy conflict revised before Docker mutation.');
       continue;
     }
@@ -175,30 +181,48 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         return { status: 'guard-stopped', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
       }
 
-      const runtimeDecision = await options.requestRuntimeApproval(verificationReport, attemptIndex);
-      if (runtimeDecision.choice === 'rejected') {
-        return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
-      }
-
-      const revisionObservation: RevisionObservation = {
-        verificationReport,
-        userFeedback: runtimeDecision.userFeedback,
-        driftSummary: null,
-      };
       const revisionRequest: PlannerRevisionRequest = {
         desiredSpec: currentApprovedAction.validatedSpec,
         currentPlan,
         runtimeIssueReport,
-        revisionObservation,
+        revisionObservation: {
+          verificationReport,
+          userFeedback: null,
+          driftSummary: null,
+        },
         stateSnapshot: null,
         resourceRefs: buildResourceRefs(currentApprovedAction.validatedSpec.projectName, preDeployActual, currentApprovedAction.validatedSpec),
         attemptIndex,
       };
       const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest);
+
+      const runtimeDecision = await options.requestRuntimeApproval(verificationReport, attemptIndex, initialRevisionResult);
+      if (runtimeDecision.choice === 'rejected') {
+        return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+      }
+
+      const requestedRevision = runtimeDecision.userFeedback === null
+        ? initialRevisionResult
+        : await options.agent.reviseFromFeedback({
+          ...revisionRequest,
+          revisionObservation: {
+            ...revisionRequest.revisionObservation,
+            userFeedback: runtimeDecision.userFeedback,
+          },
+        });
+      const requestedRevisionRequest = runtimeDecision.userFeedback === null
+        ? revisionRequest
+        : {
+          ...revisionRequest,
+          revisionObservation: {
+            ...revisionRequest.revisionObservation,
+            userFeedback: runtimeDecision.userFeedback,
+          },
+        };
       const revisionResolution = await resolveRevisionWithClarifications(
         options,
-        revisionRequest,
-        initialRevisionResult,
+        requestedRevisionRequest,
+        requestedRevision,
       );
       const revisionResult = withExpectedProjectName(
         revisionResolution.revisionResult,
@@ -222,6 +246,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         assumptions: [...currentPlan.assumptions, ...revisionResult.assumptions],
       };
       currentApprovedAction = { ...currentApprovedAction, validatedSpec: revisionResult.revisedSpec };
+      logPlannerRevision(log, revisionResult);
       log('Deploy error normalized into runtime issue report; revised before redeploy.');
       continue;
     }
@@ -260,29 +285,47 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       return { status: 'guard-stopped', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
     }
 
-    const runtimeDecision = await options.requestRuntimeApproval(verificationReport, attemptIndex);
-    if (runtimeDecision.choice === 'rejected') {
-      await options.engine.cleanupAttemptScope(options.mcpClient, deployResult.attemptScope);
-      return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
-    }
-
-    const revisionObservation: RevisionObservation = {
-      verificationReport,
-      userFeedback: runtimeDecision.userFeedback,
-      driftSummary: driftReport.status !== 'none' ? driftReport.summary : null,
-    };
     const revisionRequest: PlannerRevisionRequest = {
       desiredSpec: currentApprovedAction.validatedSpec,
-      revisionObservation,
+      revisionObservation: {
+        verificationReport,
+        userFeedback: null,
+        driftSummary: driftReport.status !== 'none' ? driftReport.summary : null,
+      },
       stateSnapshot: null,
       resourceRefs,
       attemptIndex,
     };
     const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest);
+
+    const runtimeDecision = await options.requestRuntimeApproval(verificationReport, attemptIndex, initialRevisionResult);
+    if (runtimeDecision.choice === 'rejected') {
+      await options.engine.cleanupAttemptScope(options.mcpClient, deployResult.attemptScope);
+      return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+    }
+
+    const requestedRevision = runtimeDecision.userFeedback === null
+      ? initialRevisionResult
+      : await options.agent.reviseFromFeedback({
+        ...revisionRequest,
+        revisionObservation: {
+          ...revisionRequest.revisionObservation,
+          userFeedback: runtimeDecision.userFeedback,
+        },
+      });
+    const requestedRevisionRequest = runtimeDecision.userFeedback === null
+      ? revisionRequest
+      : {
+        ...revisionRequest,
+        revisionObservation: {
+          ...revisionRequest.revisionObservation,
+          userFeedback: runtimeDecision.userFeedback,
+        },
+      };
     const revisionResolution = await resolveRevisionWithClarifications(
       options,
-      revisionRequest,
-      initialRevisionResult,
+      requestedRevisionRequest,
+      requestedRevision,
     );
     const revisionResult = withExpectedProjectName(
       revisionResolution.revisionResult,
@@ -307,6 +350,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       assumptions: [...currentPlan.assumptions, ...revisionResult.assumptions],
     };
     currentApprovedAction = { ...currentApprovedAction, validatedSpec: revisionResult.revisedSpec };
+    logPlannerRevision(log, revisionResult);
     log(`Attempt ${attemptIndex} post-deploy verification failed; cleaned up and revised before redeploy.`);
   }
 }
@@ -429,6 +473,36 @@ function runtimeIssueReportToVerificationReport(report: RuntimeIssueReport): Ver
   });
 }
 
+function logPlannerRevision(
+  log: (message: string) => void,
+  revisionResult: Awaited<ReturnType<ClosedLoopAgentPort['reviseFromFeedback']>>,
+): void {
+  log('Planner revision decision: ' + (revisionResult.revisionDecision ?? 'auto-revised'));
+  log('Planner revision summary: ' + revisionResult.revisionSummary);
+  const patchResults = revisionResult.patchResults ?? [];
+  if (patchResults.length === 0) return;
+  log('Planner patches:');
+  for (const result of patchResults) {
+    const patch = result.patch;
+    const target = result.matchedServiceNames.length > 0 ? result.matchedServiceNames.join(', ') : 'global';
+    log(`- ${patch.op} ${target}${describePatchChange(patch)} -> ${result.applied ? 'applied' : 'skipped'}${result.blockedReason ? ' (' + result.blockedReason + ')' : ''}`);
+  }
+}
+
+function describePatchChange(patch: SpecPatchPlan['patches'][number]): string {
+  if (patch.op === 'replace-service-port') return ` ${patch.from ?? '*'} -> ${patch.to}`;
+  if (patch.op === 'add-service-port') return ` +${patch.port}`;
+  if (patch.op === 'remove-service-port') return ` -${patch.port ?? '*'}`;
+  if (patch.op === 'set-service-replicas') return ` -> ${patch.replicas}`;
+  if (patch.op === 'set-service-image') return ` -> ${patch.image}`;
+  if (patch.op === 'rename-service') return ` -> ${patch.name}`;
+  if (patch.op === 'set-project-name') return ` -> ${patch.name}`;
+  if (patch.op === 'rename-network') return ` ${patch.from ?? '*'} -> ${patch.to}`;
+  if (patch.op === 'set-networks') return ` -> ${patch.networks.join(', ')}`;
+  if (patch.op === 'set-service-desired-status') return ` -> ${patch.desiredStatus}`;
+  return '';
+}
+
 function classifyDeployError(
   message: string,
   desiredSpec: ApprovedAction['validatedSpec'],
@@ -456,18 +530,39 @@ function classifyDeployError(
     };
   }
 
-  if (/manifest .*not found|pull access denied|image .*not found|No such image/i.test(message)) {
+  const pullFailureClass = classifyImagePullFailure(message);
+  if (pullFailureClass !== null) {
     const service = inferServiceFromImageError(message, desiredSpec);
+    const replacements = service
+      ? getTrustedReplacementImages(service.image, service.kind as TrustedImageRole, pullFailureClass !== 'auth')
+      : [];
+    const choices = replacements.slice(0, 3).map((image, index) => ({
+      id: String(index + 1),
+      label: 'Use ' + image,
+      description: 'Rebuild the affected service with trusted ' + service?.kind + ' image ' + image + '.',
+      value: 'use ' + image,
+    }));
     return {
       code: 'IMAGE_PULL_FAILED',
       severity: 'error',
       resourceKind: 'image',
       resourceName: service?.name ?? null,
       expected: service?.image ?? null,
-      actual: 'image pull failed',
-      evidence: [`Image pull failed during deploy: ${message}`],
+      actual: 'image pull failed: ' + pullFailureClass,
+      evidence: [
+        `Image pull failed during deploy (${pullFailureClass}): ${message}`,
+        replacements.length > 0
+          ? `Trusted replacement candidates: ${replacements.join(', ')}`
+          : 'No trusted equivalent image is available for this service role.',
+      ],
       confidence: service ? 0.9 : 0.78,
-      suggestedAction: { action: 'ask-user', summary: 'Provide a reachable image or credentials before redeploying.' },
+      suggestedAction: {
+        action: 'ask-user',
+        summary: replacements.length > 0
+          ? 'Choose a trusted replacement image, provide another image, or cancel deployment.'
+          : 'No trusted equivalent image is available; provide another trusted image or cancel deployment.',
+        ...(choices.length > 0 ? { choices } : {}),
+      },
       requiresUserInput: true,
     };
   }
@@ -499,6 +594,16 @@ function classifyDeployError(
     suggestedAction: { action: 'ask-user', summary: 'Provide other feedback or cancel deployment.' },
     requiresUserInput: true,
   };
+}
+
+function classifyImagePullFailure(message: string): 'auth' | 'not-found' | 'transient' | 'rate-limit' | 'unsupported' | null {
+  if (!/pull|image|manifest|repository|registry|Unsupported trusted image catalog/i.test(message)) return null;
+  if (/Unsupported trusted image catalog/i.test(message)) return 'unsupported';
+  if (/unauthorized|authentication required|authorization failed|pull access denied|access denied/i.test(message)) return 'auth';
+  if (/too many requests|rate limit|\b429\b/i.test(message)) return 'rate-limit';
+  if (/manifest .*not found|manifest unknown|image .*not found|No such image|repository does not exist|name unknown|not found/i.test(message)) return 'not-found';
+  if (/timed out|timeout|deadline exceeded|temporary failure|connection reset|connection refused|connection closed|network is unreachable|no route to host|tls handshake timeout|\b50[234]\b|econnreset|etimedout|eai_again/i.test(message)) return 'transient';
+  return null;
 }
 
 function inferServiceFromErrorEndpoint(

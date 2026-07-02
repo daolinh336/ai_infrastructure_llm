@@ -2,6 +2,7 @@ import type {
   InfrastructureStateSnapshot,
   VerifiedRuntimeSnapshot,
 } from '../domain/types.js';
+import { desiredPortMappingsPresent } from '../domain/port-mappings.js';
 import {
   loadState,
   StateStoreError,
@@ -81,9 +82,7 @@ function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string
       ? isRunningStatus(container.status)
       : !isRunningStatus(container.status);
     const shouldComparePorts = desiredStatus === 'running' && isRunningStatus(container.status);
-    const portsOk = !shouldComparePorts || (service.ports ?? []).every((port) =>
-      (container.ports ?? []).some((actualPort) => actualPort.includes(port.split(':')[0] ?? '')),
-    );
+    const portsOk = !shouldComparePorts || desiredPortMappingsPresent(service.ports, container.ports ?? []);
     const portsMarker = shouldComparePorts ? (portsOk ? '(ok)' : '(DRIFT)') : '(not checked)';
     lines.push(
       `  - ${label} | image: ${service.image} ${imageOk ? '==' : '!='} ${container.image ?? 'unknown'} ${imageOk ? '(ok)' : '(DRIFT)'} | lifecycle: ${desiredStatus} ${lifecycleOk ? '==' : '!='} ${status} ${lifecycleOk ? '(ok)' : '(DRIFT)'} | ports: ${desiredPorts} ${portsOk ? '==' : '!='} ${actualPorts} ${portsMarker}`,

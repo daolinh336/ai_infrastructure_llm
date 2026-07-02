@@ -152,6 +152,22 @@ const patchBaseProperties = {
   reason: { type: 'string', minLength: 1 },
 };
 
+const patchRelevanceJsonSchemaProperties = {
+  resolvesIssueCodes: { type: 'array', items: { type: 'string', minLength: 1 } },
+  affectedServiceNames: { type: 'array', items: { type: 'string', minLength: 1 } },
+  resolutionReason: { type: 'string', minLength: 1 },
+};
+
+const patchRelevanceProperties = {
+  reason: { type: 'string', minLength: 1 },
+  ...patchRelevanceJsonSchemaProperties,
+};
+
+const patchBaseRequired = ['op', 'target', 'reason'];
+const patchRelevanceRequired = ['reason'];
+const verifierPatchBaseRequired = ['op', 'target', 'reason', 'resolvesIssueCodes', 'affectedServiceNames', 'resolutionReason'];
+const verifierPatchRelevanceRequired = ['reason', 'resolvesIssueCodes', 'affectedServiceNames', 'resolutionReason'];
+
 const environmentEntryJsonSchema = {
   type: 'object',
   properties: {
@@ -278,7 +294,7 @@ export const specPatchPlanJsonSchema = {
               ...patchBaseProperties,
               replicas: { type: 'integer', minimum: 1, maximum: 50 },
             },
-            required: ['op', 'target', 'replicas', 'reason'],
+            required: [...patchBaseRequired, 'replicas'],
           },
           {
             type: 'object',
@@ -288,7 +304,7 @@ export const specPatchPlanJsonSchema = {
               from: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
               to: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
             },
-            required: ['op', 'target', 'to', 'reason'],
+            required: [...patchBaseRequired, 'to'],
           },
           {
             type: 'object',
@@ -297,7 +313,7 @@ export const specPatchPlanJsonSchema = {
               ...patchBaseProperties,
               port: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
             },
-            required: ['op', 'target', 'port', 'reason'],
+            required: [...patchBaseRequired, 'port'],
           },
           {
             type: 'object',
@@ -306,7 +322,7 @@ export const specPatchPlanJsonSchema = {
               ...patchBaseProperties,
               port: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
             },
-            required: ['op', 'target', 'reason'],
+            required: patchBaseRequired,
           },
           {
             type: 'object',
@@ -315,16 +331,16 @@ export const specPatchPlanJsonSchema = {
               ...patchBaseProperties,
               image: { type: 'string', minLength: 1 },
             },
-            required: ['op', 'target', 'image', 'reason'],
+            required: [...patchBaseRequired, 'image'],
           },
           {
             type: 'object',
             properties: {
               op: { type: 'string', enum: ['add-service'] },
               service: infrastructureServiceJsonSchema,
-              reason: { type: 'string', minLength: 1 },
+              ...patchRelevanceProperties,
             },
-            required: ['op', 'service', 'reason'],
+            required: ['op', 'service', ...patchRelevanceRequired],
           },
           {
             type: 'object',
@@ -332,7 +348,7 @@ export const specPatchPlanJsonSchema = {
               op: { type: 'string', enum: ['remove-service'] },
               ...patchBaseProperties,
             },
-            required: ['op', 'target', 'reason'],
+            required: patchBaseRequired,
           },
           {
             type: 'object',
@@ -341,7 +357,7 @@ export const specPatchPlanJsonSchema = {
               ...patchBaseProperties,
               name: { type: 'string', minLength: 1 },
             },
-            required: ['op', 'target', 'name', 'reason'],
+            required: [...patchBaseRequired, 'name'],
           },
           {
             type: 'object',
@@ -351,7 +367,7 @@ export const specPatchPlanJsonSchema = {
               key: { type: 'string', minLength: 1 },
               value: { type: 'string', minLength: 1 },
             },
-            required: ['op', 'target', 'key', 'value', 'reason'],
+            required: [...patchBaseRequired, 'key', 'value'],
           },
           {
             type: 'object',
@@ -360,7 +376,7 @@ export const specPatchPlanJsonSchema = {
               ...patchBaseProperties,
               key: { type: 'string', minLength: 1 },
             },
-            required: ['op', 'target', 'key', 'reason'],
+            required: [...patchBaseRequired, 'key'],
           },
           {
             type: 'object',
@@ -369,7 +385,7 @@ export const specPatchPlanJsonSchema = {
               ...patchBaseProperties,
               volume: { type: 'string', minLength: 1 },
             },
-            required: ['op', 'target', 'volume', 'reason'],
+            required: [...patchBaseRequired, 'volume'],
           },
           {
             type: 'object',
@@ -378,7 +394,7 @@ export const specPatchPlanJsonSchema = {
               ...patchBaseProperties,
               dependencyName: { type: 'string', minLength: 1 },
             },
-            required: ['op', 'target', 'dependencyName', 'reason'],
+            required: [...patchBaseRequired, 'dependencyName'],
           },
           {
             type: 'object',
@@ -387,16 +403,16 @@ export const specPatchPlanJsonSchema = {
               ...patchBaseProperties,
               desiredStatus: { type: 'string', enum: ['running', 'stopped'] },
             },
-            required: ['op', 'target', 'desiredStatus', 'reason'],
+            required: [...patchBaseRequired, 'desiredStatus'],
           },
           {
             type: 'object',
             properties: {
               op: { type: 'string', enum: ['set-project-name'] },
               name: { type: 'string', minLength: 1 },
-              reason: { type: 'string', minLength: 1 },
+              ...patchRelevanceProperties,
             },
-            required: ['op', 'name', 'reason'],
+            required: ['op', 'name', ...patchRelevanceRequired],
           },
           {
             type: 'object',
@@ -404,20 +420,34 @@ export const specPatchPlanJsonSchema = {
               op: { type: 'string', enum: ['rename-network'] },
               from: { type: 'string', minLength: 1 },
               to: { type: 'string', minLength: 1 },
-              reason: { type: 'string', minLength: 1 },
+              ...patchRelevanceProperties,
             },
-            required: ['op', 'to', 'reason'],
+            required: ['op', 'to', ...patchRelevanceRequired],
           },
           {
             type: 'object',
             properties: {
               op: { type: 'string', enum: ['set-networks'] },
               networks: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1 },
-              reason: { type: 'string', minLength: 1 },
+              ...patchRelevanceProperties,
             },
-            required: ['op', 'networks', 'reason'],
+            required: ['op', 'networks', ...patchRelevanceRequired],
           },
         ],
+      },
+    },
+    issueAnalysis: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          issueCode: { type: 'string', minLength: 1 },
+          affectedResource: { type: 'string', minLength: 1 },
+          affectedServiceName: { type: 'string', minLength: 1 },
+          intendedFix: { type: 'string', minLength: 1 },
+          userActionNeeded: { type: 'string', minLength: 1 },
+        },
+        required: ['issueCode', 'affectedResource', 'intendedFix'],
       },
     },
     explanation: { type: 'string', minLength: 1 },
@@ -427,4 +457,195 @@ export const specPatchPlanJsonSchema = {
     confidence: { type: 'number', minimum: 0, maximum: 1 },
   },
   required: ['patches', 'explanation', 'assumptions', 'ambiguities', 'requiresUserInput', 'confidence'],
+} satisfies JsonSchema;
+
+export const verifierRemediationPatchPlanJsonSchema = {
+  type: 'object',
+  properties: {
+    patches: {
+      type: 'array',
+      items: {
+        anyOf: [
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-service-replicas'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              replicas: { type: 'integer', minimum: 1, maximum: 50 },
+            },
+            required: [...verifierPatchBaseRequired, 'replicas'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['replace-service-port'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              from: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
+              to: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
+            },
+            required: [...verifierPatchBaseRequired, 'to'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['add-service-port'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              port: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
+            },
+            required: [...verifierPatchBaseRequired, 'port'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['remove-service-port'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              port: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' },
+            },
+            required: verifierPatchBaseRequired,
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-service-image'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              image: { type: 'string', minLength: 1 },
+            },
+            required: [...verifierPatchBaseRequired, 'image'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['add-service'] },
+              service: infrastructureServiceJsonSchema,
+              ...patchRelevanceProperties,
+            },
+            required: ['op', 'service', ...verifierPatchRelevanceRequired],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['remove-service'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+            },
+            required: verifierPatchBaseRequired,
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['rename-service'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              name: { type: 'string', minLength: 1 },
+            },
+            required: [...verifierPatchBaseRequired, 'name'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-service-env'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              key: { type: 'string', minLength: 1 },
+              value: { type: 'string', minLength: 1 },
+            },
+            required: [...verifierPatchBaseRequired, 'key', 'value'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['remove-service-env'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              key: { type: 'string', minLength: 1 },
+            },
+            required: [...verifierPatchBaseRequired, 'key'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['add-service-volume', 'remove-service-volume'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              volume: { type: 'string', minLength: 1 },
+            },
+            required: [...verifierPatchBaseRequired, 'volume'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['add-service-dependency', 'remove-service-dependency'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              dependencyName: { type: 'string', minLength: 1 },
+            },
+            required: [...verifierPatchBaseRequired, 'dependencyName'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-service-desired-status'] },
+              ...patchBaseProperties,
+              ...patchRelevanceJsonSchemaProperties,
+              desiredStatus: { type: 'string', enum: ['running', 'stopped'] },
+            },
+            required: [...verifierPatchBaseRequired, 'desiredStatus'],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-project-name'] },
+              name: { type: 'string', minLength: 1 },
+              ...patchRelevanceProperties,
+            },
+            required: ['op', 'name', ...verifierPatchRelevanceRequired],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['rename-network'] },
+              from: { type: 'string', minLength: 1 },
+              to: { type: 'string', minLength: 1 },
+              ...patchRelevanceProperties,
+            },
+            required: ['op', 'to', ...verifierPatchRelevanceRequired],
+          },
+          {
+            type: 'object',
+            properties: {
+              op: { type: 'string', enum: ['set-networks'] },
+              networks: { type: 'array', items: { type: 'string', minLength: 1 }, minItems: 1 },
+              ...patchRelevanceProperties,
+            },
+            required: ['op', 'networks', ...verifierPatchRelevanceRequired],
+          },
+        ],
+      },
+    },
+    issueAnalysis: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          issueCode: { type: 'string', minLength: 1 },
+          affectedResource: { type: 'string', minLength: 1 },
+          affectedServiceName: { type: 'string', minLength: 1 },
+          intendedFix: { type: 'string', minLength: 1 },
+          userActionNeeded: { type: 'string', minLength: 1 },
+        },
+        required: ['issueCode', 'affectedResource', 'intendedFix'],
+      },
+    },
+    explanation: { type: 'string', minLength: 1 },
+    assumptions: { type: 'array', items: { type: 'string', minLength: 1 } },
+    ambiguities: { type: 'array', items: { type: 'string', minLength: 1 } },
+    requiresUserInput: { type: 'boolean' },
+    confidence: { type: 'number', minimum: 0, maximum: 1 },
+  },
+  required: ['issueAnalysis', 'patches', 'explanation', 'assumptions', 'ambiguities', 'requiresUserInput', 'confidence'],
 } satisfies JsonSchema;

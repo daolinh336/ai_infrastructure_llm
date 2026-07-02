@@ -24,7 +24,6 @@ import {
 } from '../domain/stateful-database-volumes.js';
 import {
   createPendingPreviewState,
-  saveApprovalRejection,
   saveApprovedAction,
   savePendingPreview as persistPendingPreview,
   type StateStoreOptions,
@@ -57,6 +56,7 @@ import { validateVerificationReport } from '../domain/schemas.js';
 import { buildDriftReport } from './drift-detector.js';
 import { toReplicaContainerNames } from './container-names.js';
 import { isProtectedDockerNetwork } from './protected-docker-resources.js';
+import { isTrustedImageReference } from '../domain/supported-images.js';
 
 export interface ExecutionResult {
   composeYaml: string;
@@ -235,12 +235,6 @@ export class ExecutionEngine {
     }
 
     if (approval.decision === 'rejected') {
-      await saveApprovalRejection(
-        preparation.pendingPreview,
-        approval,
-        this.options.stateStore,
-      );
-
       return {
         ...preparation,
         approval,
@@ -305,6 +299,13 @@ export class ExecutionEngine {
     ]);
 
     const spec = normalizeStatefulDatabaseReplicaVolumes(approvedAction.validatedSpec);
+    const unsupportedImages = spec.services.filter((service) => !isTrustedImageReference(service.image));
+    if (unsupportedImages.length > 0) {
+      throw new Error(
+        'Unsupported trusted image catalog reference(s): ' +
+          unsupportedImages.map((service) => `${service.name}=${service.image}`).join(', '),
+      );
+    }
     const replicatedServicesWithPorts = spec.services.filter(
       (service) => (service.replicas ?? 1) > 1 && (service.ports?.length ?? 0) > 0,
     );

@@ -24,7 +24,41 @@ export const SUPPORTED_IMAGE_BASES = [
 
 export type SupportedImageBase = (typeof SUPPORTED_IMAGE_BASES)[number];
 
+export type TrustedImageRole = 'reverse-proxy' | 'backend' | 'database';
+
+export interface TrustedImageProfile {
+  base: SupportedImageBase;
+  image: string;
+  role: TrustedImageRole;
+  defaultPorts: string[];
+  defaultEnvironment: Record<string, string>;
+  defaultVolumes: string[];
+  sameRoleReplacements: string[];
+  crossFamilyReplacements: string[];
+}
+
 export const SUPPORTED_IMAGE_BASE_SET = new Set<string>(SUPPORTED_IMAGE_BASES);
+
+export const TRUSTED_IMAGE_PROFILES: TrustedImageProfile[] = [
+  { base: 'nginx', image: 'nginx:stable', role: 'reverse-proxy', defaultPorts: ['80:80'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['httpd:2.4', 'traefik:v3.0'], crossFamilyReplacements: [] },
+  { base: 'httpd', image: 'httpd:2.4', role: 'reverse-proxy', defaultPorts: ['80:80'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['nginx:stable', 'traefik:v3.0'], crossFamilyReplacements: [] },
+  { base: 'traefik', image: 'traefik:v3.0', role: 'reverse-proxy', defaultPorts: ['80:80'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['nginx:stable', 'httpd:2.4'], crossFamilyReplacements: [] },
+  { base: 'node', image: 'node:20-alpine', role: 'backend', defaultPorts: ['3000:3000'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['python:3.12-alpine'], crossFamilyReplacements: ['golang:1.22-alpine', 'eclipse-temurin:21-jre'] },
+  { base: 'python', image: 'python:3.12-alpine', role: 'backend', defaultPorts: ['8000:8000'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['node:20-alpine'], crossFamilyReplacements: ['golang:1.22-alpine', 'eclipse-temurin:21-jre'] },
+  { base: 'golang', image: 'golang:1.22-alpine', role: 'backend', defaultPorts: ['8080:8080'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['node:20-alpine', 'python:3.12-alpine'], crossFamilyReplacements: ['eclipse-temurin:21-jre'] },
+  { base: 'openjdk', image: 'openjdk:21-jdk-slim', role: 'backend', defaultPorts: ['8080:8080'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['eclipse-temurin:21-jre'], crossFamilyReplacements: ['node:20-alpine', 'python:3.12-alpine'] },
+  { base: 'eclipse-temurin', image: 'eclipse-temurin:21-jre', role: 'backend', defaultPorts: ['8080:8080'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['openjdk:21-jdk-slim'], crossFamilyReplacements: ['node:20-alpine', 'python:3.12-alpine'] },
+  { base: 'postgres', image: 'postgres:16-alpine', role: 'database', defaultPorts: ['5432:5432'], defaultEnvironment: { POSTGRES_PASSWORD: 'change-me' }, defaultVolumes: ['data:/var/lib/postgresql/data'], sameRoleReplacements: [], crossFamilyReplacements: ['mysql:8.4', 'mariadb:11.4', 'mongo:7'] },
+  { base: 'mysql', image: 'mysql:8.4', role: 'database', defaultPorts: ['3306:3306'], defaultEnvironment: { MYSQL_ROOT_PASSWORD: 'change-me' }, defaultVolumes: ['data:/var/lib/mysql'], sameRoleReplacements: ['mariadb:11.4'], crossFamilyReplacements: ['postgres:16-alpine', 'mongo:7'] },
+  { base: 'mariadb', image: 'mariadb:11.4', role: 'database', defaultPorts: ['3306:3306'], defaultEnvironment: { MARIADB_ROOT_PASSWORD: 'change-me' }, defaultVolumes: ['data:/var/lib/mysql'], sameRoleReplacements: ['mysql:8.4'], crossFamilyReplacements: ['postgres:16-alpine', 'mongo:7'] },
+  { base: 'mongo', image: 'mongo:7', role: 'database', defaultPorts: ['27017:27017'], defaultEnvironment: {}, defaultVolumes: ['data:/data/db'], sameRoleReplacements: [], crossFamilyReplacements: ['postgres:16-alpine', 'mysql:8.4', 'mariadb:11.4'] },
+  { base: 'redis', image: 'redis:7-alpine', role: 'database', defaultPorts: ['6379:6379'], defaultEnvironment: {}, defaultVolumes: ['data:/data'], sameRoleReplacements: [], crossFamilyReplacements: [] },
+  { base: 'rabbitmq', image: 'rabbitmq:3-management', role: 'database', defaultPorts: ['5672:5672'], defaultEnvironment: {}, defaultVolumes: ['data:/var/lib/rabbitmq'], sameRoleReplacements: [], crossFamilyReplacements: [] },
+  { base: 'elasticsearch', image: 'elasticsearch:8.14.0', role: 'database', defaultPorts: ['9200:9200'], defaultEnvironment: {}, defaultVolumes: ['data:/usr/share/elasticsearch/data'], sameRoleReplacements: [], crossFamilyReplacements: [] },
+  { base: 'kafka', image: 'kafka:latest', role: 'database', defaultPorts: ['9092:9092'], defaultEnvironment: {}, defaultVolumes: ['data:/var/lib/kafka/data'], sameRoleReplacements: [], crossFamilyReplacements: [] },
+];
+
+export const TRUSTED_IMAGE_BASE_SET = new Set<string>(TRUSTED_IMAGE_PROFILES.map((profile) => profile.base));
 
 const IMAGE_BASE_SYNONYMS = new Map<string, SupportedImageBase>([
   ['nodejs', 'node'],
@@ -141,6 +175,29 @@ export function resolveImageReference(reference: string): ImageReferenceResoluti
 export function isSupportedImageReference(reference: string): boolean {
   const parsed = splitImageReference(reference);
   return SUPPORTED_IMAGE_BASE_SET.has(parsed.base);
+}
+
+export function isTrustedImageReference(reference: string): boolean {
+  const parsed = splitImageReference(reference);
+  return TRUSTED_IMAGE_BASE_SET.has(parsed.base);
+}
+
+export function getTrustedImageProfile(reference: string): TrustedImageProfile | null {
+  const parsed = splitImageReference(reference);
+  return TRUSTED_IMAGE_PROFILES.find((profile) => profile.base === parsed.base) ?? null;
+}
+
+export function getTrustedReplacementImages(reference: string, role?: TrustedImageRole, includeCrossFamily = false): string[] {
+  const profile = getTrustedImageProfile(reference);
+  if (profile === null) return [];
+  if (role !== undefined && profile.role !== role) return [];
+  return [...profile.sameRoleReplacements, ...(includeCrossFamily ? profile.crossFamilyReplacements : [])];
+}
+
+export function getTrustedDefaultImageForBase(base: string): string | null {
+  const canonical = canonicalizeImageBase(base);
+  const profile = TRUSTED_IMAGE_PROFILES.find((candidate) => candidate.base === canonical.value);
+  return profile?.image ?? null;
 }
 
 export function getImageReferenceBase(reference: string): string {

@@ -1557,8 +1557,17 @@ function applyClarificationAnswer(
     const [, serviceName, ...imageParts] = resolvedValue.split(':');
     const imageRef = imageParts.join(':');
     const service = draftServices.find((candidate) => candidate.name === serviceName);
-    if (!service || !imageRef) {
+    if (!serviceName || !service || !imageRef) {
       throw new Error(`Invalid clarification setServiceImage value: ${resolvedValue}`);
+    }
+    const oldImageBase = service.image == null ? serviceName : getImageBase(service.image);
+    const oldDefaultName = getDefaultServiceName(oldImageBase, 0, {
+      hasReverseProxy: true,
+      hasBackend: true,
+      hasDatabase: true,
+    });
+    if (service.name === oldImageBase || service.name === oldDefaultName || service.name === 'web') {
+      service.name = getImageBase(imageRef);
     }
     service.image = imageRef;
   } else {

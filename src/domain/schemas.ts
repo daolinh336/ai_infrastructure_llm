@@ -27,6 +27,7 @@ import type {
   PlanningClarificationContext,
   PlanningUncertainty,
   SpecPatchPlan,
+  VerifierRemediationPatchPlan,
   UserFeedback,
   RevisionObservation,
 } from './types.js';
@@ -1294,31 +1295,82 @@ const serviceSelectorSchema = z
   });
 
 const patchReasonSchema = z.string().min(1, 'Patch reason must not be empty.');
+const patchRelevanceSchema = {
+  resolvesIssueCodes: z.array(findingCodeSchema).optional(),
+  affectedServiceNames: z.array(identifierSchema).optional(),
+  resolutionReason: z.string().min(1).optional(),
+};
+
+const issueAnalysisSchema = z
+  .object({
+    issueCode: z.string().min(1),
+    affectedResource: z.string().min(1),
+    affectedServiceName: identifierSchema.optional(),
+    intendedFix: z.string().min(1),
+    userActionNeeded: z.string().min(1).optional(),
+  })
+  .strict();
 
 export const specPatchSchema = z.discriminatedUnion('op', [
-  z.object({ op: z.literal('set-service-replicas'), target: serviceSelectorSchema, replicas: serviceReplicasSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('replace-service-port'), target: serviceSelectorSchema, from: portMappingSchema.optional(), to: portMappingSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('add-service-port'), target: serviceSelectorSchema, port: portMappingSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('remove-service-port'), target: serviceSelectorSchema, port: portMappingSchema.optional(), reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('set-service-image'), target: serviceSelectorSchema, image: z.string().min(1), reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('add-service'), service: infrastructureServiceSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('remove-service'), target: serviceSelectorSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('rename-service'), target: serviceSelectorSchema, name: identifierSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('set-service-env'), target: serviceSelectorSchema, key: environmentKeySchema, value: z.string().min(1), reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('remove-service-env'), target: serviceSelectorSchema, key: environmentKeySchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('add-service-volume'), target: serviceSelectorSchema, volume: volumeMountSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('remove-service-volume'), target: serviceSelectorSchema, volume: volumeMountSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('add-service-dependency'), target: serviceSelectorSchema, dependencyName: identifierSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('remove-service-dependency'), target: serviceSelectorSchema, dependencyName: identifierSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('set-service-desired-status'), target: serviceSelectorSchema, desiredStatus: z.enum(['running', 'stopped']), reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('set-project-name'), name: identifierSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('rename-network'), from: identifierSchema.optional(), to: identifierSchema, reason: patchReasonSchema }).strict(),
-  z.object({ op: z.literal('set-networks'), networks: z.array(identifierSchema).min(1), reason: patchReasonSchema }).strict(),
+  z.object({ op: z.literal('set-service-replicas'), target: serviceSelectorSchema, replicas: serviceReplicasSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('replace-service-port'), target: serviceSelectorSchema, from: portMappingSchema.optional(), to: portMappingSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('add-service-port'), target: serviceSelectorSchema, port: portMappingSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('remove-service-port'), target: serviceSelectorSchema, port: portMappingSchema.optional(), reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('set-service-image'), target: serviceSelectorSchema, image: z.string().min(1), reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('add-service'), service: infrastructureServiceSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('remove-service'), target: serviceSelectorSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('rename-service'), target: serviceSelectorSchema, name: identifierSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('set-service-env'), target: serviceSelectorSchema, key: environmentKeySchema, value: z.string().min(1), reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('remove-service-env'), target: serviceSelectorSchema, key: environmentKeySchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('add-service-volume'), target: serviceSelectorSchema, volume: volumeMountSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('remove-service-volume'), target: serviceSelectorSchema, volume: volumeMountSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('add-service-dependency'), target: serviceSelectorSchema, dependencyName: identifierSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('remove-service-dependency'), target: serviceSelectorSchema, dependencyName: identifierSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('set-service-desired-status'), target: serviceSelectorSchema, desiredStatus: z.enum(['running', 'stopped']), reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('set-project-name'), name: identifierSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('rename-network'), from: identifierSchema.optional(), to: identifierSchema, reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
+  z.object({ op: z.literal('set-networks'), networks: z.array(identifierSchema).min(1), reason: patchReasonSchema, ...patchRelevanceSchema }).strict(),
 ]);
 
 export const specPatchPlanSchema = z
   .object({
     patches: z.array(specPatchSchema),
+    explanation: z.string().min(1),
+    assumptions: z.array(z.string().min(1)),
+    ambiguities: z.array(z.string().min(1)),
+    requiresUserInput: z.boolean(),
+    confidence: z.number().min(0).max(1),
+  })
+  .strict();
+
+const verifierRemediationPatchSchema = specPatchSchema.superRefine((patch, ctx) => {
+  if (!patch.resolvesIssueCodes || patch.resolvesIssueCodes.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['resolvesIssueCodes'],
+      message: 'Verifier remediation patch must include at least one verifier issue code.',
+    });
+  }
+  if (!patch.affectedServiceNames || patch.affectedServiceNames.length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['affectedServiceNames'],
+      message: 'Verifier remediation patch must include at least one affected service name.',
+    });
+  }
+  if (!patch.resolutionReason || patch.resolutionReason.trim().length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['resolutionReason'],
+      message: 'Verifier remediation patch must include a resolution reason.',
+    });
+  }
+});
+
+export const verifierRemediationPatchPlanSchema = z
+  .object({
+    issueAnalysis: z.array(issueAnalysisSchema).min(1),
+    patches: z.array(verifierRemediationPatchSchema),
     explanation: z.string().min(1),
     assumptions: z.array(z.string().min(1)),
     ambiguities: z.array(z.string().min(1)),
@@ -1446,6 +1498,14 @@ export function validatePlannerRevisionRequest(value: unknown): PlannerRevisionR
 
 export function validateSpecPatchPlan(value: unknown): SpecPatchPlan {
   return parseWithSchema(specPatchPlanSchema, value, 'spec patch plan') as SpecPatchPlan;
+}
+
+export function validateVerifierRemediationPatchPlan(value: unknown): VerifierRemediationPatchPlan {
+  return parseWithSchema(
+    verifierRemediationPatchPlanSchema,
+    value,
+    'verifier remediation patch plan',
+  ) as VerifierRemediationPatchPlan;
 }
 
 export function validatePlanningUncertainty(value: unknown): PlanningUncertainty {

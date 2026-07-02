@@ -1,4 +1,5 @@
 import { stdin as input, stdout as output } from 'node:process';
+import { appendFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import chalk from 'chalk';
@@ -15,6 +16,7 @@ import type {
   ApprovalDecision,
   UserFeedback,
   PlannerRevisionResult,
+  SpecPatch,
   VerificationFinding,
   VerificationReport,
   DetailedDryRunPreview,
@@ -306,18 +308,19 @@ export function printPreflightReport(preflight: PreflightReport): void {
 export async function requestRuntimeApproval(
   verificationReport: VerificationReport,
   attemptIndex: number,
+  revisionPreview?: PlannerRevisionResult,
 ): Promise<ApprovalDecision> {
-  console.log(chalk.cyan(`Runtime feedback (verify/revise round ${attemptIndex}):`));
-  console.log(`- Verifier status: ${verificationReport.status}`);
+  console.log(chalk.cyan(`Deployment check (round ${attemptIndex}):`));
+  console.log(`- Check status: ${verificationReport.status}`);
   if ((verificationReport.findings ?? []).length > 0) {
-    console.log(chalk.yellow('- Verifier findings:'));
+    console.log(chalk.yellow('- Problems found:'));
     for (const finding of verificationReport.findings ?? []) {
       console.log(chalk.yellow(`  - ${finding.code} [${finding.severity}] ${finding.resourceKind}${finding.resourceName ? `/${finding.resourceName}` : ''}`));
       console.log(chalk.gray(`    expected=${finding.expected ?? 'n/a'} actual=${finding.actual ?? 'n/a'} confidence=${finding.confidence}`));
     }
   }
   if (verificationReport.issues.length > 0) {
-    console.log(chalk.yellow('- Verifier issues:'));
+    console.log(chalk.yellow('- Reported issues:'));
     for (const issue of verificationReport.issues) {
       console.log(chalk.yellow(`  - ${issue}`));
     }
@@ -328,48 +331,81 @@ export async function requestRuntimeApproval(
   if (verificationReport.revisionHint) {
     console.log(chalk.yellow('- Suggested fix: ' + verificationReport.revisionHint));
   }
+  if (revisionPreview) {
+    printRuntimeRevisionPreview(revisionPreview);
+  }
   console.log(
     chalk.cyan(
-      'Agent: I will revise using the feedback above, then deploy again. Choose y (revise + re-deploy) / n (cancel + cleanup) / other (add feedback).',
+      revisionPreview
+        ? 'If you choose y, I will apply the shown revision and deploy again. Choose y / n / other.'
+        : 'If you choose y, I will try the suggested fix and deploy again. Choose y / n / other.',
     ),
   );
 
   const readline = createInterface({ input, output });
   try {
-    const answer = (
-      await readline.question(
-        chalk.yellow('Revise and re-deploy? [y]es / [n]o (cancel + cleanup) / [o]ther (provide additional feedback) '),
-      )
-    )
-      .trim()
-      .toLowerCase();
-
-    let choice: ApprovalDecision['choice'];
+    let choice: ApprovalDecision['choice'] | null = null;
     let userFeedback: UserFeedback | null = null;
 
-    if (answer === 'y' || answer === 'yes') {
-      choice = 'approved';
-    } else if (answer === 'o' || answer === 'other') {
-      choice = 'other';
-      const feedbackText = (
+    while (choice === null) {
+      const answer = (
         await readline.question(
-          chalk.cyan('Enter your feedback (will be merged with verifier report for planner): '),
+          chalk.yellow('Revise and re-deploy? [y]es / [n]o (cancel + cleanup) / [o]ther (provide additional feedback) '),
         )
-      ).trim();
-      if (feedbackText.length > 0) {
-        userFeedback = {
-          message: feedbackText,
-          submittedAt: new Date().toISOString(),
-        };
+      )
+        .trim()
+        .toLowerCase();
+      const parsedChoice = parseApprovalPromptChoice(answer);
+      if (parsedChoice === null) {
+        printDontUnderstandPrompt();
+        continue;
       }
-    } else {
-      choice = 'rejected';
+      choice = parsedChoice;
+      if (choice === 'other') {
+        const feedbackText = (
+          await readline.question(
+            chalk.cyan('Describe what you want changed: '),
+          )
+        ).trim();
+        if (feedbackText.length > 0) {
+          userFeedback = {
+            message: feedbackText,
+            submittedAt: new Date().toISOString(),
+          };
+        }
+      }
     }
 
     return { choice, userFeedback };
   } finally {
     readline.close();
   }
+}
+
+function printRuntimeRevisionPreview(result: PlannerRevisionResult): void {
+  const patchResults = result.patchResults ?? [];
+  if (patchResults.length === 0) return;
+
+  console.log(chalk.cyan('- Planned revision if you choose y:'));
+  for (const patchResult of patchResults) {
+    const patch = patchResult.patch;
+    const target = patchResult.matchedServiceNames.join(', ') || 'global';
+    console.log(chalk.cyan(`  - ${patch.op} ${target}${describePreviewPatchChange(patch)}`));
+  }
+}
+
+function describePreviewPatchChange(patch: SpecPatch): string {
+  if (patch.op === 'replace-service-port') return ` ${patch.from ?? '*'} -> ${patch.to}`;
+  if (patch.op === 'add-service-port') return ` +${patch.port}`;
+  if (patch.op === 'remove-service-port') return ` -${patch.port ?? '*'}`;
+  if (patch.op === 'set-service-replicas') return ` -> ${patch.replicas}`;
+  if (patch.op === 'set-service-image') return ` -> ${patch.image}`;
+  if (patch.op === 'rename-service') return ` -> ${patch.name}`;
+  if (patch.op === 'set-project-name') return ` -> ${patch.name}`;
+  if (patch.op === 'rename-network') return ` ${patch.from ?? '*'} -> ${patch.to}`;
+  if (patch.op === 'set-networks') return ` -> ${patch.networks.join(', ')}`;
+  if (patch.op === 'set-service-desired-status') return ` -> ${patch.desiredStatus}`;
+  return '';
 }
 
 export async function requestRevisionClarification(
@@ -386,45 +422,41 @@ export async function requestRevisionClarification(
       console.log(chalk.cyan(`  ${index + 1}. ${choice.label}: ${choice.description}`));
     });
     if (context.allowOther) {
-      console.log(chalk.cyan('  other. Provide free-form feedback for the planner.'));
+      console.log(chalk.cyan('  other. Describe a different change.'));
     }
   }
 
   const readline = createInterface({ input, output });
   try {
-    const answer = (
-      await readline.question(
-        chalk.yellow('Use suggested fix? [y]es / [n]o (cancel + cleanup) / [o]ther (provide planner feedback) '),
-      )
-    ).trim();
+    while (true) {
+      const answer = (
+        await readline.question(
+          chalk.yellow('Use suggested fix? [y]es / [n]o (cancel + cleanup) / [o]ther (describe a different change) '),
+        )
+      ).trim();
 
-    if (answer.length === 0 || answer.toLowerCase() === 'n' || answer.toLowerCase() === 'no') {
-      return null;
-    }
-
-    const firstContext = contexts[0]!;
-    if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes') {
-      const allowChoice = firstContext.choices.find((choice) => /^allow:/i.test(choice.value)) ?? firstContext.choices[0];
-      if (allowChoice) {
-        return {
-          message: `User selected ${allowChoice.label}: ${allowChoice.value}`,
-          submittedAt: new Date().toISOString(),
-        };
+      const parsedChoice = parseApprovalPromptChoice(answer.toLowerCase());
+      if (parsedChoice === null) {
+        printDontUnderstandPrompt();
+        continue;
       }
-    }
 
-    const selectedIndex = Number(answer) - 1;
-    const selectedChoice = Number.isInteger(selectedIndex) ? firstContext.choices[selectedIndex] : undefined;
-    if (selectedChoice) {
-      return {
-        message: `User selected ${selectedChoice.label}: ${selectedChoice.value}`,
-        submittedAt: new Date().toISOString(),
-      };
-    }
+      if (parsedChoice === 'rejected') return null;
 
-    if (answer.toLowerCase() === 'o' || answer.toLowerCase() === 'other') {
+      const firstContext = contexts[0]!;
+      if (parsedChoice === 'approved') {
+        const allowChoice = firstContext.choices.find((choice) => /^allow:/i.test(choice.value)) ?? firstContext.choices[0];
+        if (allowChoice) {
+          return {
+            message: `User selected ${allowChoice.value}`,
+            submittedAt: new Date().toISOString(),
+          };
+        }
+        return null;
+      }
+
       const feedbackText = (
-        await readline.question(chalk.cyan('Enter planner feedback: '))
+        await readline.question(chalk.cyan('Describe the change you want: '))
       ).trim();
       if (feedbackText.length === 0) return null;
       return {
@@ -432,11 +464,6 @@ export async function requestRevisionClarification(
         submittedAt: new Date().toISOString(),
       };
     }
-
-    return {
-      message: answer,
-      submittedAt: new Date().toISOString(),
-    };
   } finally {
     readline.close();
   }
@@ -495,41 +522,43 @@ export async function requestCliApproval(request: ApprovalRequest): Promise<{ ap
   console.log();
   console.log(
     chalk.cyan(
-      'Agent: I have finished the plan and am ready to deploy it. Review, then choose y (approve) / n (reject) / other (feedback).',
+      'Review this plan. Choose y to continue, n to stop, other to request changes.',
     ),
   );
 
   const readline = createInterface({ input, output });
 
   try {
-    const answer = (
-      await readline.question(
-        chalk.yellow('Approve writing docker-compose.yaml? [y]es / [n]o / [o]ther (provide feedback) '),
-      )
-    )
-      .trim()
-      .toLowerCase();
-
-    let choice: ApprovalDecision['choice'];
+    let choice: ApprovalDecision['choice'] | null = null;
     let userFeedback: UserFeedback | null = null;
 
-    if (answer === 'y' || answer === 'yes') {
-      choice = 'approved';
-    } else if (answer === 'o' || answer === 'other') {
-      choice = 'other';
-      const feedbackText = (
+    while (choice === null) {
+      const answer = (
         await readline.question(
-          chalk.cyan('Enter your feedback for the planner: '),
+          chalk.yellow('Approve writing docker-compose.yaml? [y]es / [n]o / [o]ther (request changes) '),
         )
-      ).trim();
-      if (feedbackText.length > 0) {
-        userFeedback = {
-          message: feedbackText,
-          submittedAt: new Date().toISOString(),
-        };
+      )
+        .trim()
+        .toLowerCase();
+      const parsedChoice = parseApprovalPromptChoice(answer);
+      if (parsedChoice === null) {
+        printDontUnderstandPrompt();
+        continue;
       }
-    } else {
-      choice = 'rejected';
+      choice = parsedChoice;
+      if (choice === 'other') {
+        const feedbackText = (
+          await readline.question(
+            chalk.cyan('Describe what you want changed: '),
+          )
+        ).trim();
+        if (feedbackText.length > 0) {
+          userFeedback = {
+            message: feedbackText,
+            submittedAt: new Date().toISOString(),
+          };
+        }
+      }
     }
 
     const decision = choice === 'approved' ? 'approved' : 'rejected';
@@ -547,6 +576,18 @@ export async function requestCliApproval(request: ApprovalRequest): Promise<{ ap
   } finally {
     readline.close();
   }
+}
+
+export function parseApprovalPromptChoice(answer: string): ApprovalDecision['choice'] | null {
+  if (answer === 'y' || answer === 'yes') return 'approved';
+  if (answer === 'n' || answer === 'no') return 'rejected';
+  if (answer === 'o' || answer === 'other') return 'other';
+  return null;
+}
+
+function printDontUnderstandPrompt(): void {
+  console.log(chalk.yellow('dont understand'));
+  console.log(chalk.cyan('Choose y / n / other.'));
 }
 
 export function printDockerDoctorReport(report: DockerDoctorReport): void {
@@ -891,6 +932,28 @@ export function createProgressPrinter(): (event: ProgressEvent) => void {
     const toolText = event.toolName ? ` via ${event.toolName}` : '';
     console.log(
       chalk.gray(`- ${event.phase}${nextCount}${toolText}: ${event.message}`),
+    );
+  };
+}
+
+export function createProgressFileLogger(logPath = path.resolve(process.cwd(), 'agent-trace.log')): (event: ProgressEvent) => void {
+  const counts = new Map<ProgressPhase, number>();
+
+  writeFileSync(
+    logPath,
+    [`# Agent trace log`, `startedAt: ${new Date().toISOString()}`, ''].join('\n'),
+    'utf8',
+  );
+
+  return (event: ProgressEvent) => {
+    const nextCount = (counts.get(event.phase) ?? 0) + 1;
+    counts.set(event.phase, nextCount);
+
+    const toolText = event.toolName ? ` via ${event.toolName}` : '';
+    appendFileSync(
+      logPath,
+      `- ${event.phase}${nextCount}${toolText}: ${event.message}\n`,
+      'utf8',
     );
   };
 }

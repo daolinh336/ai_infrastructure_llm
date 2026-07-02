@@ -352,9 +352,8 @@ function normalizeDraftQueryCandidate(
 function normalizeDraftServiceCandidate(value: unknown, prompt: string): DraftServiceQuery {
   const record = isRecord(value) ? value : {};
   const image = getNullableString(record.image ?? record.technology);
-  const port = promptMentionsPort(prompt)
-    ? getNullableInteger(record.port ?? getFirstPortCandidate(record.ports))
-    : null;
+  const portCandidate = getNullableInteger(record.port ?? getFirstPortCandidate(record.ports));
+  const port = normalizeDraftPortCandidate(portCandidate, prompt);
 
   return {
     name: getNullableString(record.name),
@@ -375,8 +374,26 @@ function normalizeDraftServiceCandidate(value: unknown, prompt: string): DraftSe
   };
 }
 
+function normalizeDraftPortCandidate(port: number | null, prompt: string): number | null {
+  if (!promptMentionsPort(prompt) || port === null) {
+    return null;
+  }
+
+  if (port >= 1 && port <= 65535) {
+    return port;
+  }
+
+  return extractExplicitPromptPorts(prompt).includes(port) ? port : null;
+}
+
 function promptMentionsPort(prompt: string): boolean {
   return /\b(?:port|ports|expose|publish|published)\b|c[oôổ]ng/i.test(prompt);
+}
+
+function extractExplicitPromptPorts(prompt: string): number[] {
+  return [...prompt.matchAll(/(?:\b(?:port|ports|expose|publish|published)\b|c\S*ng)\s*(?:l\S*|=|:|sang|to)?\s*(-?\d+)/gi)]
+    .map((match) => Number(match[1]))
+    .filter((port) => Number.isInteger(port));
 }
 
 function getFirstPortCandidate(value: unknown): unknown {

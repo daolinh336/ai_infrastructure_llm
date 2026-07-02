@@ -1,16 +1,19 @@
 import type {
+  FeedbackIntent,
   InfrastructureService,
   InfrastructureSpec,
   ResolvedSpecPatchResult,
   ServiceSelector,
   SpecPatch,
+  VerificationFinding,
 } from '../domain/types.js';
 import { expandStatefulDatabaseReplicas, getDatabaseDataVolumeTarget } from '../domain/stateful-database-volumes.js';
+import { getTrustedImageProfile } from '../domain/supported-images.js';
 
 export function applySpecPatchPlan(
   spec: InfrastructureSpec,
   patches: SpecPatch[],
-  options: { allowBlockedPatchOps?: string[] } = {},
+  options: { allowBlockedPatchOps?: string[]; verificationFindings?: VerificationFinding[]; feedbackIntent?: FeedbackIntent | null } = {},
 ): { spec: InfrastructureSpec; results: ResolvedSpecPatchResult[] } {
   let revised = stripDisallowedHostPortsFromSpec(cloneSpec(spec));
   const results: ResolvedSpecPatchResult[] = [];
@@ -18,7 +21,10 @@ export function applySpecPatchPlan(
 
   for (const patch of patches) {
     const resolution = resolvePatchTargets(revised, patch);
-    const policyBlock = resolution.blockedReason ?? (allowedBlockedOps.has(patch.op) ? null : evaluatePatchPolicy(revised, patch, resolution.matchedServices));
+    const relevanceBlock = resolution.blockedReason === null
+      ? evaluatePatchRelevance(patch, resolution.matchedServices, options.verificationFindings ?? [], options.feedbackIntent ?? null)
+      : null;
+    const policyBlock = resolution.blockedReason ?? relevanceBlock ?? (allowedBlockedOps.has(patch.op) ? null : evaluatePatchPolicy(revised, patch, resolution.matchedServices));
     const before = JSON.stringify(revised);
     revised = policyBlock === null
       ? stripDisallowedHostPortsFromSpec(applyResolvedPatch(revised, patch, resolution.matchedServices))
@@ -271,7 +277,7 @@ function applyResolvedPatch(
       return ports.length > 0 ? { ...service, ports } : rest;
     }
     if (patch.op === 'set-service-image') {
-      return { ...service, kind: inferServiceKind(patch.image), image: patch.image };
+      return rebuildServiceForTrustedImage(service, patch.image);
     }
     if (patch.op === 'set-service-env') {
       return { ...service, environment: { ...(service.environment ?? {}), [patch.key]: patch.value } };
@@ -315,6 +321,52 @@ function applyResolvedPatch(
   };
 }
 
+function evaluatePatchRelevance(
+  patch: SpecPatch,
+  matchedServices: InfrastructureService[],
+  findings: VerificationFinding[],
+  feedbackIntent: FeedbackIntent | null,
+): string | null {
+  if (findings.length === 0) return null;
+  if (feedbackIntent?.intent === 'change-replicas' && feedbackIntent.desiredChange?.replicas !== undefined) return null;
+
+  const findingCodes = new Set(findings.map((finding) => finding.code));
+  const affectedServices = new Set(findings.flatMap((finding) => finding.resourceName ? [extractServiceName(finding.resourceName)] : []));
+  const patchCodes = new Set(patch.resolvesIssueCodes ?? []);
+  const patchServices = new Set(patch.affectedServiceNames ?? []);
+  const matchedNames = new Set(matchedServices.map((service) => service.name));
+
+  if (patchCodes.size > 0 && ![...patchCodes].some((code) => findingCodes.has(code))) {
+    return 'Patch does not address the reported runtime issue.';
+  }
+
+  if (affectedServices.size > 0 && patchServices.size > 0 && ![...patchServices].some((service) => affectedServices.has(service))) {
+    return 'Patch targets a different service than the reported runtime issue.';
+  }
+
+  if (patchServices.size > 0 && affectedServices.size > 0 && matchedNames.size > 0 && ![...matchedNames].some((service) => affectedServices.has(service))) {
+    return 'Patch target does not match the service reported by the runtime issue.';
+  }
+
+  if (patch.op === 'set-service-replicas' && !isReplicaRelevant(findings)) {
+    return 'Patch does not address the reported runtime issue.';
+  }
+
+  return null;
+}
+
+function extractServiceName(resourceName: string): string {
+  const parts = resourceName.split('/').filter(Boolean);
+  return parts[parts.length - 1] ?? resourceName;
+}
+
+function isReplicaRelevant(findings: VerificationFinding[]): boolean {
+  return findings.some((finding) => {
+    const text = [finding.code, finding.resourceKind, finding.expected, finding.actual, ...finding.evidence].filter(Boolean).join(' ').toLowerCase();
+    return finding.code.includes('REPLICA') || finding.resourceKind === 'container' || /replica|instance|container count/.test(text);
+  });
+}
+
 function formatSelector(selector: ServiceSelector): string {
   return JSON.stringify(selector);
 }
@@ -345,6 +397,30 @@ function inferServiceKind(image: string): InfrastructureService['kind'] {
   if (reverseProxyImages.has(base)) return 'reverse-proxy';
   if (databaseImages.has(base)) return 'database';
   return 'backend';
+}
+
+function rebuildServiceForTrustedImage(service: InfrastructureService, image: string): InfrastructureService {
+  const profile = getTrustedImageProfile(image);
+  const nextPorts = profile?.defaultPorts.length ? profile.defaultPorts : service.ports;
+  const nextEnvironment = profile && Object.keys(profile.defaultEnvironment).length > 0
+    ? { ...profile.defaultEnvironment, ...(service.environment ?? {}) }
+    : service.environment;
+  const nextVolumes = profile?.defaultVolumes.length
+    ? profile.defaultVolumes.map((mount) => {
+        const target = mount.split(':')[1] ?? '';
+        const existing = (service.volumes ?? []).find((candidate) => target && candidate.endsWith(':' + target));
+        return existing ?? mount.replace(/^data:/, `${service.name}-data:`);
+      })
+    : service.volumes;
+
+  return {
+    ...service,
+    kind: inferServiceKind(image),
+    image,
+    ...(nextPorts && nextPorts.length > 0 ? { ports: nextPorts } : {}),
+    ...(nextEnvironment && Object.keys(nextEnvironment).length > 0 ? { environment: nextEnvironment } : {}),
+    ...(nextVolumes && nextVolumes.length > 0 ? { volumes: nextVolumes } : {}),
+  };
 }
 
 type StatefulDatabaseReplicaGroup = {

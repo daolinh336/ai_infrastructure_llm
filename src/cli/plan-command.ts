@@ -20,6 +20,7 @@ import { runClosedLoopDeploy } from './deploy-loop.js';
 import { createProvider } from '../llm/provider.js';
 import {
   getStateDatabasePath,
+  discardManagedProjectState,
   loadProjectState,
   projectExists,
   saveVerifiedRuntimeSnapshot,
@@ -28,16 +29,14 @@ import { StaticGateway } from '../static-gateway/static-gateway.js';
 import { normalizeProjectName } from '../domain/project-identity.js';
 import {
   createDockerMcpGatewayFromEnv,
-  createProgressPrinter,
+  createProgressFileLogger,
   getErrorMessage,
   loadDockerPullRetryPolicyFromEnv,
   printDetailedDryRunPreview,
   printGuardTelemetry,
-  printObservations,
   printPreflightReport,
   printRevisionPatchResults,
   printStaticGatewayMetrics,
-  printTrace,
   requestCliApproval,
   requestPlanningClarification,
   requestRevisionClarification,
@@ -84,7 +83,9 @@ export function registerPlanCommand(program: Command): void {
       process.env.INFRA_AGENT_PROVIDER ?? 'openai',
     )
     .action(async (prompt, options) => {
-      const reportProgress = createProgressPrinter();
+      const traceLogPath = `${process.cwd()}\\agent-trace.log`;
+      const reportProgress = createProgressFileLogger(traceLogPath);
+      console.log(chalk.cyan(`Agent trace log: ${traceLogPath}`));
       const saveStateRequested = Boolean(options.saveState);
       const deployRequested = Boolean(options.deploy);
       const input = cliInputSchema.parse({
@@ -124,6 +125,24 @@ export function registerPlanCommand(program: Command): void {
           return;
         }
       }
+      let adjustProjectState: Awaited<ReturnType<typeof loadProjectState>> = null;
+      const adjustCurrentSnapshot = adjustRequested
+        ? (adjustProjectState = await loadProjectState(requestedProjectName))?.current ?? null
+        : null;
+      if (adjustRequested && !adjustCurrentSnapshot) {
+        console.error(chalk.red('CLI failed.'));
+        console.error(`Project "${requestedProjectName}" does not have a Current Verified Snapshot. Deploy/sync project before using --adjust.`);
+        process.exitCode = 1;
+        return;
+      }
+      if (adjustRequested && adjustCurrentSnapshot?.desired.projectName !== requestedProjectName) {
+        console.error(chalk.red('CLI failed.'));
+        console.error(
+          `Loaded snapshot projectName "${adjustCurrentSnapshot?.desired.projectName}" does not match requested --prjName "${requestedProjectName}".`,
+        );
+        process.exitCode = 1;
+        return;
+      }
 
       reportProgress({
         phase: 'cli',
@@ -141,7 +160,15 @@ export function registerPlanCommand(program: Command): void {
         phase: 'gate',
         message: 'acting... run pre-ReAct LLM gate and validators.',
       });
-      const gatewayResult = await gateway.validate(input.prompt);
+      const staticValidationPrompt = adjustRequested
+        ? [
+            `Adjust existing infrastructure project "${requestedProjectName}".`,
+            'Use this saved project state as context for validating the adjustment request.',
+            JSON.stringify(adjustCurrentSnapshot?.desired, null, 2),
+            `User adjustment request: ${input.prompt}`,
+          ].join('\n')
+        : input.prompt;
+      const gatewayResult = await gateway.validate(staticValidationPrompt);
 
       console.log(chalk.cyan('Static validation:'));
 
@@ -187,21 +214,10 @@ export function registerPlanCommand(program: Command): void {
       });
       let result: AgentRunResult;
       if (adjustRequested && requestedProjectName) {
-        const projectState = await loadProjectState(requestedProjectName);
-        const currentSnapshot = projectState?.current ?? null;
+        const projectState = adjustProjectState;
+        const currentSnapshot = adjustCurrentSnapshot;
         if (!currentSnapshot) {
-          console.error(chalk.red('CLI failed.'));
-          console.error(`Project "${requestedProjectName}" does not have a Current Verified Snapshot. Deploy/sync project before using --adjust.`);
-          process.exitCode = 1;
-          return;
-        }
-        if (currentSnapshot.desired.projectName !== requestedProjectName) {
-          console.error(chalk.red('CLI failed.'));
-          console.error(
-            `Loaded snapshot projectName "${currentSnapshot.desired.projectName}" does not match requested --prjName "${requestedProjectName}".`,
-          );
-          process.exitCode = 1;
-          return;
+          throw new Error(`Project "${requestedProjectName}" does not have a current snapshot for adjustment.`);
         }
         const mcpClient = createDockerMcpGatewayFromEnv();
         try {
@@ -287,18 +303,6 @@ export function registerPlanCommand(program: Command): void {
       while (result.status === 'clarification') {
         console.log(chalk.yellow('Clarification required by ReAct Agent.'));
         console.log(result.clarificationQuestion);
-        if (result.clarificationChoices?.length) {
-          console.log();
-          console.log(chalk.cyan('Available choices:'));
-          for (const choice of result.clarificationChoices) {
-            console.log(
-              `- ${choice.id}. ${choice.label}: ${choice.description}`,
-            );
-          }
-          if (result.allowOther) {
-            console.log('- other. Provide a different custom answer.');
-          }
-        }
         if (result.uncertainties?.length) {
           console.log();
           console.log(chalk.cyan('Blocking planning uncertainties:'));
@@ -311,9 +315,6 @@ export function registerPlanCommand(program: Command): void {
           printGuardTelemetry(result.guardTelemetry);
           console.log();
         }
-        printObservations(result.observations);
-        printTrace(result.trace);
-
         if (result.clarificationContext && result.uncertainties?.length) {
           console.log();
           console.log(
@@ -347,8 +348,6 @@ export function registerPlanCommand(program: Command): void {
           console.log(
             chalk.green('Clarification applied. Continuing with resumed plan.'),
           );
-          printObservations(resumedResult.observations);
-          printTrace(resumedResult.trace);
           result = enforcePlannedProjectName(resumedResult, requestedProjectName);
         } else {
           return;
@@ -361,8 +360,6 @@ export function registerPlanCommand(program: Command): void {
         console.log(`- Iterations: ${result.iterations}`);
         printGuardTelemetry(result.guardTelemetry);
         console.log();
-        printObservations(result.observations);
-        printTrace(result.trace);
         process.exitCode = 1;
         return;
       }
@@ -402,9 +399,6 @@ export function registerPlanCommand(program: Command): void {
         console.log(`- ${assumption}`);
       }
       console.log();
-
-      printObservations(result.observations);
-      printTrace(result.trace);
 
       console.log(chalk.cyan('Plan steps:'));
       for (const step of result.plan.steps) {
@@ -578,10 +572,7 @@ export function registerPlanCommand(program: Command): void {
           console.log(
             chalk.yellow('No Docker, MCP, or runtime mutation was performed.'),
           );
-          console.log();
-          console.log(chalk.cyan('State database:'));
-          console.log(getStateDatabasePath());
-          console.log();
+          console.log(chalk.yellow('No deployment state was saved.'));
           return;
         }
 
@@ -653,11 +644,13 @@ export function registerPlanCommand(program: Command): void {
                 );
               }
             } else {
+              await discardManagedProjectState(deployLoopResult.currentApprovedAction.validatedSpec.projectName);
               console.log(
                 chalk.red(
                   `Closed-loop deploy ended with status: ${deployLoopResult.status}`,
                 ),
               );
+              console.log(chalk.yellow('All deployment state for this project was discarded.'));
               const lastRevision = deployLoopResult.revisionHistory.at(-1);
               if (lastRevision) {
                 console.log(chalk.red('Failure details:'));
@@ -689,11 +682,17 @@ export function registerPlanCommand(program: Command): void {
                 console.log('- suggested fix: rerun with clearer target/service feedback, then approve revision');
               }
               process.exitCode = 1;
+              return;
             }
           } catch (error) {
+            if (deployResult.approvedAction) {
+              await discardManagedProjectState(deployResult.approvedAction.validatedSpec.projectName);
+            }
             console.log(chalk.red('Docker deploy failed:'));
             console.log(`- ${getErrorMessage(error)}`);
+            console.log(chalk.yellow('All deployment state for this project was discarded.'));
             process.exitCode = 1;
+            return;
           } finally {
             await mcpClient.shutdown();
           }

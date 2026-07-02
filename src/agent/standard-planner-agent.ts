@@ -2,6 +2,7 @@ import type { LlmProvider } from '../llm/provider.js';
 import type { PlannerRuntimeReader } from '../execution/runtime-environment-reader.js';
 import type {
   FeedbackIntent,
+  IssueAnalysis,
   InfrastructureSpec,
   InfrastructureStateSnapshot,
   PlannerRevisionRequest,
@@ -13,13 +14,18 @@ import type {
   ValidatedQuery,
   VerificationFinding,
 } from '../domain/types.js';
-import { validateFeedbackIntent, validateInfrastructureSpec, validateSpecPatchPlan } from '../domain/schemas.js';
-import { feedbackIntentJsonSchema, specPatchPlanJsonSchema } from '../domain/structured-output-schemas.js';
+import { validateFeedbackIntent, validateInfrastructureSpec, validateSpecPatchPlan, validateVerifierRemediationPatchPlan } from '../domain/schemas.js';
+import { feedbackIntentJsonSchema, specPatchPlanJsonSchema, verifierRemediationPatchPlanJsonSchema } from '../domain/structured-output-schemas.js';
 import { expandStatefulDatabaseReplicas, isStatefulDatabaseService } from '../domain/stateful-database-volumes.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import { namespaceInfrastructureSpec } from '../domain/project-identity.js';
 import type { PlannerAgent } from './agent-interfaces.js';
 import { applySpecPatchPlan, resolveServiceSelector } from './spec-patch-applier.js';
+import {
+  getTrustedDefaultImageForBase,
+  getTrustedImageProfile,
+  getTrustedReplacementImages,
+} from '../domain/supported-images.js';
 
 export class StandardPlannerAgent implements PlannerAgent {
   constructor(private readonly provider: LlmProvider) {}
@@ -98,17 +104,19 @@ export class StandardPlannerAgent implements PlannerAgent {
         assumptions.push(...intentResult.diagnostics);
       }
       if (patchPlan === null) {
+        const patchPlanMode = selectRevisionPatchPlanMode(request, feedbackIntent, findings);
         const patchPlanResult = await this.getRevisionPatchPlan(
           spec,
           { ...request, feedbackIntent },
           issues,
           findings,
+          patchPlanMode,
         );
         patchPlan = patchPlanResult.patchPlan;
         patchPlanError = patchPlanResult.error;
         assumptions.push(...patchPlanResult.diagnostics);
       }
-      if (obs.userFeedback !== null && (patchPlan === null || (patchPlan.patches.length === 0 && !isServiceTargetAmbiguityPatchPlan(patchPlan)))) {
+      if (obs.userFeedback != null && (patchPlan === null || (patchPlan.patches.length === 0 && !isServiceTargetAmbiguityPatchPlan(patchPlan)))) {
         const deterministicPatchPlan = buildDeterministicFeedbackPatchPlan(
           spec,
           obs.userFeedback.message,
@@ -124,7 +132,7 @@ export class StandardPlannerAgent implements PlannerAgent {
           patchPlan = deterministicPatchPlan;
         }
       }
-      if (patchPlan !== null && obs.userFeedback !== null) {
+      if (patchPlan !== null && obs.userFeedback != null) {
         const normalizedPatchPlan = normalizeStatefulDatabaseReplicaPatchPlan(
           spec,
           patchPlan,
@@ -136,9 +144,24 @@ export class StandardPlannerAgent implements PlannerAgent {
           assumptions.push('Revision patch source: normalized stateful database total/group feedback to a logical database replica patch.');
         }
       }
+      if (patchPlan !== null) {
+        const portConflictPatchPlan = normalizeHostPortConflictPatchPlan(
+          spec,
+          patchPlan,
+          issues,
+          findings,
+          request.attemptIndex,
+        );
+        if (portConflictPatchPlan !== patchPlan) {
+          patchPlan = portConflictPatchPlan;
+          assumptions.push('Revision patch source: normalized host port conflict to replace-service-port; port removal is not allowed for this issue.');
+        }
+      }
       if (patchPlan !== null && (patchPlan.patches.length > 0 || isServiceTargetAmbiguityPatchPlan(patchPlan))) {
         const plannedRevision = applySpecPatchPlan(spec, patchPlan.patches, {
           allowBlockedPatchOps: extractAllowedPatchOps(issues),
+          verificationFindings: findings,
+          feedbackIntent,
         });
         revisedSpec = plannedRevision.spec;
         patchResults = plannedRevision.results;
@@ -212,7 +235,7 @@ export class StandardPlannerAgent implements PlannerAgent {
     }
     const clarificationContext = [
       ...(buildRevisionClarifications(findings) ?? []),
-      ...buildPatchClarifications(patchResults ?? []),
+      ...buildPatchClarifications(patchResults ?? [], findings),
       ...buildPatchPlanAmbiguityClarifications(spec, patchPlan),
     ];
     if (clarificationContext.length > 0) {
@@ -226,16 +249,19 @@ export class StandardPlannerAgent implements PlannerAgent {
     request: PlannerRevisionRequest,
     issues: string[],
     findings: VerificationFinding[],
+    mode: RevisionPatchPlanMode,
   ): Promise<RevisionPatchPlanResult> {
     try {
+      const isVerifierRemediation = mode === 'verifier-remediation';
       const userPayload = JSON.stringify({
+        patchPlanMode: mode,
         attemptIndex: request.attemptIndex,
         projectName: spec.projectName,
         logicalServiceCatalog: buildLogicalRevisionServiceCatalog(spec),
         physicalServiceCatalog: buildPhysicalRevisionServiceCatalog(spec),
         serviceCatalog: buildLogicalRevisionServiceCatalog(spec),
         databaseReplicaGroups: buildDatabaseReplicaGroups(spec),
-        verifierObservation: buildVerifierObservationContext(request.revisionObservation),
+        verifierObservation: buildVerifierObservationContext(spec, request.revisionObservation),
         userFeedback: request.revisionObservation.userFeedback,
         feedbackIntent: request.feedbackIntent ?? null,
         runtimeIssueReport: request.runtimeIssueReport ?? null,
@@ -256,10 +282,13 @@ export class StandardPlannerAgent implements PlannerAgent {
         findings,
         patchGuidance: {
           sourceOfTruth: 'Return patches for InfrastructureSpec only. Compose YAML is rendered later.',
+          issueGrounding: isVerifierRemediation
+            ? 'Start from verifierObservation.affectedResources. For every patch, include resolvesIssueCodes, affectedServiceNames, and resolutionReason showing which verifier issue and affected entity the patch resolves.'
+            : 'Planner/user revision mode: do not use verifier issue codes as action names. Convert semantic user intent into patch op values such as set-service-replicas, rename-service, replace-service-port.',
           targetResolution: 'Prefer selectors by exact name, nameLike, kind, imageFamily, exposesHostPort, dependsOn, dependentOf instead of guessing a concrete name when the user uses an alias.',
           portInference: 'When the user gives host:container, use it exactly. When the user gives one port and the target service already has exactly one mapping, preserve the existing container port unless the user explicitly says both sides should change.',
-          schemaNormalization: 'Always convert natural-language feedback to one or more SpecPatch objects when the intent and target can be inferred from current services. Do not leave patches empty just because wording is informal.',
-          replicaGroupTargeting: 'For logical database replica groups, set patch.target.targetKind="replica-group", patch.target.name to databaseReplicaGroups.baseName, and include kind="database" plus imageFamily.',
+          schemaNormalization: 'Convert natural-language feedback to SpecPatch objects only when the intent, target, and causal link to the observation are clear. Otherwise return requiresUserInput=true with a specific ambiguity.',
+          replicaGroupTargeting: 'Use targetKind="replica-group" only when userFeedback or verifierObservation explicitly asks for database replica/group/overall instance count. Then set patch.target.name to databaseReplicaGroups.baseName and include kind="database" plus imageFamily.',
           feedbackIntent: 'If feedbackIntent is present, treat it as the structured parse of user other feedback and convert it to SpecPatch objects. If feedbackIntent is absent but userFeedback exists, infer intent from userFeedback and observations.',
         },
       });
@@ -269,10 +298,21 @@ export class StandardPlannerAgent implements PlannerAgent {
           'REVISION_PATCH_PLANNER_V1',
           'You revise desired infrastructure by returning schema-valid JSON patches only.',
           'Patch InfrastructureSpec, not Docker API payloads and not docker-compose YAML.',
+          ...(isVerifierRemediation
+            ? [
+                'Return issueAnalysis first: for each relevant verifier observation, identify the issue, affected service/resource, intended fix, and any user input needed.',
+                'Every patch must include resolvesIssueCodes, affectedServiceNames, and resolutionReason. resolvesIssueCodes must use verifier finding codes such as HOST_PORT_CONFLICT or IMAGE_NOT_FOUND, never user intents such as change-replicas.',
+              ]
+            : [
+                'Use the base planner patch schema: patches need op, target/service fields, and reason; do not include issueAnalysis and do not require resolvesIssueCodes.',
+                'User intents such as change-replicas, change-name, and change-port are not patch ops and are not verifier issue codes. Convert them into set-service-replicas, rename-service, or replace-service-port patches.',
+              ]),
+          'Do not emit patches that are unrelated to verifierObservation unless userFeedback explicitly asks for that separate change.',
+          'If a runtime issue identifies an affected service but the necessary replacement value is missing, return no patch, requiresUserInput=true, and a specific ambiguity asking for that value.',
           'Use logicalServiceCatalog as the default source of truth for mapping user wording to existing services.',
           'Use physicalServiceCatalog only when the user explicitly names an expanded physical service like postgres-2.',
           'When databaseReplicaGroups are present, treat expanded names like postgres-1/postgres-2 as one logical stateful database group for replica-count changes.',
-          'For stateful database total/group/overall instance changes, emit one set-service-replicas patch with targetKind="replica-group", name=databaseReplicaGroups.baseName, kind="database", and imageFamily; do not emit separate patches for each physical service.',
+          'Only for explicit stateful database total/group/overall instance changes, emit one set-service-replicas patch with targetKind="replica-group", name=databaseReplicaGroups.baseName, kind="database", and imageFamily; do not emit separate patches for each physical service.',
           'Use verifierObservation, userFeedback, and runtimeRefs as observations about the same desired spec; do not ignore verifier evidence when user feedback is present.',
           'Treat userFeedback from an "other" answer as a fresh natural-language instruction, but still ground target selection in logicalServiceCatalog, physicalServiceCatalog, and verifierObservation.',
           'Choose targets by comparing the user request with each service name, role, image family, exposed ports, dependencies, dependents, and current replicas.',
@@ -284,14 +324,14 @@ export class StandardPlannerAgent implements PlannerAgent {
         ].join('\n'),
         user: userPayload,
         schemaName: 'spec_patch_plan',
-        schema: specPatchPlanJsonSchema,
+        schema: isVerifierRemediation ? verifierRemediationPatchPlanJsonSchema : specPatchPlanJsonSchema,
       });
-      const patchPlan = normalizeAndValidateSpecPatchPlan(parseJsonResponse(response.text));
+      const patchPlan = normalizeAndValidateSpecPatchPlan(parseJsonResponse(response.text), mode, findings);
       return {
         patchPlan,
         error: null,
         diagnostics: [
-          'LLM revision request sent to structured provider with schema spec_patch_plan.',
+          `LLM revision request sent to structured provider with schema spec_patch_plan (${mode}).`,
           `LLM revision input: ${truncateDiagnostic(userPayload)}`,
           `LLM revision raw response: ${truncateDiagnostic(response.text)}`,
           `LLM revision validated patch ops: ${patchPlan.patches.map((patch) => patch.op).join(', ') || 'none'}.`,
@@ -333,7 +373,7 @@ export class StandardPlannerAgent implements PlannerAgent {
         physicalServiceCatalog: buildPhysicalRevisionServiceCatalog(spec),
         serviceCatalog: buildLogicalRevisionServiceCatalog(spec),
         databaseReplicaGroups: buildDatabaseReplicaGroups(spec),
-        verifierObservation: buildVerifierObservationContext(request.revisionObservation),
+        verifierObservation: buildVerifierObservationContext(spec, request.revisionObservation),
         runtimeIssueReport: request.runtimeIssueReport ?? null,
         runtimeRefs: request.resourceRefs ?? null,
         services: spec.services.map((service) => ({
@@ -679,7 +719,7 @@ function getServiceDependents(spec: InfrastructureSpec, serviceName: string): st
     .map((candidate) => candidate.name);
 }
 
-function buildVerifierObservationContext(obs: import('../domain/types.js').RevisionObservation): {
+function buildVerifierObservationContext(spec: InfrastructureSpec, obs: import('../domain/types.js').RevisionObservation): {
   status: string | null;
   scope: string | null;
   revisionHint: string | null;
@@ -694,6 +734,16 @@ function buildVerifierObservationContext(obs: import('../domain/types.js').Revis
     evidence: string[];
     suggestedAction: string | null;
     requiresUserInput: boolean;
+  }>;
+  affectedResources: Array<{
+    issueCode: string;
+    resourceRef: string;
+    serviceName: string | null;
+    serviceKind: InfrastructureSpec['services'][number]['kind'] | null;
+    currentDesiredValue: string | null;
+    runtimeActualValue: string | null;
+    blockedReason: string | null;
+    userActionNeeded: string | null;
   }>;
   driftSummary: string | null;
 } {
@@ -714,8 +764,52 @@ function buildVerifierObservationContext(obs: import('../domain/types.js').Revis
       suggestedAction: finding.suggestedAction?.summary ?? null,
       requiresUserInput: finding.requiresUserInput,
     })),
+    affectedResources: (report?.findings ?? []).map((finding) => buildAffectedResource(spec, finding)),
     driftSummary: obs.driftSummary,
   };
+}
+
+function buildAffectedResource(
+  spec: InfrastructureSpec,
+  finding: VerificationFinding,
+): ReturnType<typeof buildVerifierObservationContext>['affectedResources'][number] {
+  const serviceName = finding.resourceKind === 'service' || finding.resourceKind === 'port'
+    ? finding.resourceName ?? extractServiceNameFromResourceName(finding.resourceName)
+    : null;
+  const service = serviceName ? spec.services.find((candidate) => candidate.name === serviceName) ?? null : null;
+  return {
+    issueCode: finding.code,
+    resourceRef: finding.resourceName ? `${finding.resourceKind}/${finding.resourceName}` : finding.resourceKind,
+    serviceName: service?.name ?? serviceName,
+    serviceKind: service?.kind ?? null,
+    currentDesiredValue: finding.expected ?? summarizeDesiredFindingValue(service, finding),
+    runtimeActualValue: finding.actual ?? null,
+    blockedReason: finding.evidence[0] ?? finding.suggestedAction?.summary ?? null,
+    userActionNeeded: finding.requiresUserInput
+      ? finding.suggestedAction?.summary ?? describeFindingActionNeeded(finding)
+      : null,
+  };
+}
+
+function extractServiceNameFromResourceName(resourceName: string | null | undefined): string | null {
+  if (!resourceName) return null;
+  const parts = resourceName.split('/').filter(Boolean);
+  return parts.length > 1 ? parts[parts.length - 1]! : resourceName;
+}
+
+function summarizeDesiredFindingValue(
+  service: InfrastructureSpec['services'][number] | null,
+  finding: VerificationFinding,
+): string | null {
+  if (!service) return null;
+  if (finding.code === 'HOST_PORT_CONFLICT' || finding.code === 'PORT_MISMATCH') return (service.ports ?? []).join(', ') || null;
+  if (finding.code === 'IMAGE_NOT_FOUND' || finding.code === 'IMAGE_MISMATCH') return service.image;
+  return null;
+}
+
+function describeFindingActionNeeded(finding: VerificationFinding): string | null {
+  if (finding.code === 'HOST_PORT_CONFLICT') return 'Choose a replacement host port for the affected service.';
+  return 'Provide guidance for the affected runtime issue.';
 }
 
 function extractAllowedPatchOps(issues: string[]): string[] {
@@ -744,6 +838,30 @@ type RevisionPatchPlanResult =
   | { patchPlan: SpecPatchPlan; error: null; diagnostics: string[] }
   | { patchPlan: null; error: string; diagnostics: string[] };
 
+type RevisionPatchPlanMode = 'planner-revision' | 'verifier-remediation';
+
+type NormalizedSpecPatchPlanShape = SpecPatchPlan & { issueAnalysis?: IssueAnalysis[] };
+
+function selectRevisionPatchPlanMode(
+  request: PlannerRevisionRequest,
+  feedbackIntent: FeedbackIntent | null,
+  findings: VerificationFinding[],
+): RevisionPatchPlanMode {
+  const feedbackMessage = request.revisionObservation.userFeedback?.message ?? '';
+  const selectedVerifierRemediation = /\ballow:/i.test(feedbackMessage);
+  if (selectedVerifierRemediation) return 'verifier-remediation';
+
+  const semanticFeedbackIntent = feedbackIntent !== null
+    && feedbackIntent.intent !== 'unknown'
+    && feedbackIntent.intent !== 'retry-as-is'
+    && feedbackIntent.intent !== 'cancel';
+  if (semanticFeedbackIntent) return 'planner-revision';
+
+  if (request.revisionObservation.userFeedback !== null) return 'planner-revision';
+  if (findings.length > 0) return 'verifier-remediation';
+  return 'planner-revision';
+}
+
 function truncateDiagnostic(value: string, maxLength = 1200): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength)}... [truncated ${value.length - maxLength} chars]`;
 }
@@ -754,11 +872,61 @@ function formatRevisionPatchPlanError(error: unknown): string {
   return 'unknown error';
 }
 
-function normalizeAndValidateSpecPatchPlan(value: unknown): SpecPatchPlan {
+function normalizeAndValidateSpecPatchPlan(value: unknown, mode: RevisionPatchPlanMode, findings: VerificationFinding[] = []): SpecPatchPlan {
   const normalizedPlan = normalizeSpecPatchPlanShape(value);
-  return validateSpecPatchPlan(normalizedPlan);
+  if (mode === 'verifier-remediation') {
+    return validateVerifierRemediationPatchPlan(addVerifierGrounding(normalizedPlan, findings));
+  }
+  const { issueAnalysis: _issueAnalysis, ...plannerPlan } = normalizedPlan;
+  return validateSpecPatchPlan(plannerPlan);
 }
 
+function addVerifierGrounding(plan: NormalizedSpecPatchPlanShape, findings: VerificationFinding[]): NormalizedSpecPatchPlanShape {
+  if (findings.length === 0) return plan;
+  const fallbackIssueAnalysis: IssueAnalysis[] = findings.map((finding) => ({
+    issueCode: finding.code,
+    affectedResource: finding.resourceName ?? finding.resourceKind,
+    ...(extractServiceNameFromResourceName(finding.resourceName) ? { affectedServiceName: extractServiceNameFromResourceName(finding.resourceName)! } : {}),
+    intendedFix: finding.evidence[0] ?? finding.suggestedAction?.summary ?? finding.code,
+  }));
+
+  const firstFinding = findings[0]!;
+  const patches = plan.patches.map((patch) => {
+    const matchedFinding = findGroundingFindingForPatch(patch, findings) ?? firstFinding;
+    const affectedServiceNames = patch.affectedServiceNames?.length
+      ? patch.affectedServiceNames
+      : [extractServiceNameFromResourceName(matchedFinding.resourceName), ...resolveServiceNamesFromSelector(patch)]
+        .filter((name): name is string => Boolean(name));
+    return {
+      ...patch,
+      resolvesIssueCodes: patch.resolvesIssueCodes?.length ? patch.resolvesIssueCodes : [matchedFinding.code],
+      affectedServiceNames: affectedServiceNames.length > 0 ? uniqueIdentifiers(affectedServiceNames) : [matchedFinding.resourceName ?? matchedFinding.resourceKind],
+      resolutionReason: patch.resolutionReason ?? patch.reason,
+    };
+  });
+
+  return {
+    ...plan,
+    issueAnalysis: plan.issueAnalysis?.length ? plan.issueAnalysis : fallbackIssueAnalysis,
+    patches,
+  };
+}
+
+function findGroundingFindingForPatch(patch: SpecPatch, findings: VerificationFinding[]): VerificationFinding | null {
+  const patchServices = resolveServiceNamesFromSelector(patch);
+  return findings.find((finding) => {
+    const serviceName = extractServiceNameFromResourceName(finding.resourceName);
+    return serviceName !== null && patchServices.includes(serviceName);
+  }) ?? null;
+}
+
+function resolveServiceNamesFromSelector(patch: SpecPatch): string[] {
+  if ('target' in patch) {
+    return [patch.target.name].filter((name): name is string => Boolean(name));
+  }
+  if ('service' in patch) return [patch.service.name];
+  return [];
+}
 function normalizeAndValidateFeedbackIntent(value: unknown, rawText: string): FeedbackIntent {
   const record = isRecord(value) ? value : {};
   const intent = normalizeFeedbackIntentName(record.intent ?? record.kind ?? record.action ?? record.type);
@@ -876,7 +1044,7 @@ function normalizeResourceKind(value: unknown): NonNullable<FeedbackIntent['targ
   return null;
 }
 
-function normalizeSpecPatchPlanShape(value: unknown): SpecPatchPlan {
+function normalizeSpecPatchPlanShape(value: unknown): NormalizedSpecPatchPlanShape {
   const record = isRecord(value) ? value : {};
   const rawPatches = Array.isArray(record.patches)
     ? record.patches
@@ -891,8 +1059,9 @@ function normalizeSpecPatchPlanShape(value: unknown): SpecPatchPlan {
     ?? (patches.length > 0
       ? 'Normalized LLM revision output into schema-valid SpecPatchPlan.'
       : 'LLM revision output did not contain a directly applicable schema-valid patch.');
+  const issueAnalysis = normalizeIssueAnalysis(record.issueAnalysis);
 
-  return {
+  const plan: NormalizedSpecPatchPlanShape = {
     patches,
     explanation,
     assumptions: normalizeStringArray(record.assumptions),
@@ -902,97 +1071,127 @@ function normalizeSpecPatchPlanShape(value: unknown): SpecPatchPlan {
       : patches.length === 0,
     confidence: normalizeConfidence(record.confidence, patches.length > 0 ? 0.7 : 0.25),
   };
+  if (issueAnalysis) plan.issueAnalysis = issueAnalysis;
+  return plan;
 }
 
 function normalizeSpecPatchShape(value: unknown): SpecPatch[] {
   if (!isRecord(value)) return [];
   const op = normalizePatchOp(value.op ?? value.kind ?? value.action ?? value.type);
   const reason = normalizeString(value.reason) ?? normalizeString(value.explanation) ?? 'Normalized LLM patch.';
+  const relevance = normalizePatchRelevance(value);
   const target = normalizePatchTarget(value.target ?? value.selector ?? value.service ?? value.serviceName ?? value.name);
 
   if (op === 'set-service-replicas') {
     const replicas = normalizeInteger(value.replicas ?? value.replicaCount ?? value.instances ?? value.count);
-    return target && replicas !== null && replicas >= 1 && replicas <= 50 ? [{ op, target, replicas, reason }] : [];
+    return target && replicas !== null && replicas >= 1 && replicas <= 50 ? [{ op, target, replicas, reason, ...relevance }] : [];
   }
 
   if (op === 'replace-service-port') {
     const to = normalizePortMapping(value.to ?? value.port ?? value.mapping ?? value.ports);
     const from = normalizePortMapping(value.from);
-    return target && to ? [{ op, target, to, ...(from ? { from } : {}), reason }] : [];
+    return target && to ? [{ op, target, to, ...(from ? { from } : {}), reason, ...relevance }] : [];
   }
 
   if (op === 'add-service-port') {
     const port = normalizePortMapping(value.port ?? value.to ?? value.mapping);
-    return target && port ? [{ op, target, port, reason }] : [];
+    return target && port ? [{ op, target, port, reason, ...relevance }] : [];
   }
 
   if (op === 'remove-service-port') {
     const port = normalizePortMapping(value.port ?? value.from);
-    return target ? [{ op, target, ...(port ? { port } : {}), reason }] : [];
+    return target ? [{ op, target, ...(port ? { port } : {}), reason, ...relevance }] : [];
   }
 
   if (op === 'set-service-image') {
     const image = normalizeRevisionImage(normalizeString(value.image ?? value.to ?? value.value) ?? '');
-    return target && image ? [{ op, target, image, reason }] : [];
+    return target && image ? [{ op, target, image, reason, ...relevance }] : [];
   }
 
   if (op === 'remove-service') {
-    return target ? [{ op, target, reason }] : [];
+    return target ? [{ op, target, reason, ...relevance }] : [];
   }
 
   if (op === 'rename-service') {
     const name = normalizeIdentifierString(value.to ?? value.newName ?? value.name);
-    return target && name ? [{ op, target, name, reason }] : [];
+    return target && name ? [{ op, target, name, reason, ...relevance }] : [];
   }
 
   if (op === 'set-service-env') {
     const key = normalizeString(value.key ?? value.name);
     const envValue = normalizeString(value.value ?? value.to);
-    return target && key && envValue ? [{ op, target, key, value: envValue, reason }] : [];
+    return target && key && envValue ? [{ op, target, key, value: envValue, reason, ...relevance }] : [];
   }
 
   if (op === 'remove-service-env') {
     const key = normalizeString(value.key ?? value.name);
-    return target && key ? [{ op, target, key, reason }] : [];
+    return target && key ? [{ op, target, key, reason, ...relevance }] : [];
   }
 
   if (op === 'add-service-volume' || op === 'remove-service-volume') {
     const volume = normalizeString(value.volume ?? value.mount ?? value.value);
-    return target && volume ? [{ op, target, volume, reason }] : [];
+    return target && volume ? [{ op, target, volume, reason, ...relevance }] : [];
   }
 
   if (op === 'add-service-dependency' || op === 'remove-service-dependency') {
     const dependencyName = normalizeIdentifierString(value.dependencyName ?? value.dependency ?? value.dependsOn);
-    return target && dependencyName ? [{ op, target, dependencyName, reason }] : [];
+    return target && dependencyName ? [{ op, target, dependencyName, reason, ...relevance }] : [];
   }
 
   if (op === 'set-service-desired-status') {
     const desiredStatus = normalizeString(value.desiredStatus ?? value.status ?? value.value);
-    return target && (desiredStatus === 'running' || desiredStatus === 'stopped') ? [{ op, target, desiredStatus, reason }] : [];
+    return target && (desiredStatus === 'running' || desiredStatus === 'stopped') ? [{ op, target, desiredStatus, reason, ...relevance }] : [];
   }
 
   if (op === 'set-project-name') {
     const name = normalizeIdentifierString(value.name ?? value.projectName ?? value.to);
-    return name ? [{ op, name, reason }] : [];
+    return name ? [{ op, name, reason, ...relevance }] : [];
   }
 
   if (op === 'rename-network') {
     const from = normalizeIdentifierString(value.from);
     const to = normalizeIdentifierString(value.to ?? value.name ?? value.networkName);
-    return to ? [{ op, ...(from ? { from } : {}), to, reason }] : [];
+    return to ? [{ op, ...(from ? { from } : {}), to, reason, ...relevance }] : [];
   }
 
   if (op === 'set-networks') {
     const networks = normalizeStringArray(value.networks ?? value.names).map(sanitizeIdentifier).filter(Boolean);
-    return networks.length > 0 ? [{ op, networks: uniqueIdentifiers(networks), reason }] : [];
+    return networks.length > 0 ? [{ op, networks: uniqueIdentifiers(networks), reason, ...relevance }] : [];
   }
 
   if (op === 'add-service') {
     const service = normalizeInfrastructureService(value.service ?? value);
-    return service ? [{ op, service, reason }].filter((patch) => validatePotentialPatch(patch)) : [];
+    return service ? [{ op, service, reason, ...relevance }].filter((patch) => validatePotentialPatch(patch)) : [];
   }
 
   return [];
+}
+
+function normalizePatchRelevance(value: Record<string, unknown>): Partial<Pick<SpecPatch, 'resolvesIssueCodes' | 'affectedServiceNames' | 'resolutionReason'>> {
+  const resolvesIssueCodes = normalizeStringArray(value.resolvesIssueCodes);
+  const affectedServiceNames = normalizeStringArray(value.affectedServiceNames).map(sanitizeIdentifier).filter(Boolean);
+  const resolutionReason = normalizeString(value.resolutionReason);
+  const relevance: Partial<Pick<SpecPatch, 'resolvesIssueCodes' | 'affectedServiceNames' | 'resolutionReason'>> = {};
+  if (resolvesIssueCodes.length > 0) relevance.resolvesIssueCodes = resolvesIssueCodes as NonNullable<SpecPatch['resolvesIssueCodes']>;
+  if (affectedServiceNames.length > 0) relevance.affectedServiceNames = uniqueIdentifiers(affectedServiceNames);
+  if (resolutionReason) relevance.resolutionReason = resolutionReason;
+  return relevance;
+}
+
+function normalizeIssueAnalysis(value: unknown): IssueAnalysis[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const issues = value.flatMap((entry) => {
+    if (!isRecord(entry)) return [];
+    const issueCode = normalizeString(entry.issueCode ?? entry.code);
+    const affectedResource = normalizeString(entry.affectedResource ?? entry.resourceRef ?? entry.resource);
+    const intendedFix = normalizeString(entry.intendedFix ?? entry.proposedResolution ?? entry.fix);
+    const affectedServiceName = normalizeIdentifierString(entry.affectedServiceName ?? entry.serviceName);
+    const userActionNeeded = normalizeString(entry.userActionNeeded);
+    return issueCode && affectedResource && intendedFix
+      ? [{ issueCode, affectedResource, intendedFix, ...(affectedServiceName ? { affectedServiceName } : {}), ...(userActionNeeded ? { userActionNeeded } : {}) }]
+      : [];
+  });
+  return issues.length > 0 ? issues : undefined;
 }
 
 function normalizeInfrastructureService(value: unknown): InfrastructureSpec['services'][number] | null {
@@ -1339,7 +1538,12 @@ function buildPatchesFromFeedbackIntent(
   }
 
   if (feedbackIntent.intent === 'change-image' && feedbackIntent.desiredChange?.image && selector !== null) {
-    patches.push({ op: 'set-service-image', target: selector, image: feedbackIntent.desiredChange.image, reason });
+    const image = normalizeRevisionImage(feedbackIntent.desiredChange.image);
+    if (image !== null) {
+      patches.push({ op: 'set-service-image', target: selector, image, reason });
+    } else {
+      ambiguities.push('Requested replacement image was not clear.');
+    }
   }
 
   if ((feedbackIntent.intent === 'change-name' || feedbackIntent.intent === 'rename-service') && feedbackIntent.desiredChange?.name) {
@@ -1445,6 +1649,98 @@ function normalizeStatefulDatabaseReplicaPatchPlan(
   };
 }
 
+function normalizeHostPortConflictPatchPlan(
+  spec: InfrastructureSpec,
+  patchPlan: SpecPatchPlan,
+  issues: string[],
+  findings: VerificationFinding[],
+  attemptIndex: number,
+): SpecPatchPlan {
+  const conflicts = collectHostPortConflicts(spec, issues, findings);
+  if (conflicts.length === 0) return patchPlan;
+
+  const affectedServices = new Set(conflicts.map((conflict) => conflict.service.name));
+  const occupiedPorts = new Set(conflicts.map((conflict) => conflict.hostPort));
+  const patches = patchPlan.patches.filter((patch) => {
+    if (patch.op !== 'remove-service-port') return true;
+    const matched = resolveServiceSelector(spec, patch.target);
+    return !matched.some((service) => affectedServices.has(service.name));
+  });
+  const hasReplacementFor = new Set(
+    patches
+      .filter((patch) => patch.op === 'replace-service-port')
+      .flatMap((patch) => resolveServiceSelector(spec, patch.target).map((service) => service.name)),
+  );
+  const hasAnyReplacementPatch = patches.some((patch) => patch.op === 'replace-service-port');
+
+  for (const conflict of conflicts) {
+    if (hasAnyReplacementPatch) continue;
+    if (hasReplacementFor.has(conflict.service.name)) continue;
+    const replacementHostPort = nextSafePort(conflict.hostPort, occupiedPorts, Math.max(1, attemptIndex + 1));
+    occupiedPorts.add(replacementHostPort);
+    patches.push({
+      op: 'replace-service-port',
+      target: { name: conflict.service.name },
+      from: conflict.currentPort,
+      to: `${replacementHostPort}:${conflict.containerPort}`,
+      reason: `Host port ${conflict.hostPort} is occupied; replace with ${replacementHostPort}:${conflict.containerPort}.`,
+      resolvesIssueCodes: ['HOST_PORT_CONFLICT'],
+      affectedServiceNames: [conflict.service.name],
+    });
+  }
+
+  if (patches.length === patchPlan.patches.length && patches.every((patch, index) => patch === patchPlan.patches[index])) return patchPlan;
+
+  return {
+    ...patchPlan,
+    patches,
+    explanation: `${patchPlan.explanation} Host port conflicts are resolved by replacing the host port, not by removing exposure.`,
+    ambiguities: patches.length > 0 ? patchPlan.ambiguities.filter((ambiguity) => !/LLM provider|required|port|feedback/i.test(ambiguity)) : patchPlan.ambiguities,
+    requiresUserInput: patches.length === 0,
+  };
+}
+
+function collectHostPortConflicts(
+  spec: InfrastructureSpec,
+  issues: string[],
+  findings: VerificationFinding[],
+): Array<{ service: InfrastructureSpec['services'][number]; hostPort: number; containerPort: string; currentPort: string }> {
+  const conflicts: Array<{ service: InfrastructureSpec['services'][number]; hostPort: number; containerPort: string; currentPort: string }> = [];
+
+  for (const finding of findings) {
+    if (finding.code !== 'HOST_PORT_CONFLICT') continue;
+    const serviceName = extractServiceNameFromResourceName(finding.resourceName);
+    const service = serviceName ? spec.services.find((candidate) => candidate.name === serviceName) : null;
+    const hostPort = extractHostPort(finding.expected) ?? extractHostPort(finding.actual);
+    if (!service || hostPort === null) continue;
+    const currentPort = (service.ports ?? []).find((port) => Number(port.split(':')[0]) === hostPort) ?? service.ports?.[0];
+    if (!currentPort) continue;
+    conflicts.push({ service, hostPort, containerPort: currentPort.split(':')[1] ?? getDefaultContainerPort(service.image) ?? String(hostPort), currentPort });
+  }
+
+  for (const issue of issues) {
+    const match = /Host port conflict: service "([^"]+)" wants (\d+)/i.exec(issue);
+    if (!match) continue;
+    const service = spec.services.find((candidate) => candidate.name === match[1]);
+    const hostPort = Number(match[2]);
+    if (!service || !Number.isInteger(hostPort)) continue;
+    if (conflicts.some((conflict) => conflict.service.name === service.name && conflict.hostPort === hostPort)) continue;
+    const currentPort = (service.ports ?? []).find((port) => Number(port.split(':')[0]) === hostPort) ?? service.ports?.[0];
+    if (!currentPort) continue;
+    conflicts.push({ service, hostPort, containerPort: currentPort.split(':')[1] ?? getDefaultContainerPort(service.image) ?? String(hostPort), currentPort });
+  }
+
+  return conflicts;
+}
+
+function extractHostPort(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const match = /\b([1-9][0-9]{0,4})(?::\d{1,5})?\b/.exec(value);
+  if (!match) return null;
+  const port = Number(match[1]);
+  return Number.isInteger(port) && port > 0 && port <= 65535 ? port : null;
+}
+
 function isDatabaseGroupTotalFeedback(feedback: string, feedbackIntent: FeedbackIntent | null): boolean {
   const normalizedFeedback = feedback.toLowerCase();
   const mentionsDatabase = inferFeedbackServiceKind(normalizedFeedback, null) === 'database';
@@ -1537,7 +1833,12 @@ function containsServiceHint(text: string): boolean {
 }
 
 function parseImageFeedback(feedback: string): string | null {
-  const requestedImage = /(?:use|image|replace\s+with|change\s+image\s+to|set\s+image\s+to)\s+([A-Za-z0-9_./:-]+)/i.exec(feedback)?.[1];
+  const requestedImage = [
+    /\b(?:change|set|update|switch)\s+(?:\w+\s+){0,4}?image\s+(?:to|with)\s+([A-Za-z0-9_./:-]+)/i,
+    /\b(?:change|set|update|switch)\s+(?:\w+\s+){0,4}?(?:to|with)\s+image\s+([A-Za-z0-9_./:-]+)/i,
+    /\breplace\s+(?:\w+\s+){0,4}?with\s+([A-Za-z0-9_./:-]+)/i,
+    /\buse\s+([A-Za-z0-9_./:-]+)(?:\s+image)?\b/i,
+  ].map((pattern) => pattern.exec(feedback)?.[1]).find((value): value is string => Boolean(value));
   return requestedImage ? normalizeRevisionImage(requestedImage) : null;
 }
 
@@ -1646,7 +1947,7 @@ function parseRevisionPatches(
         conflictingHostPorts.add(port);
       }
     }
-    if (finding.code === 'IMAGE_NOT_FOUND' && finding.resourceName) {
+    if ((finding.code === 'IMAGE_NOT_FOUND' || finding.code === 'IMAGE_PULL_FAILED') && finding.resourceName) {
       const fallback = supportedImageFallback(finding.expected ?? finding.resourceName);
       if (fallback) {
         patches.push({ kind: 'set-service-image', serviceName: finding.resourceName, image: fallback });
@@ -1841,7 +2142,7 @@ function applyRevisionPatch(spec: InfrastructureSpec, patch: RevisionPatch): Inf
       ...spec,
       services: spec.services.map((service) => {
         if (!matchesPatchService(service.name, patch.serviceName, spec.services.length)) return service;
-        return { ...service, kind: inferServiceKind(patch.image), image: patch.image };
+        return rebuildServiceForTrustedImage(service, patch.image);
       }),
     };
   }
@@ -2022,9 +2323,9 @@ function buildRevisionClarifications(
   return riskyFindings.map((finding, index) => ({
     id: `revision-${index + 1}-${finding.code.toLowerCase()}`,
     severity: finding.severity === 'blocker' || finding.severity === 'error' ? 'blocking' : 'warning',
-    field: finding.code === 'IMAGE_NOT_FOUND' || finding.code === 'IMAGE_MISMATCH' ? 'services[].image' : finding.code === 'HOST_PORT_CONFLICT' || finding.code === 'PORT_MISMATCH' ? 'services[].ports' : 'topology',
-    message: formatFindingForPlanner(finding),
-    reason: finding.suggestedAction?.summary ?? 'Planner needs human guidance before making a risky change.',
+    field: finding.code === 'IMAGE_NOT_FOUND' || finding.code === 'IMAGE_MISMATCH' || finding.code === 'IMAGE_PULL_FAILED' ? 'services[].image' : finding.code === 'HOST_PORT_CONFLICT' || finding.code === 'PORT_MISMATCH' ? 'services[].ports' : 'topology',
+    message: formatClarificationMessage(finding),
+    reason: formatClarificationReason(finding),
     affectedServices: finding.resourceKind === 'service' && finding.resourceName ? [finding.resourceName] : [],
     choices: finding.suggestedAction?.choices ?? [
       { id: '1', label: 'Auto safe fix', description: 'Let the planner use only low-risk spec changes.', value: 'auto-safe-fix' },
@@ -2034,8 +2335,25 @@ function buildRevisionClarifications(
   }));
 }
 
+function formatClarificationMessage(finding: VerificationFinding): string {
+  if (finding.code === 'HOST_PORT_CONFLICT') {
+    const serviceName = finding.resourceName ?? 'the affected web service';
+    return `Host port ${finding.expected ?? 'requested by the spec'} for ${serviceName} is already allocated.`;
+  }
+  return formatFindingForPlanner(finding);
+}
+
+function formatClarificationReason(finding: VerificationFinding): string {
+  if (finding.code === 'HOST_PORT_CONFLICT') {
+    const serviceName = finding.resourceName ?? 'the affected web/reverse-proxy service';
+    return `Choose a replacement host port for ${serviceName}; the planner should not change unrelated services.`;
+  }
+  return finding.suggestedAction?.summary ?? 'Planner needs human guidance before making a risky change.';
+}
+
 function buildPatchClarifications(
   patchResults: ResolvedSpecPatchResult[],
+  findings: VerificationFinding[],
 ): NonNullable<PlannerRevisionResult['clarificationContext']> {
   return patchResults
     .filter((result) => result.blockedReason !== null)
@@ -2043,15 +2361,33 @@ function buildPatchClarifications(
       id: `patch-${index + 1}-${result.patch.op}`,
       severity: 'warning',
       field: patchField(result.patch.op),
-      message: `Structured revision patch "${result.patch.op}" needs user input before it can be applied.`,
+      message: formatBlockedPatchMessage(result, findings),
       reason: result.blockedReason ?? 'Patch requires user input.',
       affectedServices: result.matchedServiceNames,
-      choices: [
-        { id: '1', label: 'Allow patch', description: 'Use this structured revision patch after explicit confirmation.', value: `allow:${result.patch.op}` },
-        { id: '2', label: 'Keep current', description: 'Skip this patch and keep the current desired spec unchanged.', value: `skip:${result.patch.op}` },
-      ],
+      choices: buildBlockedPatchChoices(result),
       allowOther: true,
     }));
+}
+
+function formatBlockedPatchMessage(result: ResolvedSpecPatchResult, findings: VerificationFinding[]): string {
+  if (result.blockedReason?.includes('reported runtime issue')) {
+    const portConflict = findings.find((finding) => finding.code === 'HOST_PORT_CONFLICT');
+    if (portConflict) return `The proposed "${result.patch.op}" patch does not fix the host port conflict on ${portConflict.resourceName ?? 'the affected service'}.`;
+  }
+  return `Structured revision patch "${result.patch.op}" needs user input before it can be applied.`;
+}
+
+function buildBlockedPatchChoices(result: ResolvedSpecPatchResult): NonNullable<PlannerRevisionResult['clarificationContext']>[number]['choices'] {
+  if (result.blockedReason?.includes('reported runtime issue') || result.blockedReason?.includes('different service')) {
+    return [
+      { id: '1', label: 'Describe fix', description: 'Provide a different change that directly addresses the runtime issue.', value: `describe-fix:${result.patch.op}` },
+      { id: '2', label: 'Keep current', description: 'Skip this patch and keep the current desired spec unchanged.', value: `skip:${result.patch.op}` },
+    ];
+  }
+  return [
+    { id: '1', label: 'Allow patch', description: 'Use this structured revision patch after explicit confirmation.', value: `allow:${result.patch.op}` },
+    { id: '2', label: 'Keep current', description: 'Skip this patch and keep the current desired spec unchanged.', value: `skip:${result.patch.op}` },
+  ];
 }
 
 function buildPatchPlanAmbiguityClarifications(
@@ -2097,7 +2433,7 @@ function formatFindingForPlanner(finding: VerificationFinding): string {
 }
 
 function findingNeedsUserInput(finding: VerificationFinding): boolean {
-  return finding.requiresUserInput || (finding.code === 'IMAGE_NOT_FOUND' && supportedImageFallback(finding.expected ?? finding.resourceName ?? '') === null);
+  return finding.requiresUserInput || ((finding.code === 'IMAGE_NOT_FOUND' || finding.code === 'IMAGE_PULL_FAILED') && supportedImageFallback(finding.expected ?? finding.resourceName ?? '') === null);
 }
 
 function nextSafePort(port: number, occupiedPorts: Set<number>, attemptNumber: number): number {
@@ -2109,13 +2445,10 @@ function nextSafePort(port: number, occupiedPorts: Set<number>, attemptNumber: n
 }
 
 function supportedImageFallback(image: string): string | null {
-  const base = (image.toLowerCase().split(':')[0] ?? '').split('/').pop() ?? '';
-  if (base === 'nginx' || image.toLowerCase().includes('web')) return 'nginx:stable';
-  if (base === 'node') return 'node:20-alpine';
-  if (base === 'python') return 'python:3.12-alpine';
-  if (base === 'postgres') return 'postgres:16-alpine';
-  if (base === 'redis') return 'redis:7-alpine';
-  return null;
+  const direct = getTrustedDefaultImageForBase(image);
+  if (direct) return direct;
+  const replacements = getTrustedReplacementImages(image, inferServiceKind(image), true);
+  return replacements[0] ?? null;
 }
 
 function getDefaultContainerPort(image: string): string | null {
@@ -2128,10 +2461,37 @@ function normalizeRevisionImage(image: string): string | null {
   const cleaned = image.replace(/[.,;]+$/g, '').toLowerCase();
   const ignoredWords = new Set(['a', 'an', 'the', 'different', 'image', 'container']);
   if (ignoredWords.has(cleaned)) return null;
-  if (cleaned === 'nginx') return 'nginx:stable';
-  if (cleaned === 'node') return 'node:20-alpine';
-  if (cleaned === 'python') return 'python:3.12-alpine';
+  const trusted = getTrustedDefaultImageForBase(cleaned);
+  if (trusted) return trusted;
+  if (!/^[a-z0-9./:_-]+$/i.test(cleaned)) return null;
   return cleaned.includes(':') ? cleaned : `${cleaned}:latest`;
+}
+
+function rebuildServiceForTrustedImage(
+  service: InfrastructureSpec['services'][number],
+  image: string,
+): InfrastructureSpec['services'][number] {
+  const profile = getTrustedImageProfile(image);
+  const nextPorts = profile?.defaultPorts.length ? profile.defaultPorts : service.ports;
+  const nextEnvironment = profile && Object.keys(profile.defaultEnvironment).length > 0
+    ? { ...profile.defaultEnvironment, ...(service.environment ?? {}) }
+    : service.environment;
+  const nextVolumes = profile?.defaultVolumes.length
+    ? profile.defaultVolumes.map((mount) => {
+        const target = mount.split(':')[1] ?? '';
+        const existing = (service.volumes ?? []).find((candidate) => target && candidate.endsWith(':' + target));
+        return existing ?? mount.replace(/^data:/, `${service.name}-data:`);
+      })
+    : service.volumes;
+
+  return {
+    ...service,
+    kind: inferServiceKind(image),
+    image,
+    ...(nextPorts && nextPorts.length > 0 ? { ports: nextPorts } : {}),
+    ...(nextEnvironment && Object.keys(nextEnvironment).length > 0 ? { environment: nextEnvironment } : {}),
+    ...(nextVolumes && nextVolumes.length > 0 ? { volumes: nextVolumes } : {}),
+  };
 }
 
 function buildRevisionSummary(

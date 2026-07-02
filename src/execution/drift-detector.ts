@@ -6,6 +6,7 @@ import type {
   RuntimeActualState,
   RuntimeContainerObservation,
 } from '../domain/types.js';
+import { missingDesiredPortMappings } from '../domain/port-mappings.js';
 import { toReplicaContainerNames } from './container-names.js';
 
 function imageBase(image: string): string {
@@ -159,9 +160,7 @@ export function buildDriftReport(
 
     if (desiredStatus === 'running' && service.ports && service.ports.length > 0 && actualIsRunning) {
       const actualPorts = container.ports ?? [];
-      const missingPorts = service.ports.filter(
-        (port) => !actualPorts.some((actualPort) => actualPort.includes(port.split(':')[0] ?? '')),
-      );
+      const missingPorts = missingDesiredPortMappings(service.ports, actualPorts);
       if (missingPorts.length > 0) {
         findings.push(
           finding(

@@ -93,7 +93,7 @@ export function deriveSpecFromRuntime(
       }
       if (derived.ports && derived.ports.length > 0) {
         merged.ports = derived.ports;
-      } else {
+      } else if (derived.desiredStatus === 'stopped') {
         delete merged.ports;
       }
       services.push(merged);

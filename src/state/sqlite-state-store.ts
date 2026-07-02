@@ -561,6 +561,31 @@ export async function clearManagedProjectState(
   return nextState;
 }
 
+export async function discardManagedProjectState(
+  projectName: string,
+  options: StateStoreOptions = {},
+): Promise<InfrastructureStateSnapshot> {
+  const existingState = (await loadState(options)) ?? createEmptyStateSnapshot();
+  const nextState = validateInfrastructureStateSnapshot({
+    ...existingState,
+    current: existingState.current?.desired.projectName === projectName ? null : existingState.current,
+    pendingPreview: existingState.pendingPreview?.desired.projectName === projectName ? null : existingState.pendingPreview,
+    history: existingState.history.filter((record) => record.projectName !== projectName),
+  });
+
+  await saveState(nextState, options);
+  const database = openDatabaseForWrite(options);
+  try {
+    ensureSchema(database);
+    deleteProjectSnapshot(database, projectName);
+    deleteProjectOperations(database, projectName);
+  } finally {
+    database.close();
+  }
+
+  return nextState;
+}
+
 export async function clearManagedStateAfterDestroyAll(
   input: ClearManagedStateAfterDestroyAllInput,
   options: StateStoreOptions = {},
@@ -802,6 +827,10 @@ function upsertProjectSnapshots(
 
 function deleteProjectSnapshot(database: Database.Database, projectName: string): void {
   database.prepare('DELETE FROM project_state_snapshots WHERE project_name = ?').run(projectName);
+}
+
+function deleteProjectOperations(database: Database.Database, projectName: string): void {
+  database.prepare('DELETE FROM state_operations WHERE project_name = ?').run(projectName);
 }
 
 function deleteAllProjectSnapshots(database: Database.Database): void {

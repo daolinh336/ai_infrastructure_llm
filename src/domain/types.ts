@@ -605,113 +605,133 @@ export interface ServiceSelector {
   dependentOf?: string;
 }
 
+export interface PatchRelevance {
+  resolvesIssueCodes?: VerificationFinding['code'][];
+  affectedServiceNames?: string[];
+  resolutionReason?: string;
+}
+
+export interface IssueAnalysis {
+  issueCode: VerificationFinding['code'] | string;
+  affectedResource: string;
+  affectedServiceName?: string;
+  intendedFix: string;
+  userActionNeeded?: string;
+}
+
+type RelevantPatchFields = {
+  resolvesIssueCodes?: VerificationFinding['code'][];
+  affectedServiceNames?: string[];
+  resolutionReason?: string;
+};
+
 export type SpecPatch =
   | {
       op: 'set-service-replicas';
       target: ServiceSelector;
       replicas: number;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'replace-service-port';
       target: ServiceSelector;
       to: string;
       from?: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'add-service-port';
       target: ServiceSelector;
       port: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'remove-service-port';
       target: ServiceSelector;
       port?: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'set-service-image';
       target: ServiceSelector;
       image: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'add-service';
       service: InfrastructureService;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'remove-service';
       target: ServiceSelector;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'rename-service';
       target: ServiceSelector;
       name: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'set-service-env';
       target: ServiceSelector;
       key: string;
       value: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'remove-service-env';
       target: ServiceSelector;
       key: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'add-service-volume';
       target: ServiceSelector;
       volume: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'remove-service-volume';
       target: ServiceSelector;
       volume: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'add-service-dependency';
       target: ServiceSelector;
       dependencyName: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'remove-service-dependency';
       target: ServiceSelector;
       dependencyName: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'set-service-desired-status';
       target: ServiceSelector;
       desiredStatus: NonNullable<InfrastructureService['desiredStatus']>;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'set-project-name';
       name: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'rename-network';
       from?: string;
       to: string;
       reason: string;
-    }
+    } & RelevantPatchFields
   | {
       op: 'set-networks';
       networks: string[];
       reason: string;
-    };
+    } & RelevantPatchFields;
 
 export interface SpecPatchPlan {
   patches: SpecPatch[];
@@ -720,6 +740,17 @@ export interface SpecPatchPlan {
   ambiguities: string[];
   requiresUserInput: boolean;
   confidence: number;
+}
+
+export type VerifierRemediationPatch = SpecPatch & {
+  resolvesIssueCodes: VerificationFinding['code'][];
+  affectedServiceNames: string[];
+  resolutionReason: string;
+};
+
+export interface VerifierRemediationPatchPlan extends Omit<SpecPatchPlan, 'patches'> {
+  issueAnalysis: IssueAnalysis[];
+  patches: VerifierRemediationPatch[];
 }
 
 export interface ResolvedSpecPatchResult {
