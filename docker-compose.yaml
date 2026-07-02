@@ -10,7 +10,7 @@ services:
     depends_on:
       - api
     networks:
-      - app-network
+      - test2-app-network
   api:
     image: node:20-alpine
     restart: unless-stopped
@@ -18,14 +18,14 @@ services:
       replicas: 2
     environment: {}
     depends_on:
-      - postgres-1
+      - postgres
     command:
       - tail
       - -f
       - /dev/null
     networks:
-      - app-network
-  postgres-1:
+      - test2-app-network
+  postgres:
     image: postgres:16
     restart: unless-stopped
     deploy:
@@ -33,9 +33,9 @@ services:
     environment:
       POSTGRES_DB: app
       POSTGRES_USER: abcabcabc
-      POSTGRES_PASSWORD: pw-bf687965917e65b38f8817df
+      POSTGRES_PASSWORD: pw-9c9cf28dbf573fc975cb9e21
     volumes:
-      - postgres-data-1:/var/lib/postgresql/data
+      - test2-postgres-data:/var/lib/postgresql/data
     healthcheck:
       test:
         - CMD-SHELL
@@ -45,8 +45,8 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - app-network
+      - test2-app-network
 networks:
-  app-network: {}
+  test2-app-network: {}
 volumes:
-  postgres-data-1: {}
+  test2-postgres-data: {}

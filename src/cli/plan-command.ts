@@ -1,24 +1,31 @@
 import type { Command } from 'commander';
 import chalk from 'chalk';
-import type { InfrastructureSpec } from '../domain/types.js';
+import type { AgentRunResult, InfrastructureSpec } from '../domain/types.js';
 import { ReActAgent } from '../agent/react-agent.js';
 import {
   ClosedLoopGuard,
   loadClosedLoopGuardConfig,
 } from '../agent/closed-loop-guard.js';
-import { cliInputSchema } from '../domain/schemas.js';
+import {
+  cliInputSchema,
+  validateInfrastructureSpec,
+  validateValidatedQuery,
+} from '../domain/schemas.js';
 import {
   ExecutionEngine,
-  type ApplyPreparationResult,
+  type DeployPreparationResult,
 } from '../execution/execution-engine.js';
 
 import { runClosedLoopDeploy } from './deploy-loop.js';
 import { createProvider } from '../llm/provider.js';
 import {
   getStateDatabasePath,
+  loadProjectState,
+  projectExists,
   saveVerifiedRuntimeSnapshot,
 } from '../state/sqlite-state-store.js';
 import { StaticGateway } from '../static-gateway/static-gateway.js';
+import { normalizeProjectName } from '../domain/project-identity.js';
 import {
   createDockerMcpGatewayFromEnv,
   createProgressPrinter,
@@ -41,7 +48,7 @@ export function registerPlanCommand(program: Command): void {
   program
     .command('plan')
     .description(
-      'Analyze a natural-language infrastructure request and produce a plan',
+      'Plan, approve, and deploy natural-language infrastructure to Docker',
     )
     .argument(
       '<prompt>',
@@ -53,18 +60,22 @@ export function registerPlanCommand(program: Command): void {
       true,
     )
     .option(
-      '--apply',
-      'Run Phase 8 preflight, request approval, then write docker-compose.yaml without Docker deployment',
-      false,
-    )
-    .option(
       '--save-state',
       'Persist the desired state snapshot without deploying Docker',
       false,
     )
     .option(
       '--deploy',
-      'After approval, deploy to Docker via MCP (requires --apply)',
+      'After approval, write compose artifact and deploy to Docker via MCP',
+      false,
+    )
+    .option(
+      '--prjName <name>',
+      'Unique projectName for create/adjust routing',
+    )
+    .option(
+      '--adjust',
+      'Adjust an existing project plan instead of creating a new one',
       false,
     )
     .option(
@@ -74,23 +85,45 @@ export function registerPlanCommand(program: Command): void {
     )
     .action(async (prompt, options) => {
       const reportProgress = createProgressPrinter();
-      const applyRequested = Boolean(options.apply);
       const saveStateRequested = Boolean(options.saveState);
       const deployRequested = Boolean(options.deploy);
-      if (deployRequested && !applyRequested) {
-        console.error(chalk.red('CLI failed.'));
-        console.error('--deploy requires --apply so the plan is approved before Docker deployment.');
-        process.exitCode = 1;
-        return;
-      }
       const input = cliInputSchema.parse({
         prompt,
         dryRun:
-          applyRequested || saveStateRequested
+          deployRequested || saveStateRequested
             ? false
             : (options.dryRun ?? true),
         provider: options.provider,
       });
+      const adjustRequested = Boolean(options.adjust);
+      const requestedProjectName = options.prjName ? normalizeProjectName(String(options.prjName)) : null;
+      if (!requestedProjectName) {
+        console.error(chalk.red('CLI failed.'));
+        console.error('plan requires --prjName so projectName stays unique and routable across create/adjust flows.');
+        process.exitCode = 1;
+        return;
+      }
+      if (adjustRequested && !requestedProjectName) {
+        console.error(chalk.red('CLI failed.'));
+        console.error('--adjust requires --prjName so the CLI can load the correct saved infrastructure context.');
+        process.exitCode = 1;
+        return;
+      }
+      if (requestedProjectName) {
+        const exists = await projectExists(requestedProjectName);
+        if (adjustRequested && !exists) {
+          console.error(chalk.red('CLI failed.'));
+          console.error(`Project "${requestedProjectName}" does not exist. Create a new project by removing --adjust.`);
+          process.exitCode = 1;
+          return;
+        }
+        if (!adjustRequested && exists) {
+          console.error(chalk.red('CLI failed.'));
+          console.error(`Project "${requestedProjectName}" already exists. Use --adjust to update it, or choose another --prjName.`);
+          process.exitCode = 1;
+          return;
+        }
+      }
 
       reportProgress({
         phase: 'cli',
@@ -152,7 +185,104 @@ export function registerPlanCommand(program: Command): void {
       const engine = new ExecutionEngine({
         dockerPullRetry: loadDockerPullRetryPolicyFromEnv(),
       });
-      let result = await agent.run(gatewayResult.validatedQuery);
+      let result: AgentRunResult;
+      if (adjustRequested && requestedProjectName) {
+        const projectState = await loadProjectState(requestedProjectName);
+        const currentSnapshot = projectState?.current ?? null;
+        if (!currentSnapshot) {
+          console.error(chalk.red('CLI failed.'));
+          console.error(`Project "${requestedProjectName}" does not have a Current Verified Snapshot. Deploy/sync project before using --adjust.`);
+          process.exitCode = 1;
+          return;
+        }
+        if (currentSnapshot.desired.projectName !== requestedProjectName) {
+          console.error(chalk.red('CLI failed.'));
+          console.error(
+            `Loaded snapshot projectName "${currentSnapshot.desired.projectName}" does not match requested --prjName "${requestedProjectName}".`,
+          );
+          process.exitCode = 1;
+          return;
+        }
+        const mcpClient = createDockerMcpGatewayFromEnv();
+        try {
+          await mcpClient.initialize();
+          const { drift } = await engine.detectRuntimeDrift(currentSnapshot, mcpClient);
+          if (drift.status !== 'none') {
+            console.error(chalk.red('CLI failed.'));
+            console.error(`Project "${requestedProjectName}" has drift: ${drift.summary}`);
+            console.error('Please sync or repair before using --adjust.');
+            process.exitCode = 1;
+            return;
+          }
+        } finally {
+          await mcpClient.shutdown();
+        }
+        const currentComposeYaml = currentSnapshot.composeArtifact.previewContent;
+        const adjustFeedback = [
+          'User adjustment request:',
+          input.prompt,
+          '',
+          'Original request context:',
+          currentSnapshot.request.raw,
+          '',
+          'Current desired InfrastructureSpec JSON context:',
+          JSON.stringify(currentSnapshot.desired, null, 2),
+          '',
+          'Current rendered docker-compose.yaml context:',
+          currentComposeYaml,
+        ].join('\n');
+        const revisionResult = await agent.reviseFromFeedback({
+          desiredSpec: currentSnapshot.desired,
+          revisionObservation: {
+            verificationReport: null,
+            userFeedback: { message: adjustFeedback, submittedAt: new Date().toISOString() },
+            driftSummary: null,
+          },
+          stateSnapshot: projectState,
+          attemptIndex: 0,
+        });
+        const revisedSpec = validateInfrastructureSpec({
+          ...revisionResult.revisedSpec,
+          projectName: requestedProjectName,
+        });
+        result = {
+          status: 'planned',
+          request: {
+            raw: input.prompt,
+            normalizedPrompt: input.prompt,
+            intent: 'update',
+          },
+          plan: {
+            summary: revisionResult.revisionSummary,
+            spec: revisedSpec,
+            assumptions: revisionResult.assumptions,
+            steps: [
+              { id: 'generate-compose', description: 'Regenerate compose from adjusted desired-state spec.', action: 'generate-compose' },
+              { id: 'write-state', description: 'Persist adjusted desired-state snapshot.', action: 'write-state', dependsOn: ['generate-compose'] },
+              { id: 'deploy-compose', description: 'Deploy adjusted runtime after approval.', action: 'deploy-compose', dependsOn: ['write-state'] },
+              { id: 'inspect-drift', description: 'Inspect runtime after adjustment.', action: 'inspect-drift', dependsOn: ['deploy-compose'] },
+            ],
+          },
+          observations: [
+            { source: 'observe:state', message: `Loaded current verified snapshot for project "${requestedProjectName}".` },
+            { source: 'observe:user_feedback', message: adjustFeedback },
+            { source: 'observe:planner_revision', message: revisionResult.revisionSummary },
+          ],
+          trace: [],
+        };
+      } else {
+        const validatedQuery = requestedProjectName
+          ? validateValidatedQuery({
+              ...gatewayResult.validatedQuery,
+              draft: {
+                ...gatewayResult.validatedQuery.draft,
+                projectName: requestedProjectName,
+              },
+            })
+          : gatewayResult.validatedQuery;
+        result = await agent.run(validatedQuery);
+        result = enforcePlannedProjectName(result, requestedProjectName);
+      }
 
       while (result.status === 'clarification') {
         console.log(chalk.yellow('Clarification required by ReAct Agent.'));
@@ -219,7 +349,7 @@ export function registerPlanCommand(program: Command): void {
           );
           printObservations(resumedResult.observations);
           printTrace(resumedResult.trace);
-          result = resumedResult;
+          result = enforcePlannedProjectName(resumedResult, requestedProjectName);
         } else {
           return;
         }
@@ -243,21 +373,21 @@ export function registerPlanCommand(program: Command): void {
 
       reportProgress({
         phase: 'execution',
-        message: applyRequested
-          ? 'acting... render dry-run output and run Phase 8 preflight.'
+        message: deployRequested
+          ? 'acting... render dry-run output and run deploy preflight.'
           : input.dryRun
             ? 'acting... render dry-run output and compose preview.'
             : 'acting... persist pending preview memory without Docker deployment.',
       });
-      const execution = applyRequested
-        ? await engine.prepareApply(result)
+      const execution = deployRequested
+        ? await engine.prepareDeploy(result)
         : input.dryRun
           ? await engine.dryRun(result)
           : await engine.savePendingPreview(result);
       reportProgress({
         phase: 'execution',
-        message: applyRequested
-          ? 'observe... Phase 8 preflight prepared; no Docker deployment executed.'
+        message: deployRequested
+          ? 'observe... deploy preflight prepared; no Docker deployment executed.'
           : input.dryRun
             ? 'observe... dry-run completed without state mutation.'
             : 'observe... pending preview saved; no Docker deployment executed.',
@@ -285,7 +415,7 @@ export function registerPlanCommand(program: Command): void {
       }
       console.log();
 
-      if (input.dryRun || applyRequested) {
+      if (input.dryRun || deployRequested) {
         printDetailedDryRunPreview(
           execution.dryRunPreview,
           execution.secretResolution,
@@ -294,7 +424,7 @@ export function registerPlanCommand(program: Command): void {
 
       console.log(
         chalk.cyan(
-          applyRequested
+          deployRequested
             ? 'docker-compose.yaml preview:'
             : 'Generated docker-compose.yaml:',
         ),
@@ -310,7 +440,7 @@ export function registerPlanCommand(program: Command): void {
       ) {
         console.log(
           chalk.gray(
-            '💡 Auto-generated passwords are saved to: state/generated-secrets.env (after --apply).',
+            '💡 Auto-generated passwords are saved to: state/generated-secrets.env (after deploy).',
           ),
         );
         console.log(
@@ -321,15 +451,15 @@ export function registerPlanCommand(program: Command): void {
         console.log();
       }
 
-      if (applyRequested) {
+      if (deployRequested) {
         let currentResult = result;
-        let applyPreparation = execution as ApplyPreparationResult;
-        printPreflightReport(applyPreparation.preflight);
+        let deployPreparation = execution as DeployPreparationResult;
+        printPreflightReport(deployPreparation.preflight);
 
-        if (!applyPreparation.approvalRequest) {
+        if (!deployPreparation.approvalRequest) {
           console.log(
             chalk.red(
-              'Phase 8 apply stopped. Preflight failed; docker-compose.yaml was not written.',
+              'deploy stopped. Preflight failed; docker-compose.yaml was not written.',
             ),
           );
           process.exitCode = 1;
@@ -337,7 +467,7 @@ export function registerPlanCommand(program: Command): void {
         }
 
         let { approval, decision: previewDecision } = await requestCliApproval(
-          applyPreparation.approvalRequest,
+          deployPreparation.approvalRequest,
         );
 
         while (previewDecision.choice === 'other') {
@@ -416,30 +546,30 @@ export function registerPlanCommand(program: Command): void {
               },
             ],
           };
-          applyPreparation = await engine.prepareApply(currentResult);
-          printPreflightReport(applyPreparation.preflight);
-          if (!applyPreparation.approvalRequest) {
+          deployPreparation = await engine.prepareDeploy(currentResult);
+          printPreflightReport(deployPreparation.preflight);
+          if (!deployPreparation.approvalRequest) {
             console.log(
               chalk.red(
-                'Phase 8 apply stopped after feedback revision. Preflight failed; docker-compose.yaml was not written.',
+                'deploy stopped after feedback revision. Preflight failed; docker-compose.yaml was not written.',
               ),
             );
             process.exitCode = 1;
             return;
           }
           console.log(chalk.cyan('Revised docker-compose.yaml preview:'));
-          console.log(applyPreparation.composeYaml);
+          console.log(deployPreparation.composeYaml);
           ({ approval, decision: previewDecision } = await requestCliApproval(
-            applyPreparation.approvalRequest,
+            deployPreparation.approvalRequest,
           ));
         }
 
-        const applyResult = await engine.completeApply(
-          applyPreparation,
+        const deployResult = await engine.completeDeploy(
+          deployPreparation,
           approval,
         );
 
-        if (!applyResult.approvedAction) {
+        if (!deployResult.approvedAction) {
           console.log(
             chalk.yellow(
               'Approval rejected. docker-compose.yaml was not written.',
@@ -456,15 +586,15 @@ export function registerPlanCommand(program: Command): void {
         }
 
         console.log(chalk.green('ApprovedAction created.'));
-        console.log(`- id: ${applyResult.approvedAction.id}`);
-        console.log(`- compose artifact: ${applyResult.composeArtifactPath}`);
+        console.log(`- id: ${deployResult.approvedAction.id}`);
+        console.log(`- compose artifact: ${deployResult.composeArtifactPath}`);
         console.log(
-          `- compose hash: ${applyResult.approvedAction.composeArtifact.previewSha256}`,
+          `- compose hash: ${deployResult.approvedAction.composeArtifact.previewSha256}`,
         );
-        if (applyResult.generatedSecretsPath) {
+        if (deployResult.generatedSecretsPath) {
           console.log(
             chalk.gray(
-              `- generated secrets: ${applyResult.generatedSecretsPath}`,
+              `- generated secrets: ${deployResult.generatedSecretsPath}`,
             ),
           );
           console.log(
@@ -474,7 +604,7 @@ export function registerPlanCommand(program: Command): void {
           );
         }
 
-        if (deployRequested) {
+        {
           console.log(chalk.cyan('Deploying to Docker via MCP...'));
           const mcpClient = createDockerMcpGatewayFromEnv();
           const closedLoopGuard = new ClosedLoopGuard(
@@ -500,7 +630,7 @@ export function registerPlanCommand(program: Command): void {
               engine,
               mcpClient,
               closedLoopGuard,
-              approvedAction: applyResult.approvedAction,
+              approvedAction: deployResult.approvedAction,
               plan: currentResult.plan,
               requestRuntimeApproval,
               requestRevisionClarification,
@@ -528,6 +658,36 @@ export function registerPlanCommand(program: Command): void {
                   `Closed-loop deploy ended with status: ${deployLoopResult.status}`,
                 ),
               );
+              const lastRevision = deployLoopResult.revisionHistory.at(-1);
+              if (lastRevision) {
+                console.log(chalk.red('Failure details:'));
+                if (deployLoopResult.failureReason) {
+                  console.log(`- stop reason: ${deployLoopResult.failureReason}`);
+                }
+                console.log(`- revision decision: ${lastRevision.revisionDecision}`);
+                console.log(`- revision summary: ${lastRevision.revisionSummary}`);
+                if (lastRevision.findings.length > 0) {
+                  console.log('- verifier findings:');
+                  lastRevision.findings.forEach((finding) => {
+                    const resourceLabel = finding.resourceName ? ` (${finding.resourceKind}:${finding.resourceName})` : ` (${finding.resourceKind})`;
+                    const expectedActual = finding.expected || finding.actual
+                      ? ` expected=${finding.expected ?? 'n/a'} actual=${finding.actual ?? 'n/a'}`
+                      : '';
+                    const evidence = finding.evidence[0] ? ` evidence=${finding.evidence[0]}` : '';
+                    console.log(`  - ${finding.code}${resourceLabel}${expectedActual}${evidence}`);
+                    if (finding.suggestedAction?.summary) {
+                      console.log(`    suggested fix: ${finding.suggestedAction.summary}`);
+                    }
+                  });
+                }
+                if (lastRevision.userFeedback?.message) {
+                  console.log(`- last user feedback: ${lastRevision.userFeedback.message}`);
+                }
+              } else {
+                console.log(chalk.red('Failure details:'));
+                console.log('- no revision history recorded before stop');
+                console.log('- suggested fix: rerun with clearer target/service feedback, then approve revision');
+              }
               process.exitCode = 1;
             }
           } catch (error) {
@@ -537,21 +697,12 @@ export function registerPlanCommand(program: Command): void {
           } finally {
             await mcpClient.shutdown();
           }
-        } else {
-          console.log('- Docker called: false');
-          console.log('- MCP called: false');
         }
+
         console.log();
         console.log(chalk.cyan('State database:'));
         console.log(getStateDatabasePath());
         console.log();
-        if (!deployRequested) {
-          console.log(
-            chalk.green(
-              'Phase 8 apply completed: compose artifact written, no Docker deployment executed.',
-            ),
-          );
-        }
         return;
       }
 
@@ -602,4 +753,31 @@ function formatServiceSummary(spec: InfrastructureSpec): string {
 function formatList(values: string[]): string {
   return values.length > 0 ? values.join(', ') : 'none';
 }
+
+function enforcePlannedProjectName(
+  result: AgentRunResult,
+  projectName: string,
+): AgentRunResult {
+  if (result.status !== 'planned') return result;
+  if (result.plan.spec.projectName === projectName) return result;
+
+  return {
+    ...result,
+    plan: {
+      ...result.plan,
+      spec: validateInfrastructureSpec({ ...result.plan.spec, projectName }),
+    },
+  };
+}
+
+
+
+
+
+
+
+
+
+
+
 

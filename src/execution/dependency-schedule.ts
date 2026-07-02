@@ -231,7 +231,7 @@ export function evaluateDryRunPolicy(
         findings.push({
           severity: 'info',
           code: 'auto-generated-secret',
-          message: `Service "${service.name}" has no env value for ${key}; the system generated a password automatically. See state/generated-secrets.env after apply.`,
+          message: `Service "${service.name}" has no env value for ${key}; the system generated a password automatically. See state/generated-secrets.env after deploy.`,
           resourceName: service.name,
           resourceType: 'service',
         });
@@ -240,7 +240,7 @@ export function evaluateDryRunPolicy(
           findings.push({
             severity: 'warning',
             code: 'weak-env-secret',
-            message: `Service "${service.name}" uses weak or guessable env secret ${resolvedSecret.envVarName} for ${key}; change the env value before apply.`,
+            message: `Service "${service.name}" uses weak or guessable env secret ${resolvedSecret.envVarName} for ${key}; change the env value before deploy.`,
             resourceName: service.name,
             resourceType: 'service',
           });
@@ -257,7 +257,7 @@ export function evaluateDryRunPolicy(
         findings.push({
           severity: 'info',
           code: 'auto-generated-secret',
-          message: `Service "${service.name}" has no env value for ${key}; the system generated a password automatically. See state/generated-secrets.env after apply.`,
+          message: `Service "${service.name}" has no env value for ${key}; the system generated a password automatically. See state/generated-secrets.env after deploy.`,
           resourceName: service.name,
           resourceType: 'service',
         });
@@ -265,7 +265,7 @@ export function evaluateDryRunPolicy(
         findings.push({
           severity: 'warning',
           code: 'weak-hardcoded-secret',
-          message: `Service "${service.name}" uses a weak hardcoded value for ${key}; replace it before real apply.`,
+          message: `Service "${service.name}" uses a weak hardcoded value for ${key}; replace it before real deploy.`,
           resourceName: service.name,
           resourceType: 'service',
         });

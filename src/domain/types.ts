@@ -39,6 +39,7 @@ export interface DraftQuery {
   raw: string;
   normalizedPrompt: string;
   intent: InfrastructureIntent;
+  projectName?: string | null;
   services: DraftServiceQuery[];
   destructive: boolean;
   missingInformation: string[];
@@ -963,6 +964,7 @@ export interface StateOperationRecord {
     | 'verified-runtime-saved'
     | 'repair-rejected'
     | 'drift-observed'
+    | 'destroy-executed'
     | 'destroy-all-executed';
   projectName: string;
   request: RequestMetadata | null;

@@ -17,6 +17,7 @@ import { validateFeedbackIntent, validateInfrastructureSpec, validateSpecPatchPl
 import { feedbackIntentJsonSchema, specPatchPlanJsonSchema } from '../domain/structured-output-schemas.js';
 import { expandStatefulDatabaseReplicas, isStatefulDatabaseService } from '../domain/stateful-database-volumes.js';
 import { parseJsonResponse } from '../llm/json-response.js';
+import { namespaceInfrastructureSpec } from '../domain/project-identity.js';
 import type { PlannerAgent } from './agent-interfaces.js';
 import { applySpecPatchPlan, resolveServiceSelector } from './spec-patch-applier.js';
 
@@ -49,7 +50,7 @@ export class StandardPlannerAgent implements PlannerAgent {
         return service;
       });
 
-    // Apply default dependsOn inference
+    // Use default dependsOn inference
     const inferred = applyDependencyInference(services);
 
     const spec: InfrastructureSpec = {
@@ -195,7 +196,7 @@ export class StandardPlannerAgent implements PlannerAgent {
       );
     }
 
-    const validatedSpec = validateInfrastructureSpec(revisedSpec);
+    const validatedSpec = validateInfrastructureSpec(namespaceInfrastructureSpec(revisedSpec));
 
     const result: PlannerRevisionResult = {
       revisedSpec: validatedSpec,
@@ -275,7 +276,7 @@ export class StandardPlannerAgent implements PlannerAgent {
           'Use verifierObservation, userFeedback, and runtimeRefs as observations about the same desired spec; do not ignore verifier evidence when user feedback is present.',
           'Treat userFeedback from an "other" answer as a fresh natural-language instruction, but still ground target selection in logicalServiceCatalog, physicalServiceCatalog, and verifierObservation.',
           'Choose targets by comparing the user request with each service name, role, image family, exposed ports, dependencies, dependents, and current replicas.',
-          'If prior clarification feedback contains targetService:<name>, apply the requested change to that exact existing service name.',
+          'If prior clarification feedback contains targetService:<name>, use the requested change to that exact existing service name.',
           'Understand natural language flexibly: map names, roles, image families, counts, and port intent into the closest valid SpecPatch.',
           'Normalize free-form user feedback into schema-valid patches: ports, replicas, images, env vars, volumes, dependencies, service names, service status, project name, networks, add/remove services.',
           'Use targetKind="service" for ordinary single services and targetKind="replica-group" only for logical stateful replica groups.',
@@ -2026,7 +2027,7 @@ function buildRevisionClarifications(
     reason: finding.suggestedAction?.summary ?? 'Planner needs human guidance before making a risky change.',
     affectedServices: finding.resourceKind === 'service' && finding.resourceName ? [finding.resourceName] : [],
     choices: finding.suggestedAction?.choices ?? [
-      { id: '1', label: 'Auto safe fix', description: 'Let the planner apply only low-risk spec changes.', value: 'auto-safe-fix' },
+      { id: '1', label: 'Auto safe fix', description: 'Let the planner use only low-risk spec changes.', value: 'auto-safe-fix' },
       { id: '2', label: 'Keep current', description: 'Do not change this part of the spec automatically.', value: 'keep-current' },
     ],
     allowOther: true,
@@ -2046,7 +2047,7 @@ function buildPatchClarifications(
       reason: result.blockedReason ?? 'Patch requires user input.',
       affectedServices: result.matchedServiceNames,
       choices: [
-        { id: '1', label: 'Allow patch', description: 'Apply this structured revision patch after explicit confirmation.', value: `allow:${result.patch.op}` },
+        { id: '1', label: 'Allow patch', description: 'Use this structured revision patch after explicit confirmation.', value: `allow:${result.patch.op}` },
         { id: '2', label: 'Keep current', description: 'Skip this patch and keep the current desired spec unchanged.', value: `skip:${result.patch.op}` },
       ],
       allowOther: true,
@@ -2069,7 +2070,7 @@ function buildPatchPlanAmbiguityClarifications(
     choices: spec.services.slice(0, 3).map((service, index) => ({
       id: String(index + 1),
       label: service.name,
-      description: `Apply the requested change to ${service.kind} service ${service.name} (${service.image}).`,
+      description: `Use the requested change to ${service.kind} service ${service.name} (${service.image}).`,
       value: `targetService:${service.name}`,
     })),
     allowOther: true,
@@ -2154,4 +2155,5 @@ function buildRevisionSummary(
   }
   return parts.join(' ');
 }
+
 

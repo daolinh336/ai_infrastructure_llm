@@ -378,7 +378,7 @@ export async function requestRevisionClarification(
   const contexts = revisionResult.clarificationContext ?? [];
   if (contexts.length === 0) return null;
 
-  console.log(chalk.yellow('Planner needs user input before cleanup/redeploy.'));
+  console.log(chalk.yellow('Deploy revision needs your confirmation before cleanup/redeploy.'));
   for (const context of contexts) {
     console.log(chalk.yellow(`- ${context.message}`));
     console.log(chalk.gray(`  reason: ${context.reason}`));
@@ -394,15 +394,25 @@ export async function requestRevisionClarification(
   try {
     const answer = (
       await readline.question(
-        chalk.yellow('Choose option number, [o]ther feedback, or press Enter to keep auto-safe revision: '),
+        chalk.yellow('Use suggested fix? [y]es / [n]o (cancel + cleanup) / [o]ther (provide planner feedback) '),
       )
     ).trim();
 
-    if (answer.length === 0) {
+    if (answer.length === 0 || answer.toLowerCase() === 'n' || answer.toLowerCase() === 'no') {
       return null;
     }
 
     const firstContext = contexts[0]!;
+    if (answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes') {
+      const allowChoice = firstContext.choices.find((choice) => /^allow:/i.test(choice.value)) ?? firstContext.choices[0];
+      if (allowChoice) {
+        return {
+          message: `User selected ${allowChoice.label}: ${allowChoice.value}`,
+          submittedAt: new Date().toISOString(),
+        };
+      }
+    }
+
     const selectedIndex = Number(answer) - 1;
     const selectedChoice = Number.isInteger(selectedIndex) ? firstContext.choices[selectedIndex] : undefined;
     if (selectedChoice) {
@@ -738,6 +748,7 @@ function conflictIssueToFinding(issue: string): VerificationFinding {
 
 export function collectDestroyAllTargets(
   state: InfrastructureStateSnapshot | null,
+  projectStates: InfrastructureStateSnapshot[],
   actual: RuntimeActualState,
   removeVolumes: boolean,
 ): {
@@ -745,7 +756,7 @@ export function collectDestroyAllTargets(
   containers: string[];
   networks: string[];
   volumes: string[];
-} {
+  } {
   const projects = new Set<string>();
   const containers = new Set<string>();
   const networks = new Set<string>();
@@ -794,6 +805,12 @@ export function collectDestroyAllTargets(
   addSnapshotTargets(state?.current ?? null);
   if (state?.pendingPreview?.desired) {
     projects.add(state.pendingPreview.desired.projectName);
+  }
+  for (const projectState of projectStates) {
+    addSnapshotTargets(projectState.current ?? null);
+    if (projectState.pendingPreview?.desired) {
+      projects.add(projectState.pendingPreview.desired.projectName);
+    }
   }
 
   for (const project of projects) {

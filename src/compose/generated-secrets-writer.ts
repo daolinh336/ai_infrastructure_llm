@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { ServiceSecretResolution } from './secret-resolver.js';
 
 /**
- * Writes `state/generated-secrets.env` after `--apply`.
+ * Writes `state/generated-secrets.env` after deploy.
  *
  * ONLY auto-generated secrets are recorded here — never passwords the user
  * supplied via `.env`. The file is a read-only reference so the user can look up

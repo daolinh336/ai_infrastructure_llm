@@ -9,7 +9,7 @@ The codebase is the source of truth for current behavior. Documentation in this 
 Key implementation entry points:
 
 - `src/cli/main.ts`: CLI commands for doctor, observe, status, destroy, destroy-all, and repair.
-- `src/cli/plan-command.ts`: natural-language plan, dry-run, apply, save-state, and deploy flow.
+- `src/cli/plan-command.ts`: natural-language deploy, dry-run, save-state, and runtime deploy flow.
 - `src/static-gateway/static-gateway.ts`: pre-ReAct validation and structured query gate.
 - `src/agent/`: ReAct orchestration, planner/verifier agents, internal tools, loop guards, and feedback revision helpers.
 - `src/domain/`: Zod schemas and domain types for specs, plans, state, approvals, runtime observations, drift, repair, and verification.
@@ -25,7 +25,7 @@ Key implementation entry points:
 The CLI keeps the planning model, runtime execution, and saved state separate:
 
 - `InfrastructureSpec` is the canonical desired-state model.
-- `ExecutionPlan` explains the intended validate, preview, approve, apply, observe, and verify procedure.
+- `ExecutionPlan` explains the intended validate, preview, approve, deploy, observe, and verify procedure.
 - Docker Compose YAML is a generated artifact for preview and execution support, not the canonical model.
 - SQLite stores validated JSON payloads for pending previews, approved actions, verified desired/actual runtime snapshots, drift reports, repair reports, and history.
 - Docker runtime mutations go through `DockerMcpGateway`, route metadata, policy checks, and an approval-controlled mutation gate.
@@ -34,10 +34,10 @@ The CLI keeps the planning model, runtime execution, and saved state separate:
 ## Implemented CLI commands
 
 ```bash
-npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres"
-npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres" --save-state
-npm run dev -- plan "Create nginx on port 8080" --apply
-npm run dev -- plan "Create nginx on port 8080" --apply --deploy
+npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres" --prjName web-stack
+npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres" --prjName web-stack --save-state
+npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --dry-run
+npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --deploy
 npm run dev -- doctor --docker
 npm run dev -- observe
 npm run dev -- status
@@ -52,10 +52,9 @@ npm run dev -- destroy-all --remove-volumes
 
 Command behavior:
 
-- `plan` validates a natural-language request, runs the Static Gateway, runs the ReAct agent, renders a detailed dry-run preview, and prints trace/observations.
+- `plan --dry-run` validates a natural-language request, runs the Static Gateway, runs the ReAct agent, renders a detailed dry-run preview, and prints trace/observations without writing state or mutating Docker.
 - `plan --save-state` stores a pending preview in SQLite without Docker mutation.
-- `plan --apply` runs preflight, asks for approval, writes `docker-compose.yaml`, writes generated secrets when needed, and saves an approved action.
-- `plan --apply --deploy` deploys approved resources through Docker MCP, observes actual runtime state, verifies the result, and saves a verified runtime snapshot.
+- `plan --deploy` approves, writes the compose artifact, deploys through Docker MCP, observes runtime state, verifies the result, and saves a verified runtime snapshot.
 - `doctor --docker` performs read-only Docker setup checks.
 - `observe` lists current Docker containers, networks, volumes, and images through MCP.
 - `status` reads SQLite state and prints pending/current saved infrastructure status.
@@ -71,7 +70,7 @@ Runtime safety is enforced in code, not by documentation convention:
 - Static validation rejects empty, out-of-scope, unsafe, or malformed requests before ReAct planning starts.
 - Domain objects are validated with Zod before they become specs, plans, approvals, state records, or runtime reports.
 - Dry-run is the default path and does not write final artifacts or mutate Docker.
-- `--deploy` requires `--apply`, so Docker mutation only happens after the plan is approved.
+- `plan --deploy` performs Docker mutation only after preflight and explicit approval.
 - `DockerMcpGateway` blocks mutate/destructive routes unless its mutation gate is explicitly enabled in the execution path.
 - MCP routes are declared in `src/execution/mcp-routing-table.ts` with read/mutate/destructive metadata.
 - Runtime operations use dependency-aware ordering and cleanup logic for failed deploy attempts.

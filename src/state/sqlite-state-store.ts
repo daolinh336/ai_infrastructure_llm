@@ -136,6 +136,133 @@ export async function loadState(
   }
 }
 
+export async function loadProjectState(
+  projectName: string,
+  options: StateStoreOptions = {},
+): Promise<InfrastructureStateSnapshot | null> {
+  const databasePath = getStateDatabasePath(options);
+
+  if (databasePath !== ':memory:' && !existsSync(databasePath)) {
+    return null;
+  }
+
+  const database = openDatabase(databasePath);
+  try {
+    ensureSchema(database);
+    const row = database
+      .prepare([
+        'SELECT schema_version, current_json, pending_preview_json',
+        'FROM project_state_snapshots',
+        'WHERE project_name = ?',
+      ].join(' '))
+      .get(projectName) as StateSnapshotRow | undefined;
+
+    const historyRows = database
+      .prepare([
+        'SELECT id, type, project_name, request_json, summary, created_at, payload_json',
+        'FROM state_operations',
+        'WHERE project_name = ?',
+        'ORDER BY rowid ASC',
+      ].join(' '))
+      .all(projectName) as StateOperationRow[];
+
+    if (!row) {
+      const singleton = database
+        .prepare(
+          [
+            'SELECT schema_version, current_json, pending_preview_json',
+            'FROM state_snapshots',
+            'WHERE id = ?',
+          ].join(' '),
+        )
+        .get(SINGLETON_STATE_ID) as StateSnapshotRow | undefined;
+
+      if (!singleton) {
+        return null;
+      }
+
+      const current = parseJsonField<VerifiedRuntimeSnapshot | null>(singleton.current_json, 'current_json');
+      const pendingPreview = parseJsonField<PendingPreviewState | null>(singleton.pending_preview_json, 'pending_preview_json');
+      const matchesCurrent = current?.desired.projectName === projectName;
+      const matchesPendingPreview = pendingPreview?.desired.projectName === projectName;
+
+      if (!matchesCurrent && !matchesPendingPreview) {
+        return null;
+      }
+
+      return validateInfrastructureStateSnapshot({
+        schemaVersion: singleton.schema_version,
+        current: matchesCurrent ? current : null,
+        pendingPreview: matchesPendingPreview ? pendingPreview : null,
+        history: historyRows.map((historyRow) =>
+          parseJsonField<StateOperationRecord>(historyRow.payload_json, `history:${historyRow.id}`),
+        ),
+      });
+    }
+
+    return validateInfrastructureStateSnapshot({
+      schemaVersion: row.schema_version,
+      current: parseJsonField<VerifiedRuntimeSnapshot | null>(row.current_json, 'project_current_json'),
+      pendingPreview: parseJsonField<PendingPreviewState | null>(row.pending_preview_json, 'project_pending_preview_json'),
+      history: historyRows.map((historyRow) =>
+        parseJsonField<StateOperationRecord>(historyRow.payload_json, `history:${historyRow.id}`),
+      ),
+    });
+  } finally {
+    database.close();
+  }
+}
+
+export async function listProjectStates(
+  options: StateStoreOptions = {},
+): Promise<InfrastructureStateSnapshot[]> {
+  const databasePath = getStateDatabasePath(options);
+
+  if (databasePath !== ':memory:' && !existsSync(databasePath)) {
+    return [];
+  }
+
+  const database = openDatabase(databasePath);
+  try {
+    ensureSchema(database);
+    const rows = database
+      .prepare([
+        'SELECT project_name, schema_version, current_json, pending_preview_json',
+        'FROM project_state_snapshots',
+        'ORDER BY project_name ASC',
+      ].join(' '))
+      .all() as Array<StateSnapshotRow & { project_name: string }>;
+
+    return rows.map((row) => {
+      const historyRows = database
+        .prepare([
+          'SELECT id, type, project_name, request_json, summary, created_at, payload_json',
+          'FROM state_operations',
+          'WHERE project_name = ?',
+          'ORDER BY rowid ASC',
+        ].join(' '))
+        .all(row.project_name) as StateOperationRow[];
+
+      return validateInfrastructureStateSnapshot({
+        schemaVersion: row.schema_version,
+        current: parseJsonField<VerifiedRuntimeSnapshot | null>(row.current_json, 'project_current_json'),
+        pendingPreview: parseJsonField<PendingPreviewState | null>(row.pending_preview_json, 'project_pending_preview_json'),
+        history: historyRows.map((historyRow) =>
+          parseJsonField<StateOperationRecord>(historyRow.payload_json, `history:${historyRow.id}`),
+        ),
+      });
+    });
+  } finally {
+    database.close();
+  }
+}
+
+export async function projectExists(
+  projectName: string,
+  options: StateStoreOptions = {},
+): Promise<boolean> {
+  return (await loadProjectState(projectName, options)) !== null;
+}
 export async function saveState(
   stateSnapshot: InfrastructureStateSnapshot,
   options: StateStoreOptions = {},
@@ -147,6 +274,7 @@ export async function saveState(
     ensureSchema(database);
     const write = database.transaction(() => {
       upsertSnapshot(database, validStateSnapshot);
+      upsertProjectSnapshots(database, validStateSnapshot);
       replaceOperations(database, validStateSnapshot.history);
     });
 
@@ -396,6 +524,43 @@ export interface ClearManagedStateAfterDestroyAllInput {
   createdAt?: string;
 }
 
+export interface ClearManagedProjectStateInput {
+  projectName: string;
+  request: RequestMetadata | null;
+  summary: string;
+  createdAt?: string;
+}
+
+export async function clearManagedProjectState(
+  input: ClearManagedProjectStateInput,
+  options: StateStoreOptions = {},
+): Promise<InfrastructureStateSnapshot> {
+  const existingState = (await loadState(options)) ?? createEmptyStateSnapshot();
+  const createdAt = input.createdAt ?? new Date().toISOString();
+  const record = createStateOperationRecord({
+    type: 'destroy-executed',
+    projectName: input.projectName,
+    request: input.request,
+    summary: input.summary,
+    createdAt,
+  });
+  const nextState = validateInfrastructureStateSnapshot({
+    ...existingState,
+    current: existingState.current?.desired.projectName === input.projectName ? null : existingState.current,
+    pendingPreview: existingState.pendingPreview?.desired.projectName === input.projectName ? null : existingState.pendingPreview,
+    history: [...existingState.history, record],
+  });
+  await saveState(nextState, options);
+  const database = openDatabaseForWrite(options);
+  try {
+    ensureSchema(database);
+    deleteProjectSnapshot(database, input.projectName);
+  } finally {
+    database.close();
+  }
+  return nextState;
+}
+
 export async function clearManagedStateAfterDestroyAll(
   input: ClearManagedStateAfterDestroyAllInput,
   options: StateStoreOptions = {},
@@ -416,6 +581,13 @@ export async function clearManagedStateAfterDestroyAll(
     history: [...existingState.history, record],
   });
   await saveState(nextState, options);
+  const database = openDatabaseForWrite(options);
+  try {
+    ensureSchema(database);
+    deleteAllProjectSnapshots(database);
+  } finally {
+    database.close();
+  }
   return nextState;
 }
 
@@ -529,6 +701,14 @@ function ensureSchema(database: Database.Database): void {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS project_state_snapshots (
+      project_name TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL,
+      current_json TEXT,
+      pending_preview_json TEXT,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS state_operations (
       id TEXT PRIMARY KEY,
       type TEXT NOT NULL,
@@ -571,6 +751,61 @@ function upsertSnapshot(
       pendingPreviewJson: stringifyNullableJson(stateSnapshot.pendingPreview),
       updatedAt: new Date().toISOString(),
     });
+}
+
+function upsertProjectSnapshots(
+  database: Database.Database,
+  stateSnapshot: InfrastructureStateSnapshot,
+): void {
+  const projects = new Map<string, InfrastructureStateSnapshot>();
+  if (stateSnapshot.current) {
+    const projectName = stateSnapshot.current.desired.projectName;
+    projects.set(projectName, {
+      schemaVersion: stateSnapshot.schemaVersion,
+      current: stateSnapshot.current,
+      pendingPreview: null,
+      history: stateSnapshot.history.filter((entry) => entry.projectName === projectName),
+    });
+  }
+  if (stateSnapshot.pendingPreview) {
+    const projectName = stateSnapshot.pendingPreview.desired.projectName;
+    const existing = projects.get(projectName) ?? {
+      schemaVersion: stateSnapshot.schemaVersion,
+      current: null,
+      pendingPreview: null,
+      history: stateSnapshot.history.filter((entry) => entry.projectName === projectName),
+    };
+    projects.set(projectName, { ...existing, pendingPreview: stateSnapshot.pendingPreview });
+  }
+
+  const upsertProject = database.prepare([
+    'INSERT INTO project_state_snapshots',
+    '(project_name, schema_version, current_json, pending_preview_json, updated_at)',
+    'VALUES (@projectName, @schemaVersion, @currentJson, @pendingPreviewJson, @updatedAt)',
+    'ON CONFLICT(project_name) DO UPDATE SET',
+    'schema_version = excluded.schema_version,',
+    'current_json = excluded.current_json,',
+    'pending_preview_json = excluded.pending_preview_json,',
+    'updated_at = excluded.updated_at',
+  ].join(' '));
+
+  for (const [projectName, projectState] of projects) {
+    upsertProject.run({
+      projectName,
+      schemaVersion: projectState.schemaVersion,
+      currentJson: stringifyNullableJson(projectState.current),
+      pendingPreviewJson: stringifyNullableJson(projectState.pendingPreview),
+      updatedAt: new Date().toISOString(),
+    });
+  }
+}
+
+function deleteProjectSnapshot(database: Database.Database, projectName: string): void {
+  database.prepare('DELETE FROM project_state_snapshots WHERE project_name = ?').run(projectName);
+}
+
+function deleteAllProjectSnapshots(database: Database.Database): void {
+  database.prepare('DELETE FROM project_state_snapshots').run();
 }
 
 function replaceOperations(
@@ -677,3 +912,6 @@ function getErrorMessage(error: unknown): string {
 
   return String(error);
 }
+
+
+

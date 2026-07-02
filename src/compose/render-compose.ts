@@ -2,6 +2,7 @@ import type { InfrastructureSpec } from '../domain/types.js';
 import { validateInfrastructureSpec } from '../domain/schemas.js';
 import { getImageReferenceBase } from '../domain/supported-images.js';
 import { normalizeStatefulDatabaseReplicaVolumes } from '../domain/stateful-database-volumes.js';
+import { namespaceInfrastructureSpec } from '../domain/project-identity.js';
 import YAML from 'yaml';
 
 /**
@@ -67,7 +68,7 @@ const DATABASE_HEALTHCHECKS: Record<string, ComposeHealthcheck> = {
 };
 
 // App-runtime images that ship with no default CMD and would exit immediately.
-// A keepalive command lets the container stay up for the demo/runtime apply.
+// A keepalive command lets the container stay up for the demo/runtime deploy.
 const KEEPALIVE_COMMAND: Record<string, string[]> = {
   node: ['tail', '-f', '/dev/null'],
   python: ['tail', '-f', '/dev/null'],
@@ -91,7 +92,7 @@ function getAllowedHostPorts(service: { kind: string; name: string; image: strin
 
 export function renderCompose(spec: InfrastructureSpec): string {
   const validSpec = normalizeStatefulDatabaseReplicaVolumes(
-    validateInfrastructureSpec(spec),
+    namespaceInfrastructureSpec(validateInfrastructureSpec(spec)),
   );
   const compose = {
     services: Object.fromEntries(
@@ -124,3 +125,4 @@ export function renderCompose(spec: InfrastructureSpec): string {
 
   return YAML.stringify(compose, { aliasDuplicateObjects: false });
 }
+

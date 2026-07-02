@@ -32,7 +32,7 @@ export interface ApprovalGate {
   requestApproval(request: ApprovalRequest): Promise<ApprovalResult>;
 }
 
-export function classifyPhase8ApplyAction(): ActionClassification {
+export function classifyDeployApprovalAction(): ActionClassification {
   return validateActionClassification({
     capability: 'compose-artifact-write',
     risk: 'artifact-write',
@@ -51,7 +51,7 @@ export function classifyDockerDeployAction(): ActionClassification {
   return validateActionClassification({
     capability: 'compose-artifact-write',
     risk: 'runtime-create',
-    summary: 'Deploy the approved compose infrastructure to Docker via MCP; requires Phase 8 approval gate.',
+    summary: 'Deploy the approved compose infrastructure to Docker via MCP; requires deploy approval gate.',
     requiresApproval: true,
     mutatesRuntime: true,
     writesArtifact: false,

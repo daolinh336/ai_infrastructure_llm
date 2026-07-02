@@ -17,6 +17,7 @@ import { resolveSecrets, type SecretResolutionResult } from '../compose/secret-r
 import { repairExposedSecrets } from '../compose/secret-policy-repair.js';
 import { writeGeneratedSecretsFile } from '../compose/generated-secrets-writer.js';
 import { validateAgentRunResult } from '../domain/schemas.js';
+import { namespaceInfrastructureSpec } from '../domain/project-identity.js';
 import {
   getContainerVolumeMountsForReplica,
   normalizeStatefulDatabaseReplicaVolumes,
@@ -35,7 +36,7 @@ import {
 import {
   buildApprovalRequest,
   buildApprovedAction,
-  classifyPhase8ApplyAction,
+  classifyDeployApprovalAction,
   runPhase8Preflight,
   type ApprovalGate,
 } from './phase8-approval.js';
@@ -64,7 +65,7 @@ export interface ExecutionResult {
   secretResolution?: SecretResolutionResult;
 }
 
-export interface ApplyExecutionResult extends ExecutionResult {
+export interface DeployExecutionResult extends ExecutionResult {
   classification: ActionClassification;
   preflight: PreflightReport;
   approvalRequest: ApprovalRequest | null;
@@ -74,7 +75,7 @@ export interface ApplyExecutionResult extends ExecutionResult {
   generatedSecretsPath?: string | null;
 }
 
-export interface ApplyPreparationResult extends ExecutionResult {
+export interface DeployPreparationResult extends ExecutionResult {
   classification: ActionClassification;
   preflight: PreflightReport;
   approvalRequest: ApprovalRequest | null;
@@ -130,7 +131,7 @@ export class ExecutionEngine {
     const secretRepair = repairExposedSecrets(secretResolution.updatedSpec, secretResolution);
     const resolvedPlan = {
       ...validResult.plan,
-      spec: normalizeStatefulDatabaseReplicaVolumes(secretRepair.updatedSpec),
+      spec: namespaceInfrastructureSpec(normalizeStatefulDatabaseReplicaVolumes(secretRepair.updatedSpec)),
     };
 
     const composeYaml = renderCompose(resolvedPlan.spec);
@@ -168,11 +169,11 @@ export class ExecutionEngine {
     return executionResult;
   }
 
-  async apply(
+  async deploy(
     result: AgentRunResult,
     approvalGate: ApprovalGate,
-  ): Promise<ApplyExecutionResult> {
-    const preparation = await this.prepareApply(result);
+  ): Promise<DeployExecutionResult> {
+    const preparation = await this.prepareDeploy(result);
 
     if (!preparation.approvalRequest) {
       return {
@@ -184,12 +185,12 @@ export class ExecutionEngine {
     }
 
     const approval = await approvalGate.requestApproval(preparation.approvalRequest);
-    return this.completeApply(preparation, approval);
+    return this.completeDeploy(preparation, approval);
   }
 
-  async prepareApply(result: AgentRunResult): Promise<ApplyPreparationResult> {
+  async prepareDeploy(result: AgentRunResult): Promise<DeployPreparationResult> {
     const executionResult = await this.dryRun(result);
-    const classification = classifyPhase8ApplyAction();
+    const classification = classifyDeployApprovalAction();
     const preflight = runPhase8Preflight(executionResult);
 
     if (preflight.status !== 'passed') {
@@ -216,10 +217,10 @@ export class ExecutionEngine {
     };
   }
 
-  async completeApply(
-    preparation: ApplyPreparationResult,
+  async completeDeploy(
+    preparation: DeployPreparationResult,
     approval: ApprovalResult,
-  ): Promise<ApplyExecutionResult> {
+  ): Promise<DeployExecutionResult> {
     if (!preparation.approvalRequest) {
       return {
         ...preparation,
@@ -331,6 +332,7 @@ export class ExecutionEngine {
     const startedAt = new Date().toISOString();
     const createdNetworks: string[] = [];
     const createdContainers: string[] = [];
+    const attemptedContainers: string[] = [];
     const createdVolumes: string[] = [];
 
     dockerMcpClient.setAllowMutations(true);
@@ -419,6 +421,7 @@ export class ExecutionEngine {
             continue;
           }
 
+          attemptedContainers.push(containerSpec.name);
           const containerId = await dockerMcpClient.createContainer(containerSpec);
           createdContainers.push(containerSpec.name);
           await dockerMcpClient.startContainer(containerSpec.name);
@@ -428,7 +431,7 @@ export class ExecutionEngine {
     } catch (error) {
       const cleanupReport = await this.cleanupPartialDeploy(
         dockerMcpClient,
-        { createdContainers, createdNetworks, createdVolumes },
+        { createdContainers: [...new Set([...createdContainers, ...attemptedContainers])], createdNetworks, createdVolumes },
         'deploy-failed',
       );
       throw new Error(
@@ -1018,3 +1021,4 @@ function replicaIndexFromContainerName(containerName: string): number {
   if (!match) return 0;
   return Math.max(Number(match[1]) - 1, 0);
 }
+

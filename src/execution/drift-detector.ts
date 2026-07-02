@@ -28,6 +28,10 @@ function normalizeObservedResourceName(name: string, projectName: string): strin
   return stripProjectPrefix(name, projectName);
 }
 
+function resourceNameMatches(actualName: string, desiredName: string, projectName: string): boolean {
+  return actualName === desiredName || normalizeObservedResourceName(actualName, projectName) === desiredName;
+}
+
 function isRunningStatus(status: string | null): boolean {
   return status === 'running';
 }
@@ -208,7 +212,7 @@ export function buildDriftReport(
   }
 
   for (const network of desired.networks) {
-    if (!actual.networks.some((entry) => normalizeObservedResourceName(entry.name, desired.projectName) === network)) {
+    if (!actual.networks.some((entry) => resourceNameMatches(entry.name, network, desired.projectName))) {
       findings.push(
         finding(
           'missing-network',
@@ -227,7 +231,7 @@ export function buildDriftReport(
   for (const service of desired.services) {
     for (const volume of service.volumes ?? []) {
       const volumeName = volume.split(':')[0] ?? '';
-      if (volumeName && !actual.volumes.some((entry) => normalizeObservedResourceName(entry.name, desired.projectName) === volumeName)) {
+      if (volumeName && !actual.volumes.some((entry) => resourceNameMatches(entry.name, volumeName, desired.projectName))) {
         findings.push(
           finding(
             'missing-volume',

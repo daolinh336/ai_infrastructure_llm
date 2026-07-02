@@ -45,7 +45,7 @@ function resolvePatchTargets(
   if (patch.op === 'set-service-replicas' && patch.target.targetKind === 'replica-group') {
     const databaseGroup = resolveStatefulDatabaseReplicaGroup(spec, patch.target, []);
     if (databaseGroup !== null) return { matchedServices: databaseGroup.services, blockedReason: null };
-    return { matchedServices: [], blockedReason: 'No matching replica group for selector.' };
+    return { matchedServices: [], blockedReason: `No matching replica group for selector ${formatSelector(patch.target)}. Available replica groups: ${formatReplicaGroups(spec)}. Available services: ${formatServices(spec)}. Suggested fix: target an existing service by name/kind, or first create an expanded stateful DB replica group before using targetKind="replica-group".` };
   }
 
   const matches = resolveServiceSelector(spec, patch.target);
@@ -53,14 +53,14 @@ function resolvePatchTargets(
     if (patch.op === 'set-service-replicas' && resolveStatefulDatabaseReplicaGroup(spec, patch.target, []) !== null) {
       return { matchedServices: [], blockedReason: null };
     }
-    return { matchedServices: [], blockedReason: 'No matching service for selector.' };
+    return { matchedServices: [], blockedReason: `No matching service for selector ${formatSelector(patch.target)}. Available services: ${formatServices(spec)}. Suggested fix: use one of the listed service names, or clarify which service should change.` };
   }
 
   if (matches.length > 1) {
     if (patch.op === 'set-service-replicas' && resolveStatefulDatabaseReplicaGroup(spec, patch.target, matches) !== null) {
       return { matchedServices: matches, blockedReason: null };
     }
-    return { matchedServices: matches, blockedReason: 'Ambiguous selector matched multiple services.' };
+    return { matchedServices: matches, blockedReason: `Ambiguous selector ${formatSelector(patch.target)} matched multiple services: ${matches.map((service) => service.name).join(', ')}. Suggested fix: choose exactly one service name.` };
   }
 
   return { matchedServices: matches, blockedReason: null };
@@ -315,6 +315,25 @@ function applyResolvedPatch(
   };
 }
 
+function formatSelector(selector: ServiceSelector): string {
+  return JSON.stringify(selector);
+}
+
+function formatServices(spec: InfrastructureSpec): string {
+  return spec.services.map((service) => `${service.name}(${service.kind}, ${service.image})`).join(', ') || 'none';
+}
+
+function formatReplicaGroups(spec: InfrastructureSpec): string {
+  const groups = new Map<string, string[]>();
+  for (const service of spec.services) {
+    if (service.kind !== 'database') continue;
+    const parsed = parseNumberedReplicaServiceName(service.name);
+    if (!parsed) continue;
+    groups.set(parsed.baseName, [...(groups.get(parsed.baseName) ?? []), service.name]);
+  }
+  return [...groups.entries()].map(([baseName, services]) => `${baseName}=[${services.join(', ')}]`).join('; ') || 'none';
+}
+
 function inferServiceKind(image: string): InfrastructureService['kind'] {
   const base = (image.toLowerCase().split(':')[0] ?? '').split('/').pop() ?? '';
   const reverseProxyImages = new Set(['nginx', 'httpd', 'traefik', 'haproxy', 'caddy']);
@@ -339,17 +358,25 @@ function resolveStatefulDatabaseReplicaGroup(
   matchedServices: InfrastructureService[],
 ): StatefulDatabaseReplicaGroup | null {
   const groups = new Map<string, InfrastructureService[]>();
+  const logicalGroups: StatefulDatabaseReplicaGroup[] = [];
   for (const service of spec.services) {
     if (service.kind !== 'database') continue;
     const parsed = parseNumberedReplicaServiceName(service.name);
+    if (!parsed && selector.targetKind === 'replica-group') {
+      logicalGroups.push({ baseName: service.name, services: [service] });
+      continue;
+    }
     if (!parsed) continue;
     const services = groups.get(parsed.baseName) ?? [];
     services.push(service);
     groups.set(parsed.baseName, services);
   }
 
-  const candidates = [...groups.entries()]
+  const candidates = [
+    ...logicalGroups,
+    ...[...groups.entries()]
     .map(([baseName, services]) => ({ baseName, services: sortNumberedReplicaServices(services) }))
+  ]
     .filter((group) => group.services.length > 0)
     .filter((group) => matchesReplicaGroupSelector(group, selector, matchedServices));
 

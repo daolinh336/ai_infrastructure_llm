@@ -10,9 +10,10 @@ import { buildRepairPlan } from '../execution/repair-planner.js';
 import { deriveSpecFromRuntime } from '../execution/spec-sync.js';
 import { isProtectedDockerNetwork } from '../execution/protected-docker-resources.js';
 import { toReplicaContainerNames } from '../execution/container-names.js';
-import { clearManagedStateAfterDestroyAll, loadState, saveStateOperationRecord, saveVerifiedRuntimeSnapshot } from '../state/sqlite-state-store.js';
+import { clearManagedProjectState, clearManagedStateAfterDestroyAll, listProjectStates, loadProjectState, loadState, saveStateOperationRecord, saveVerifiedRuntimeSnapshot } from '../state/sqlite-state-store.js';
 import { StatusService } from '../status/status-service.js';
 import { registerPlanCommand } from './plan-command.js';
+import type { PendingPreviewState, VerifiedRuntimeSnapshot } from '../domain/types.js';
 import {
   collectDestroyAllTargets,
   createDockerMcpGatewayFromEnv,
@@ -106,11 +107,12 @@ program
   .option('--yes', 'Skip interactive approval by typing the verification phrase automatically', false)
   .action(async (options) => {
     const state = await loadState();
+    const projectStates = await listProjectStates();
     const mcpClient = createDockerMcpGatewayFromEnv();
     try {
       await mcpClient.initialize();
       const actual = await mcpClient.observeActualState();
-      const targets = collectDestroyAllTargets(state, actual, Boolean(options.removeVolumes));
+      const targets = collectDestroyAllTargets(state, projectStates, actual, Boolean(options.removeVolumes));
 
       console.log(chalk.red('Destroy all preview for infrastructure managed by this tool:'));
       console.log('- Projects: ' + (targets.projects.join(', ') || 'none'));
@@ -298,7 +300,7 @@ program
         const readline = createInterface({ input, output });
         let choice = 'n';
         try {
-          const answer = (await readline.question(chalk.yellow('Drift detected. Apply repair (y), skip (n), or sync runtime as truth (s)? [y/n/s] '))).trim().toLowerCase();
+          const answer = (await readline.question(chalk.yellow('Drift detected. Run repair (y), skip (n), or sync runtime as truth (s)? [y/n/s] '))).trim().toLowerCase();
           choice = answer === 'y' || answer === 'yes' ? 'y' : answer === 's' || answer === 'sync' ? 's' : 'n';
         } finally {
           readline.close();
@@ -390,22 +392,29 @@ program
     const engine = new ExecutionEngine({
       dockerPullRetry: loadDockerPullRetryPolicyFromEnv(),
     });
-    if (!state || !state.current) {
+    const project = options.project ?? state?.current?.desired.projectName;
+    if (!project) {
       console.log(chalk.red('No current verified runtime snapshot found. Run a deploy first.'));
       process.exitCode = 1;
       return;
     }
-    const project = options.project ?? state.current.desired.projectName;
-    const expectedContainers = state.current.desired.services.flatMap((service) =>
+    const projectState = options.project ? await loadProjectState(project) : state;
+    if (!projectState || (!projectState.current && !projectState.pendingPreview)) {
+      console.log(chalk.red(`No managed state found for project "${project}".`));
+      process.exitCode = 1;
+      return;
+    }
+    const destroySnapshot = projectState.current ?? destroySnapshotFromPendingPreview(projectState.pendingPreview as PendingPreviewState);
+    const expectedContainers = destroySnapshot.desired.services.flatMap((service) =>
       toReplicaContainerNames(project, service),
     );
-    const expectedNetworks = new Set(state.current.desired.networks);
-    const expectedVolumes = new Set(state.current.desired.volumes);
-    const previewContainers = (state.current.resourceRefs?.containers ?? expectedContainers)
+    const expectedNetworks = new Set(destroySnapshot.desired.networks);
+    const expectedVolumes = new Set(destroySnapshot.desired.volumes);
+    const previewContainers = (destroySnapshot.resourceRefs?.containers ?? expectedContainers)
       .filter((name) => name.startsWith(project + '-') || expectedContainers.includes(name));
-    const previewNetworks = (state.current.resourceRefs?.networks ?? state.current.desired.networks)
+    const previewNetworks = (destroySnapshot.resourceRefs?.networks ?? destroySnapshot.desired.networks)
       .filter((name) => !isProtectedDockerNetwork(name) && (name.startsWith(project + '-') || expectedNetworks.has(name)));
-    const previewVolumes = (state.current.resourceRefs?.volumes ?? state.current.desired.volumes)
+    const previewVolumes = (destroySnapshot.resourceRefs?.volumes ?? destroySnapshot.desired.volumes)
       .filter((name) => name.startsWith(project + '-') || expectedVolumes.has(name));
     console.log(chalk.cyan('Destroy preview for project "' + project + '":'));
     console.log('- Containers: ' + (previewContainers.join(', ') || 'none'));
@@ -425,7 +434,7 @@ program
       const mcpClient = createDockerMcpGatewayFromEnv();
     try {
       await mcpClient.initialize();
-      const result = await engine.destroyWithDocker(state.current, mcpClient, { projectName: project, removeVolumes: Boolean(options.removeVolumes) });
+      const result = await engine.destroyWithDocker(destroySnapshot, mcpClient, { projectName: project, removeVolumes: Boolean(options.removeVolumes) });
       console.log(result.removalErrors.length === 0 ? chalk.green('Destroy completed via MCP.') : chalk.yellow('Destroy partially completed via MCP.'));
       console.log('- Containers removed: ' + (result.containersRemoved.join(', ') || 'none'));
       console.log('- Networks removed: ' + (result.networksRemoved.join(', ') || 'none'));
@@ -453,17 +462,19 @@ program
       }
 
       if (result.verificationReport.status === 'passed') {
-        const resourceRefs = buildResourceRefs(project, result.actual, state.current.desired);
-        await saveVerifiedRuntimeSnapshot({
-          sourceSnapshot: state.current,
-          actual: result.actual,
-          verificationReport: result.verificationReport,
-          operation: 'destroy',
-          resourceRefs,
+        await clearManagedProjectState({
+          projectName: project,
+          request: destroySnapshot.request,
+          summary: `Destroy completed for project "${project}"; managed SQLite state was cleared.`,
         });
-        console.log(chalk.green('Saved verified runtime state to SQLite after destroy.'));
+        console.log(chalk.green('SQLite state cleared for destroyed project.'));
       } else {
-        console.log(chalk.yellow('Destroy verification did not pass; current state was not saved as destroyed.'));
+        await clearManagedProjectState({
+          projectName: project,
+          request: destroySnapshot.request,
+          summary: `Destroy verification failed for project "${project}"; managed SQLite state was cleared by user policy. Issues: ${result.verificationReport.issues.join('; ')}`,
+        });
+        console.log(chalk.yellow('Destroy verification did not pass; managed SQLite state for this project was cleared.'));
       }
     } catch (error) {
       console.log(chalk.red('Destroy failed:'));
@@ -475,7 +486,7 @@ program
   });
 program
 .command('repair')
-.description('Detect drift, preview repair plan, get approval, then apply repair via MCP')
+.description('Detect drift, preview repair plan, get approval, then deploy repair via MCP')
 .option('--approve-risky', 'Include approval-required repair actions in the approval request', false)
 .action(async (options) => {
   const state = await loadState();
@@ -502,13 +513,13 @@ program
     console.log('- Total actions: ' + String(plan.actions.length));
     console.log('- Safe actions: ' + String(plan.actions.filter((a) => a.risk === 'safe').length));
     console.log('- Approval-required: ' + String(plan.actions.filter((a) => a.risk === 'approval-required').length));
-    console.log('- Actions to apply: ' + String(actionsToApply.length));
+    console.log('- Actions to run: ' + String(actionsToApply.length));
     for (const action of actionsToApply) { console.log('  - [' + action.risk + '] ' + action.kind + ' ' + action.resourceName); }
-    if (actionsToApply.length === 0) { console.log(chalk.yellow('No repair actions to apply after filtering. Use --approve-risky to include approval-required actions.')); return; }
+    if (actionsToApply.length === 0) { console.log(chalk.yellow('No repair actions to run after filtering. Use --approve-risky to include approval-required actions.')); return; }
     const readline = createInterface({ input, output });
     let approved = false;
     try {
-      const answer = (await readline.question(chalk.yellow('Approve applying these repair actions? (y/N) '))).trim().toLowerCase();
+      const answer = (await readline.question(chalk.yellow('Approve running these repair actions? (y/N) '))).trim().toLowerCase();
       approved = answer === 'y' || answer === 'yes';
     } finally { readline.close(); }
     if (!approved) {
@@ -542,6 +553,30 @@ program
     await mcpClient.shutdown();
   }
 });
+function destroySnapshotFromPendingPreview(
+  pendingPreview: PendingPreviewState,
+): VerifiedRuntimeSnapshot {
+  const observedAt = pendingPreview.acceptedAt ?? pendingPreview.createdAt;
+  return {
+    id: `pending-destroy-${pendingPreview.id}`,
+    request: pendingPreview.request,
+    desired: pendingPreview.desired,
+    composeArtifact: pendingPreview.composeArtifact,
+    actual: {
+      source: 'not-observed',
+      containers: [],
+      networks: [],
+      volumes: [],
+      images: [],
+      lastObservedAt: null,
+    },
+    verification: pendingPreview.verification,
+    approvedAt: pendingPreview.acceptedAt,
+    appliedAt: null,
+    savedAt: observedAt,
+  };
+}
+
 program.parseAsync(process.argv).catch((error: unknown) => {
   if (isCommanderDisplayExitError(error)) {
     return;

@@ -15,7 +15,7 @@ import type {
   VerificationFinding,
   VerificationReport,
 } from '../domain/types.js';
-import { validateVerificationReport } from '../domain/schemas.js';
+import { validateInfrastructureSpec, validateVerificationReport } from '../domain/schemas.js';
 import type { ExecutionEngine } from '../execution/execution-engine.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 import { buildDriftReport } from '../execution/drift-detector.js';
@@ -77,13 +77,15 @@ export interface ClosedLoopDeployResult {
   currentApprovedAction: ApprovedAction;
   currentPlan: ExecutionPlan;
   successfulDeployResult?: Awaited<ReturnType<ClosedLoopEnginePort['deployWithDocker']>>;
+  failureReason?: string;
 }
 
 type RevisionResult = Awaited<ReturnType<ClosedLoopAgentPort['reviseFromFeedback']>>;
 
 type RevisionResolutionResult =
   | { status: 'resolved'; revisionResult: RevisionResult; userFeedback: UserFeedback | null }
-  | { status: 'blocked'; revisionResult: RevisionResult; userFeedback: UserFeedback | null; reason: string };
+  | { status: 'blocked'; revisionResult: RevisionResult; userFeedback: UserFeedback | null; reason: string }
+  | { status: 'rejected'; revisionResult: RevisionResult; userFeedback: UserFeedback | null; reason: string };
 
 export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Promise<ClosedLoopDeployResult> {
   let currentApprovedAction = options.approvedAction;
@@ -127,7 +129,10 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         revisionRequest,
         initialRevisionResult,
       );
-      const revisionResult = revisionResolution.revisionResult;
+      const revisionResult = withExpectedProjectName(
+        revisionResolution.revisionResult,
+        currentApprovedAction.validatedSpec.projectName,
+      );
       revisionHistory.push({
         attemptIndex,
         revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
@@ -136,9 +141,9 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         userFeedback: revisionResolution.userFeedback,
         createdAt: new Date().toISOString(),
       });
-      if (revisionResolution.status === 'blocked') {
+      if (revisionResolution.status === 'blocked' || revisionResolution.status === 'rejected') {
         log(revisionResolution.reason);
-        return { status: 'failed', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+        return { status: revisionResolution.status === 'rejected' ? 'rejected' : 'failed', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan, failureReason: revisionResolution.reason };
       }
       currentPlan = {
         ...currentPlan,
@@ -195,7 +200,10 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         revisionRequest,
         initialRevisionResult,
       );
-      const revisionResult = revisionResolution.revisionResult;
+      const revisionResult = withExpectedProjectName(
+        revisionResolution.revisionResult,
+        currentApprovedAction.validatedSpec.projectName,
+      );
       revisionHistory.push({
         attemptIndex,
         revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
@@ -204,9 +212,9 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         userFeedback: revisionResolution.userFeedback,
         createdAt: new Date().toISOString(),
       });
-      if (revisionResolution.status === 'blocked') {
+      if (revisionResolution.status === 'blocked' || revisionResolution.status === 'rejected') {
         log(revisionResolution.reason);
-        return { status: 'failed', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+        return { status: revisionResolution.status === 'rejected' ? 'rejected' : 'failed', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan, failureReason: revisionResolution.reason };
       }
       currentPlan = {
         ...currentPlan,
@@ -276,7 +284,10 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       revisionRequest,
       initialRevisionResult,
     );
-    const revisionResult = revisionResolution.revisionResult;
+    const revisionResult = withExpectedProjectName(
+      revisionResolution.revisionResult,
+      currentApprovedAction.validatedSpec.projectName,
+    );
     revisionHistory.push({
       attemptIndex,
       revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
@@ -286,9 +297,9 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       createdAt: new Date().toISOString(),
     });
     await options.engine.cleanupAttemptScope(options.mcpClient, deployResult.attemptScope);
-    if (revisionResolution.status === 'blocked') {
-      log(revisionResolution.reason);
-      return { status: 'failed', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+    if (revisionResolution.status === 'blocked' || revisionResolution.status === 'rejected') {
+        log(revisionResolution.reason);
+        return { status: revisionResolution.status === 'rejected' ? 'rejected' : 'failed', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan, failureReason: revisionResolution.reason };
     }
     currentPlan = {
       ...currentPlan,
@@ -321,10 +332,10 @@ async function resolveRevisionWithClarifications(
     const clarificationFeedback = await options.requestRevisionClarification(revisionResult);
     if (clarificationFeedback === null) {
       return {
-        status: 'blocked',
+        status: 'rejected',
         revisionResult,
         userFeedback,
-        reason: 'Planner still needs user input after clarification; stopping deploy loop before redeploy.',
+        reason: 'User cancelled revision; deploy loop stopped.',
       };
     }
 
@@ -356,6 +367,23 @@ function tickGuard(
     if (error instanceof ClosedLoopGuardError) return 'guard-stopped';
     throw error;
   }
+}
+
+function withExpectedProjectName(
+  revisionResult: RevisionResult,
+  expectedProjectName: string,
+): RevisionResult {
+  if (revisionResult.revisedSpec.projectName === expectedProjectName) {
+    return revisionResult;
+  }
+
+  return {
+    ...revisionResult,
+    revisedSpec: validateInfrastructureSpec({
+      ...revisionResult.revisedSpec,
+      projectName: expectedProjectName,
+    }),
+  };
 }
 
 function createDeployErrorRuntimeIssueReport(

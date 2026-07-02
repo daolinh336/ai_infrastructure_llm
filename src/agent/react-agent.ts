@@ -1265,7 +1265,7 @@ function buildSpecFromDraft(query: ValidatedQuery): InfrastructureSpec {
   applyInferredDependencies(services);
 
   return expandStatefulDatabaseReplicas({
-    projectName: 'sample-infra',
+    projectName: query.draft.projectName ?? 'sample-infra',
     networks: ['app-network'],
     volumes: [...volumes],
     services,
