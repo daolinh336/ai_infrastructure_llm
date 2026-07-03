@@ -33,6 +33,7 @@ export type TrustedImageRole = 'reverse-proxy' | 'backend' | 'database';
 export interface TrustedImageProfile {
   base: SupportedImageBase;
   image: string;
+  versions: string[];
   role: TrustedImageRole;
   defaultPorts: string[];
   defaultEnvironment: Record<string, string>;
@@ -60,6 +61,7 @@ const trustedImageRoleSchema = z.enum(['reverse-proxy', 'backend', 'database']);
 const trustedImageProfileSchema = z.object({
   base: z.enum(SUPPORTED_IMAGE_BASES),
   image: z.string().trim().min(1),
+  versions: z.array(z.string().trim().min(1)).default([]),
   role: trustedImageRoleSchema,
   defaultPorts: z.array(z.string().trim().min(1)),
   defaultEnvironment: z.record(z.string(), z.string()),
@@ -220,12 +222,13 @@ export function isSupportedImageReference(reference: string): boolean {
 
 export function isTrustedImageReference(reference: string): boolean {
   const parsed = splitImageReference(reference);
-  return getTrustedImageProfileByBase(parsed.base) !== null;
+  const profile = getTrustedImageProfileByBase(parsed.base);
+  if (profile === null) return false;
+  const tag = parsed.suffix.startsWith(':') ? parsed.suffix.slice(1) : parsed.suffix;
+  return tag.length > 0 && profile.versions.includes(tag);
 }
-
 export function getTrustedImageProfile(reference: string): TrustedImageProfile | null {
-  const parsed = splitImageReference(reference);
-  return getTrustedImageProfileByBase(parsed.base);
+  return isTrustedImageReference(reference) ? getTrustedImageProfileByBase(splitImageReference(reference).base) : null;
 }
 
 export function getTrustedReplacementImages(reference: string, role?: TrustedImageRole, includeCrossFamily = false): string[] {
@@ -238,6 +241,22 @@ export function getTrustedReplacementImages(reference: string, role?: TrustedIma
 export function getTrustedDefaultImageForBase(base: string): string | null {
   const canonical = canonicalizeImageBase(base);
   return getTrustedImageProfileByBase(canonical.value)?.image ?? null;
+}
+
+export function getTrustedImageForBaseVersion(base: string, version: string): string | null {
+  const canonical = canonicalizeImageBase(base);
+  const profile = getTrustedImageProfileByBase(canonical.value);
+  if (profile === null) return null;
+  const normalizedVersion = version.replace(/^:/, '').toLowerCase();
+  const match = profile.versions.find((candidate) => candidate.toLowerCase() === normalizedVersion);
+  if (match === undefined) return null;
+  return `${profile.base}:${match}`;
+}
+
+export function getTrustedImageVersionsForBase(base: string): string[] {
+  const canonical = canonicalizeImageBase(base);
+  const profile = getTrustedImageProfileByBase(canonical.value);
+  return profile === null ? [] : [...profile.versions];
 }
 
 export function getImageReferenceBase(reference: string): string {
@@ -289,6 +308,11 @@ function validateTrustedImageCatalog(catalog: TrustedImageCatalog, configPath: s
   const seenBases = new Set<string>();
 
   for (const profile of catalog.trustedImages) {
+    const defaultVersion = profile.image.split(':').slice(1).join(':');
+    if (!profile.versions.includes(defaultVersion)) {
+      throw new TrustedImageCatalogError(`Trusted image catalog default image "${profile.image}" must be listed in versions for base "${profile.base}" in ${configPath}`);
+    }
+
     if (seenBases.has(profile.base)) {
       throw new TrustedImageCatalogError(`Trusted image catalog contains duplicate base "${profile.base}" in ${configPath}`);
     }

@@ -23,6 +23,7 @@ import type { PlannerAgent } from './agent-interfaces.js';
 import { applySpecPatchPlan, resolveServiceSelector } from './spec-patch-applier.js';
 import {
   getTrustedDefaultImageForBase,
+  getTrustedImageForBaseVersion,
   getTrustedImageProfile,
   getTrustedReplacementImages,
 } from '../domain/supported-images.js';
@@ -813,7 +814,7 @@ function describeFindingActionNeeded(finding: VerificationFinding): string | nul
 }
 
 function extractAllowedPatchOps(issues: string[]): string[] {
-  return issues.flatMap((issue) => [...issue.matchAll(/allow:([a-z-]+)/gi)].map((match) => match[1]!));
+  return issues.flatMap((issue) => [...issue.matchAll(/allow:([a-z0-9-]+)/gi)].map((match) => match[1]!));
 }
 
 type RevisionPatch =
@@ -847,9 +848,6 @@ function selectRevisionPatchPlanMode(
   feedbackIntent: FeedbackIntent | null,
   findings: VerificationFinding[],
 ): RevisionPatchPlanMode {
-  const feedbackMessage = request.revisionObservation.userFeedback?.message ?? '';
-  const selectedVerifierRemediation = /\ballow:/i.test(feedbackMessage);
-  if (selectedVerifierRemediation) return 'verifier-remediation';
 
   const semanticFeedbackIntent = feedbackIntent !== null
     && feedbackIntent.intent !== 'unknown'
@@ -858,7 +856,6 @@ function selectRevisionPatchPlanMode(
   if (semanticFeedbackIntent) return 'planner-revision';
 
   if (request.revisionObservation.userFeedback !== null) return 'planner-revision';
-  if (findings.length > 0) return 'verifier-remediation';
   return 'planner-revision';
 }
 
@@ -1833,13 +1830,39 @@ function containsServiceHint(text: string): boolean {
 }
 
 function parseImageFeedback(feedback: string): string | null {
+  const versionedImage = parseTrustedImageVersionFeedback(feedback);
+  if (versionedImage !== null) return versionedImage;
+
   const requestedImage = [
-    /\b(?:change|set|update|switch)\s+(?:\w+\s+){0,4}?image\s+(?:to|with)\s+([A-Za-z0-9_./:-]+)/i,
-    /\b(?:change|set|update|switch)\s+(?:\w+\s+){0,4}?(?:to|with)\s+image\s+([A-Za-z0-9_./:-]+)/i,
+    /\b(?:change|set|update|switch|downgrade|upgrade)\s+(?:\w+\s+){0,4}?image\s+(?:to|with)\s+([A-Za-z0-9_./:-]+)/i,
+    /\b(?:change|set|update|switch|downgrade|upgrade)\s+(?:\w+\s+){0,4}?(?:to|with)\s+image\s+([A-Za-z0-9_./:-]+)/i,
     /\breplace\s+(?:\w+\s+){0,4}?with\s+([A-Za-z0-9_./:-]+)/i,
     /\buse\s+([A-Za-z0-9_./:-]+)(?:\s+image)?\b/i,
   ].map((pattern) => pattern.exec(feedback)?.[1]).find((value): value is string => Boolean(value));
   return requestedImage ? normalizeRevisionImage(requestedImage) : null;
+}
+
+function parseTrustedImageVersionFeedback(feedback: string): string | null {
+  const direct = /\b([a-z][a-z0-9_.-]*)\s*[: ]\s*(v?\d+(?:\.\d+)*(?:-[a-z0-9_.-]+)?)\b/i.exec(feedback);
+  if (direct) {
+    const resolved = getTrustedImageForBaseVersion(direct[1]!, direct[2]!);
+    if (resolved !== null) return resolved;
+  }
+
+  const contextual = /\b(?:version|tag|phiên b?n|phien ban|xu?ng|xuong|lên|len|downgrade|upgrade)\s+(?:to\s+)?(v?\d+(?:\.\d+)*(?:-[a-z0-9_.-]+)?)\b/i.exec(feedback);
+  if (contextual) {
+    for (const base of extractImageBaseMentions(feedback)) {
+      const resolved = getTrustedImageForBaseVersion(base, contextual[1]!);
+      if (resolved !== null) return resolved;
+    }
+  }
+
+  return null;
+}
+
+function extractImageBaseMentions(text: string): string[] {
+  const tokens = [...text.matchAll(/[A-Za-z][A-Za-z0-9_.-]*/g)].map((match) => match[0].toLowerCase());
+  return tokens.filter((token) => getTrustedDefaultImageForBase(token) !== null);
 }
 
 function inferFeedbackServiceSelector(

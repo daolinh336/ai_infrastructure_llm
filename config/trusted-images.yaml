@@ -1,6 +1,43 @@
 trustedImages:
+  - base: alpine
+    image: alpine:3.20
+    versions: ['3.22', '3.21', '3.20', '3.19', '3.18']
+    role: backend
+    defaultPorts: []
+    defaultEnvironment: {}
+    defaultVolumes: []
+    sameRoleReplacements: ['busybox:1.36', 'ubuntu:24.04', 'debian:12']
+    crossFamilyReplacements: []
+  - base: ubuntu
+    image: ubuntu:24.04
+    versions: ['24.04', '22.04']
+    role: backend
+    defaultPorts: []
+    defaultEnvironment: {}
+    defaultVolumes: []
+    sameRoleReplacements: ['debian:12', 'alpine:3.20']
+    crossFamilyReplacements: []
+  - base: debian
+    image: debian:12
+    versions: ['12', '11']
+    role: backend
+    defaultPorts: []
+    defaultEnvironment: {}
+    defaultVolumes: []
+    sameRoleReplacements: ['ubuntu:24.04', 'alpine:3.20']
+    crossFamilyReplacements: []
+  - base: busybox
+    image: busybox:1.36
+    versions: ['1.37', '1.36', '1.35']
+    role: backend
+    defaultPorts: []
+    defaultEnvironment: {}
+    defaultVolumes: []
+    sameRoleReplacements: ['alpine:3.20']
+    crossFamilyReplacements: []
   - base: nginx
     image: nginx:stable
+    versions: ['latest', 'stable', 'stable-alpine', '1.27-alpine', '1.26-alpine']
     role: reverse-proxy
     defaultPorts: ['80:80']
     defaultEnvironment: {}
@@ -9,6 +46,7 @@ trustedImages:
     crossFamilyReplacements: []
   - base: httpd
     image: httpd:2.4
+    versions: ['2.4', '2.4-alpine']
     role: reverse-proxy
     defaultPorts: ['80:80']
     defaultEnvironment: {}
@@ -17,6 +55,7 @@ trustedImages:
     crossFamilyReplacements: []
   - base: traefik
     image: traefik:v3.0
+    versions: ['v3.1', 'v3.0', 'v2.11']
     role: reverse-proxy
     defaultPorts: ['80:80']
     defaultEnvironment: {}
@@ -25,6 +64,7 @@ trustedImages:
     crossFamilyReplacements: []
   - base: node
     image: node:20-alpine
+    versions: ['22-alpine', '20-alpine', '18-alpine', '20-bookworm-slim']
     role: backend
     defaultPorts: ['3000:3000']
     defaultEnvironment: {}
@@ -33,6 +73,7 @@ trustedImages:
     crossFamilyReplacements: ['golang:1.22-alpine', 'eclipse-temurin:21-jre']
   - base: python
     image: python:3.12-alpine
+    versions: ['3.13-alpine', '3.12-alpine', '3.11-alpine', '3.12-slim']
     role: backend
     defaultPorts: ['8000:8000']
     defaultEnvironment: {}
@@ -41,6 +82,7 @@ trustedImages:
     crossFamilyReplacements: ['golang:1.22-alpine', 'eclipse-temurin:21-jre']
   - base: golang
     image: golang:1.22-alpine
+    versions: ['1.23-alpine', '1.22-alpine', '1.21-alpine']
     role: backend
     defaultPorts: ['8080:8080']
     defaultEnvironment: {}
@@ -49,6 +91,7 @@ trustedImages:
     crossFamilyReplacements: ['eclipse-temurin:21-jre']
   - base: openjdk
     image: openjdk:21-jdk-slim
+    versions: ['21-jdk-slim', '17-jdk-slim']
     role: backend
     defaultPorts: ['8080:8080']
     defaultEnvironment: {}
@@ -57,6 +100,7 @@ trustedImages:
     crossFamilyReplacements: ['node:20-alpine', 'python:3.12-alpine']
   - base: eclipse-temurin
     image: eclipse-temurin:21-jre
+    versions: ['21-jre', '17-jre', '21-jdk', '17-jdk']
     role: backend
     defaultPorts: ['8080:8080']
     defaultEnvironment: {}
@@ -65,6 +109,7 @@ trustedImages:
     crossFamilyReplacements: ['node:20-alpine', 'python:3.12-alpine']
   - base: postgres
     image: postgres:16-alpine
+    versions: ['17-alpine', '16-alpine', '16', '15-alpine', '15', '14-alpine', '14']
     role: database
     defaultPorts: ['5432:5432']
     defaultEnvironment:
@@ -76,6 +121,7 @@ trustedImages:
     crossFamilyReplacements: ['mysql:8.4', 'mariadb:11.4', 'mongo:7']
   - base: mysql
     image: mysql:8.4
+    versions: ['8.4', '8.0']
     role: database
     defaultPorts: ['3306:3306']
     defaultEnvironment:
@@ -88,6 +134,7 @@ trustedImages:
     crossFamilyReplacements: ['postgres:16-alpine', 'mongo:7']
   - base: mariadb
     image: mariadb:11.4
+    versions: ['11.4', '10.11']
     role: database
     defaultPorts: ['3306:3306']
     defaultEnvironment:
@@ -100,6 +147,7 @@ trustedImages:
     crossFamilyReplacements: ['postgres:16-alpine', 'mongo:7']
   - base: mongo
     image: mongo:7
+    versions: ['8', '7', '6']
     role: database
     defaultPorts: ['27017:27017']
     defaultEnvironment: {}
@@ -108,6 +156,7 @@ trustedImages:
     crossFamilyReplacements: ['postgres:16-alpine', 'mysql:8.4', 'mariadb:11.4']
   - base: redis
     image: redis:7-alpine
+    versions: ['7-alpine', '7', '6-alpine']
     role: database
     defaultPorts: ['6379:6379']
     defaultEnvironment: {}
@@ -116,6 +165,7 @@ trustedImages:
     crossFamilyReplacements: []
   - base: rabbitmq
     image: rabbitmq:3-management
+    versions: ['4-management', '3-management']
     role: database
     defaultPorts: ['5672:5672']
     defaultEnvironment: {}
@@ -124,6 +174,7 @@ trustedImages:
     crossFamilyReplacements: []
   - base: elasticsearch
     image: elasticsearch:8.14.0
+    versions: ['8.15.0', '8.14.0', '8.13.0']
     role: database
     defaultPorts: ['9200:9200']
     defaultEnvironment: {}
@@ -132,6 +183,7 @@ trustedImages:
     crossFamilyReplacements: []
   - base: kafka
     image: kafka:latest
+    versions: ['latest']
     role: database
     defaultPorts: ['9092:9092']
     defaultEnvironment: {}
