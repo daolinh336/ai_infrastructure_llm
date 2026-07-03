@@ -3,6 +3,7 @@ import type {
   VerifiedRuntimeSnapshot,
 } from '../domain/types.js';
 import { desiredPortMappingsPresent } from '../domain/port-mappings.js';
+import { toReplicaContainerNames } from '../execution/container-names.js';
 import {
   loadState,
   StateStoreError,
@@ -38,10 +39,6 @@ export class StatusService {
   }
 }
 
-function toContainerName(projectName: string, serviceName: string): string {
-  return projectName + '-' + serviceName.replace(/[_\s]+/g, '-');
-}
-
 function isRunningStatus(status: string | null): boolean {
   return status === 'running';
 }
@@ -54,39 +51,48 @@ function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string
   const matched = new Set<string>();
 
   for (const service of desired.services) {
-    const expected = toContainerName(desired.projectName, service.name);
-    const container =
-      containers.find((entry) => entry.name === expected) ??
-      containers.find((entry) => entry.name.includes(service.name)) ??
-      null;
-    if (container) matched.add(container.name);
+    const expectedNames = toReplicaContainerNames(desired.projectName, service);
+    const serviceContainers = expectedNames
+      .map((expected) => containers.find((entry) => entry.name === expected) ?? null)
+      .filter((container): container is NonNullable<typeof container> => container !== null);
+    for (const container of serviceContainers) matched.add(container.name);
     const label = service.name.padEnd(nameWidth);
 
-    if (!container) {
+    if (serviceContainers.length === 0) {
       const desiredStatus = service.desiredStatus ?? 'running';
       lines.push(
-        `  - ${label} | MISSING | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | desired: ${desiredStatus} | status: absent (DRIFT)`,
+        `  - ${label} | MISSING | expected: ${expectedNames.join(', ')} | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | desired: ${desiredStatus} | status: absent (DRIFT)`,
       );
       continue;
     }
 
-    const imageOk =
-      container.image == null ||
-      container.image.startsWith(service.image) ||
-      service.image.startsWith(container.image);
-    const desiredPorts = (service.ports ?? []).join(', ') || 'none';
-    const actualPorts = (container.ports ?? []).join(', ') || 'none';
-    const desiredStatus = service.desiredStatus ?? 'running';
-    const status = container.status ?? 'unknown';
-    const lifecycleOk = desiredStatus === 'running'
-      ? isRunningStatus(container.status)
-      : !isRunningStatus(container.status);
-    const shouldComparePorts = desiredStatus === 'running' && isRunningStatus(container.status);
-    const portsOk = !shouldComparePorts || desiredPortMappingsPresent(service.ports, container.ports ?? []);
-    const portsMarker = shouldComparePorts ? (portsOk ? '(ok)' : '(DRIFT)') : '(not checked)';
-    lines.push(
-      `  - ${label} | image: ${service.image} ${imageOk ? '==' : '!='} ${container.image ?? 'unknown'} ${imageOk ? '(ok)' : '(DRIFT)'} | lifecycle: ${desiredStatus} ${lifecycleOk ? '==' : '!='} ${status} ${lifecycleOk ? '(ok)' : '(DRIFT)'} | ports: ${desiredPorts} ${portsOk ? '==' : '!='} ${actualPorts} ${portsMarker}`,
-    );
+    for (const container of serviceContainers) {
+      const imageOk =
+        container.image == null ||
+        container.image.startsWith(service.image) ||
+        service.image.startsWith(container.image);
+      const desiredPorts = (service.ports ?? []).join(', ') || 'none';
+      const actualPorts = (container.ports ?? []).join(', ') || 'none';
+      const desiredStatus = service.desiredStatus ?? 'running';
+      const status = container.status ?? 'unknown';
+      const lifecycleOk = desiredStatus === 'running'
+        ? isRunningStatus(container.status)
+        : !isRunningStatus(container.status);
+      const shouldComparePorts = desiredStatus === 'running' && isRunningStatus(container.status);
+      const portsOk = !shouldComparePorts || desiredPortMappingsPresent(service.ports, container.ports ?? []);
+      const portsMarker = shouldComparePorts ? (portsOk ? '(ok)' : '(DRIFT)') : '(not checked)';
+      lines.push(
+        `  - ${label} | container: ${container.name} | image: ${service.image} ${imageOk ? '==' : '!='} ${container.image ?? 'unknown'} ${imageOk ? '(ok)' : '(DRIFT)'} | lifecycle: ${desiredStatus} ${lifecycleOk ? '==' : '!='} ${status} ${lifecycleOk ? '(ok)' : '(DRIFT)'} | ports: ${desiredPorts} ${portsOk ? '==' : '!='} ${actualPorts} ${portsMarker}`,
+      );
+    }
+
+    const missingNames = expectedNames.filter((expected) => !matched.has(expected));
+    for (const missingName of missingNames) {
+      const desiredStatus = service.desiredStatus ?? 'running';
+      lines.push(
+        `  - ${label} | MISSING | expected: ${missingName} | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | desired: ${desiredStatus} | status: absent (DRIFT)`,
+      );
+    }
   }
 
   for (const container of containers) {

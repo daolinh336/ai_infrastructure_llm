@@ -23,6 +23,7 @@ export interface PlannerAgent {
 
   reviseFromFeedback(
     request: PlannerRevisionRequest,
+    runtimeReader?: PlannerRuntimeReader,
   ): Promise<PlannerRevisionResult>;
 }
 

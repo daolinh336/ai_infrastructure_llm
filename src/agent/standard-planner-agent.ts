@@ -82,6 +82,7 @@ export class StandardPlannerAgent implements PlannerAgent {
 
   async reviseFromFeedback(
     request: PlannerRevisionRequest,
+    runtimeReader?: PlannerRuntimeReader,
   ): Promise<PlannerRevisionResult> {
     const spec = request.desiredSpec;
     const obs = request.revisionObservation;
@@ -89,6 +90,7 @@ export class StandardPlannerAgent implements PlannerAgent {
     const findings = obs.verificationReport?.findings ?? [];
     const requiresUserInput = findings.some((finding) => findingNeedsUserInput(finding));
     const assumptions: string[] = [];
+    const observedOccupiedHostPorts = await readObservedOccupiedHostPorts(runtimeReader, issues, findings, assumptions);
 
     let revisedSpec = spec;
     let patchPlan: SpecPatchPlan | null = null;
@@ -152,6 +154,7 @@ export class StandardPlannerAgent implements PlannerAgent {
           issues,
           findings,
           request.attemptIndex,
+          observedOccupiedHostPorts,
         );
         if (portConflictPatchPlan !== patchPlan) {
           patchPlan = portConflictPatchPlan;
@@ -199,7 +202,7 @@ export class StandardPlannerAgent implements PlannerAgent {
           assumptions.push(`LLM structured revision failed or was unavailable: ${patchPlanError ?? 'unknown error'}. Deterministic feedback parsing is disabled.`);
         }
       } else {
-        const revision = applyRevisionRepairs(spec, issues, request.attemptIndex + 1, findings);
+        const revision = applyRevisionRepairs(spec, issues, request.attemptIndex + 1, findings, observedOccupiedHostPorts);
         revisionStats = revision;
         revisedSpec = revision.spec;
         revisionDecision = requiresUserInput || revision.unmatchedIssueCount > 0 || (revision.appliedPatchCount === 0 && revision.skippedPatchCount > 0) ? 'needs-user-input' : hasNoSafeResolution(findings) ? 'no-safe-resolution' : 'auto-revised';
@@ -471,6 +474,34 @@ async function readPlannerRuntimeContext(runtimeReader: PlannerRuntimeReader | u
   } catch {
     return empty;
   }
+}
+
+async function readObservedOccupiedHostPorts(
+  runtimeReader: PlannerRuntimeReader | undefined,
+  issues: string[],
+  findings: VerificationFinding[],
+  assumptions: string[],
+): Promise<Set<number>> {
+  if (!runtimeReader || !hasHostPortConflictObservation(issues, findings)) return new Set();
+
+  try {
+    const usedHostPorts = await runtimeReader.listUsedHostPorts();
+    const occupiedPorts = new Set<number>();
+    for (const usedPort of usedHostPorts) {
+      const port = Number(usedPort.hostPort);
+      if (Number.isInteger(port) && port > 0 && port <= 65535) occupiedPorts.add(port);
+    }
+    assumptions.push(`Runtime port scan: observed ${occupiedPorts.size} occupied host port(s) before choosing a replacement.`);
+    return occupiedPorts;
+  } catch {
+    assumptions.push('Runtime port scan failed; falling back to verifier-reported conflicting port(s) only.');
+    return new Set();
+  }
+}
+
+function hasHostPortConflictObservation(issues: string[], findings: VerificationFinding[]): boolean {
+  return findings.some((finding) => finding.code === 'HOST_PORT_CONFLICT')
+    || issues.some((issue) => /host port conflict|port .*already (?:allocated|used)|already used by/i.test(issue));
 }
 
 function hasPlannerPortConflict(runtimeContext: PlannerRuntimeContext, port: number): boolean {
@@ -1652,12 +1683,13 @@ function normalizeHostPortConflictPatchPlan(
   issues: string[],
   findings: VerificationFinding[],
   attemptIndex: number,
+  observedOccupiedHostPorts: Set<number> = new Set(),
 ): SpecPatchPlan {
   const conflicts = collectHostPortConflicts(spec, issues, findings);
   if (conflicts.length === 0) return patchPlan;
 
   const affectedServices = new Set(conflicts.map((conflict) => conflict.service.name));
-  const occupiedPorts = new Set(conflicts.map((conflict) => conflict.hostPort));
+  const occupiedPorts = new Set([...observedOccupiedHostPorts, ...conflicts.map((conflict) => conflict.hostPort)]);
   const patches = patchPlan.patches.filter((patch) => {
     if (patch.op !== 'remove-service-port') return true;
     const matched = resolveServiceSelector(spec, patch.target);
@@ -1945,8 +1977,9 @@ function applyRevisionRepairs(
   issues: string[],
   attemptNumber: number,
   findings: VerificationFinding[] = [],
+  observedOccupiedHostPorts: Set<number> = new Set(),
 ): RevisionRepairResult {
-  const patches = parseRevisionPatches(spec, issues, attemptNumber, findings);
+  const patches = parseRevisionPatches(spec, issues, attemptNumber, findings, observedOccupiedHostPorts);
   return applyRevisionPatches(spec, issues, patches);
 }
 
@@ -1955,10 +1988,11 @@ function parseRevisionPatches(
   issues: string[],
   attemptNumber: number,
   findings: VerificationFinding[] = [],
+  observedOccupiedHostPorts: Set<number> = new Set(),
 ): RevisionPatch[] {
   const patches: RevisionPatch[] = [];
   const conflictingContainerNames = new Set<string>();
-  const conflictingHostPorts = new Set<number>();
+  const conflictingHostPorts = new Set<number>(observedOccupiedHostPorts);
 
   for (const finding of findings) {
     if (finding.code === 'CONTAINER_NAME_CONFLICT' && finding.resourceName) {

@@ -59,7 +59,7 @@ import { StandardPlannerAgent } from './standard-planner-agent.js';
 import { StandardVerifierAgent } from './standard-verifier-agent.js';
 import { mapSemanticIntentToValidatedQuery } from './semantic-intent-mapper.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
-import { createVerifierRuntimeReader } from '../execution/runtime-environment-reader.js';
+import { createVerifierRuntimeReader, type PlannerRuntimeReader } from '../execution/runtime-environment-reader.js';
 import {
   ReActLoopGuard,
   ReActLoopGuardError,
@@ -209,8 +209,8 @@ export class ReActAgent {
     return this.verifier.verify(plan.spec, createVerifierRuntimeReader(mcpClient));
   }
 
-  async reviseFromFeedback(request: PlannerRevisionRequest): Promise<PlannerRevisionResult> {
-    return this.planner.reviseFromFeedback(request);
+  async reviseFromFeedback(request: PlannerRevisionRequest, runtimeReader?: PlannerRuntimeReader): Promise<PlannerRevisionResult> {
+    return this.planner.reviseFromFeedback(request, runtimeReader);
   }
 
   private async tryApplySemanticIntent(
@@ -389,7 +389,7 @@ export class ReActAgent {
       return imageResolution.result;
     }
 
-    validatedQuery = imageResolution.query;
+    validatedQuery = applyExplicitPromptImageHints(imageResolution.query);
 
     const imageSelectionClarification = buildImageSelectionClarification(
       validatedQuery,
@@ -924,8 +924,13 @@ function buildReasoningPromptInput(
 ): ReasoningPromptInput {
   const pendingPreview = previousState?.pendingPreview ?? null;
   const current = previousState?.current ?? null;
-  const trace = pendingPreview?.trace ?? [];
-  const observations = pendingPreview?.observations ?? [];
+  const requestedProject = query.draft.projectName ?? null;
+  const canUsePriorMemory = requestedProject === null || [
+    current?.desired.projectName ?? null,
+    pendingPreview?.desired.projectName ?? null,
+  ].includes(requestedProject);
+  const trace = canUsePriorMemory ? (pendingPreview?.trace ?? []) : [];
+  const observations = canUsePriorMemory ? (pendingPreview?.observations ?? []) : [];
 
   return {
     query,
@@ -951,6 +956,48 @@ function buildReasoningPromptInput(
         })),
     },
   };
+}
+
+function applyExplicitPromptImageHints(query: ValidatedQuery): ValidatedQuery {
+  if (query.intent !== 'create' || !query.draft.services.some((service) => service.image === null)) {
+    return query;
+  }
+
+  const services = query.draft.services.map((service) => {
+    if (service.image !== null) return service;
+    const image = inferExplicitPromptImageForService(query, service);
+    return image === null ? service : { ...service, image };
+  });
+
+  return validateValidatedQuery({
+    ...query,
+    draft: {
+      ...query.draft,
+      services,
+    },
+  });
+}
+
+function inferExplicitPromptImageForService(
+  query: ValidatedQuery,
+  service: DraftServiceQuery,
+): string | null {
+  const prompt = query.normalizedPrompt.toLowerCase();
+  const serviceText = service.name?.toLowerCase() ?? '';
+
+  if (/\b(web|website|nginx|ngix|proxy|reverse-proxy)\b/.test(serviceText) && /\b(nginx|ngix)\b/.test(prompt)) {
+    return getDefaultImage('nginx');
+  }
+
+  if (/\b(backend|api|node|nodejs|server)\b/.test(serviceText) && /\b(node|nodejs)\b/.test(prompt)) {
+    return getDefaultImage('node');
+  }
+
+  if (/\b(db|database|postgres|postgresql|postresql)\b/.test(serviceText) && /\b(postgres|postgresql|postresql)\b/.test(prompt)) {
+    return getDefaultImage('postgres');
+  }
+
+  return null;
 }
 
 function truncateMemoryText(value: string): string {

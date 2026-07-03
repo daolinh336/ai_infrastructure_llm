@@ -16,10 +16,12 @@ import type {
   VerificationFinding,
   VerificationReport,
   ResolvedSpecPatchResult,
+  ProgressReporter,
 } from '../domain/types.js';
 import { validateInfrastructureSpec, validateVerificationReport } from '../domain/schemas.js';
 import type { ExecutionEngine } from '../execution/execution-engine.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
+import { createPlannerRuntimeReader, type PlannerRuntimeReader } from '../execution/runtime-environment-reader.js';
 import { buildDriftReport } from '../execution/drift-detector.js';
 import { toReplicaContainerNames } from '../execution/container-names.js';
 import {
@@ -32,7 +34,7 @@ const MAX_REVISION_CLARIFICATION_ROUNDS = 3;
 
 export interface ClosedLoopAgentPort {
   verifyAfterApply(plan: ExecutionPlan, mcpClient: DockerMcpGateway): Promise<VerificationReport>;
-  reviseFromFeedback(request: PlannerRevisionRequest): Promise<{
+  reviseFromFeedback(request: PlannerRevisionRequest, runtimeReader?: PlannerRuntimeReader): Promise<{
     revisedSpec: ApprovedAction['validatedSpec'];
     revisionSummary: string;
     assumptions: string[];
@@ -73,6 +75,7 @@ export interface ClosedLoopDeployOptions {
     revisionHistory: RevisionHistoryRecord[];
   }): Promise<unknown>;
   log?: (message: string) => void;
+  progress?: ProgressReporter;
 }
 
 export interface ClosedLoopDeployResult {
@@ -101,14 +104,18 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
   let attemptIndex = 0;
   const revisionHistory: RevisionHistoryRecord[] = [];
   const log = options.log ?? (() => undefined);
+  const progress = options.progress ?? (() => undefined);
+  const plannerRuntimeReader = createPlannerRuntimeReader(options.mcpClient);
 
   while (true) {
+    progress({ phase: 'observe', message: 'Scanning Docker runtime before deploy...', toolName: 'observeActualState' });
     const preDeployActual = await options.mcpClient.observeActualState();
     const preDeployConflicts = detectPreDeployConflicts(
       currentApprovedAction.validatedSpec,
       preDeployActual,
     );
     if (preDeployConflicts.length > 0) {
+      progress({ phase: 'execution', message: 'Pre-deploy conflicts found; asking planner for a safe revision.' });
       attemptIndex += 1;
       const conflictReport = createConflictVerificationReport(preDeployConflicts);
       const resourceRefs = buildResourceRefs(currentApprovedAction.validatedSpec.projectName, preDeployActual, currentApprovedAction.validatedSpec);
@@ -128,11 +135,12 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         resourceRefs,
         attemptIndex,
       };
-      const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest);
+      const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest, plannerRuntimeReader);
       const revisionResolution = await resolveRevisionWithClarifications(
         options,
         revisionRequest,
         initialRevisionResult,
+        plannerRuntimeReader,
       );
       const revisionResult = withExpectedProjectName(
         revisionResolution.revisionResult,
@@ -166,6 +174,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
 
     let deployResult: Awaited<ReturnType<ClosedLoopEnginePort['deployWithDocker']>>;
     try {
+      progress({ phase: 'execution', message: 'Applying approved Docker plan...' });
       deployResult = await options.engine.deployWithDocker(currentApprovedAction, options.mcpClient);
     } catch (error) {
       attemptIndex += 1;
@@ -194,7 +203,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         resourceRefs: buildResourceRefs(currentApprovedAction.validatedSpec.projectName, preDeployActual, currentApprovedAction.validatedSpec),
         attemptIndex,
       };
-      const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest);
+      const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest, plannerRuntimeReader);
 
       const runtimeDecision = await options.requestRuntimeApproval(verificationReport, attemptIndex, initialRevisionResult);
       if (runtimeDecision.choice === 'rejected') {
@@ -209,7 +218,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
             ...revisionRequest.revisionObservation,
             userFeedback: runtimeDecision.userFeedback,
           },
-        });
+        }, plannerRuntimeReader);
       const requestedRevisionRequest = runtimeDecision.userFeedback === null
         ? revisionRequest
         : {
@@ -223,6 +232,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         options,
         requestedRevisionRequest,
         requestedRevision,
+        plannerRuntimeReader,
       );
       const revisionResult = withExpectedProjectName(
         revisionResolution.revisionResult,
@@ -250,10 +260,12 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       log('Deploy error normalized into runtime issue report; revised before redeploy.');
       continue;
     }
+    progress({ phase: 'observe', message: 'Verifying deployed containers...', toolName: 'verifyAfterApply' });
     const verificationReport = await options.agent.verifyAfterApply(currentPlan, options.mcpClient);
     const containerNames = currentApprovedAction.validatedSpec.services.flatMap((service) =>
       toReplicaContainerNames(currentApprovedAction.validatedSpec.projectName, service),
     );
+    progress({ phase: 'observe', message: 'Reading container inspect details...', toolName: 'observeActualStateWithInspect' });
     const actualState = await options.mcpClient.observeActualStateWithInspect({ containerNames });
     const resourceRefs = buildResourceRefs(currentApprovedAction.validatedSpec.projectName, actualState, currentApprovedAction.validatedSpec);
     const driftReport = buildDriftReport(currentApprovedAction.validatedSpec, actualState);
@@ -296,7 +308,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       resourceRefs,
       attemptIndex,
     };
-    const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest);
+    const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest, plannerRuntimeReader);
 
     const runtimeDecision = await options.requestRuntimeApproval(verificationReport, attemptIndex, initialRevisionResult);
     if (runtimeDecision.choice === 'rejected') {
@@ -312,7 +324,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
           ...revisionRequest.revisionObservation,
           userFeedback: runtimeDecision.userFeedback,
         },
-      });
+      }, plannerRuntimeReader);
     const requestedRevisionRequest = runtimeDecision.userFeedback === null
       ? revisionRequest
       : {
@@ -326,6 +338,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       options,
       requestedRevisionRequest,
       requestedRevision,
+      plannerRuntimeReader,
     );
     const revisionResult = withExpectedProjectName(
       revisionResolution.revisionResult,
@@ -359,6 +372,7 @@ async function resolveRevisionWithClarifications(
   options: Pick<ClosedLoopDeployOptions, 'agent' | 'requestRevisionClarification'>,
   revisionRequest: PlannerRevisionRequest,
   initialRevisionResult: RevisionResult,
+  runtimeReader: PlannerRuntimeReader,
 ): Promise<RevisionResolutionResult> {
   let revisionResult = initialRevisionResult;
   let userFeedback = revisionRequest.revisionObservation.userFeedback;
@@ -390,7 +404,7 @@ async function resolveRevisionWithClarifications(
         ...revisionRequest.revisionObservation,
         userFeedback: clarificationFeedback,
       },
-    });
+    }, runtimeReader);
   }
 
   return { status: 'resolved', revisionResult, userFeedback };

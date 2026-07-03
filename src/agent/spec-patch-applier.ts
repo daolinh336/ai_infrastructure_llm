@@ -8,7 +8,7 @@ import type {
   VerificationFinding,
 } from '../domain/types.js';
 import { expandStatefulDatabaseReplicas, getDatabaseDataVolumeTarget } from '../domain/stateful-database-volumes.js';
-import { getTrustedImageProfile, isTrustedImageReference } from '../domain/supported-images.js';
+import { getTrustedImageProfile, normalizeTrustedImageReference } from '../domain/supported-images.js';
 
 export function applySpecPatchPlan(
   spec: InfrastructureSpec,
@@ -48,7 +48,7 @@ function resolvePatchTargets(
     return { matchedServices: [], blockedReason: null };
   }
 
-  if (patch.op === 'set-service-replicas' && patch.target.targetKind === 'replica-group') {
+  if ((patch.op === 'set-service-replicas' || patch.op === 'set-service-image') && patch.target.targetKind === 'replica-group') {
     const databaseGroup = resolveStatefulDatabaseReplicaGroup(spec, patch.target, []);
     if (databaseGroup !== null) return { matchedServices: databaseGroup.services, blockedReason: null };
     return { matchedServices: [], blockedReason: `No matching replica group for selector ${formatSelector(patch.target)}. Available replica groups: ${formatReplicaGroups(spec)}. Available services: ${formatServices(spec)}. Suggested fix: target an existing service by name/kind, or first create an expanded stateful DB replica group before using targetKind="replica-group".` };
@@ -56,14 +56,15 @@ function resolvePatchTargets(
 
   const matches = resolveServiceSelector(spec, patch.target);
   if (matches.length === 0) {
-    if (patch.op === 'set-service-replicas' && resolveStatefulDatabaseReplicaGroup(spec, patch.target, []) !== null) {
-      return { matchedServices: [], blockedReason: null };
+    if (patch.op === 'set-service-replicas' || patch.op === 'set-service-image') {
+      const databaseGroup = resolveStatefulDatabaseReplicaGroup(spec, patch.target, [], { allowServiceTargetKind: patch.op === 'set-service-image' });
+      if (databaseGroup !== null) return { matchedServices: databaseGroup.services, blockedReason: null };
     }
     return { matchedServices: [], blockedReason: `No matching service for selector ${formatSelector(patch.target)}. Available services: ${formatServices(spec)}. Suggested fix: use one of the listed service names, or clarify which service should change.` };
   }
 
   if (matches.length > 1) {
-    if (patch.op === 'set-service-replicas' && resolveStatefulDatabaseReplicaGroup(spec, patch.target, matches) !== null) {
+    if ((patch.op === 'set-service-replicas' || patch.op === 'set-service-image') && resolveStatefulDatabaseReplicaGroup(spec, patch.target, matches, { allowServiceTargetKind: patch.op === 'set-service-image' }) !== null) {
       return { matchedServices: matches, blockedReason: null };
     }
     return { matchedServices: matches, blockedReason: `Ambiguous selector ${formatSelector(patch.target)} matched multiple services: ${matches.map((service) => service.name).join(', ')}. Suggested fix: choose exactly one service name.` };
@@ -121,8 +122,8 @@ function evaluatePatchPolicy(
   patch: SpecPatch,
   matchedServices: InfrastructureService[],
 ): string | null {
-  if (patch.op === 'set-service-image' && !isTrustedImageReference(patch.image)) {
-    return `Image "${patch.image}" is not in the trusted image whitelist; the current plan was left unchanged. Choose one of the supported trusted images before applying this change.`;
+  if (patch.op === 'set-service-image' && normalizeTrustedImageReference(patch.image) === null) {
+    return `Image "${patch.image}" is not in the trusted image base catalog; the current plan was left unchanged. Choose one of the supported image bases before applying this change.`;
   }
 
   if (patch.op === 'remove-service') {
@@ -211,6 +212,10 @@ function applyResolvedPatch(
     }
   }
 
+  if (patch.op === 'set-service-image' && matchedServices.length > 0) {
+    return applySetServiceImagePatch(spec, matchedServices, normalizeTrustedImageReference(patch.image) ?? patch.image);
+  }
+
   if (matchedServices.length !== 1) {
     return spec;
   }
@@ -257,7 +262,6 @@ function applyResolvedPatch(
     });
   }
 
-  let serviceVolumeSourcesBeforeImageChange: Set<string> | null = null;
   const services: InfrastructureService[] = spec.services.map((service) => {
     if (service.name !== target.name) return service;
 
@@ -282,7 +286,6 @@ function applyResolvedPatch(
       return ports.length > 0 ? { ...service, ports } : rest;
     }
     if (patch.op === 'set-service-image') {
-      serviceVolumeSourcesBeforeImageChange = new Set((service.volumes ?? []).map(mountSource));
       return rebuildServiceForTrustedImage(service, patch.image);
     }
     if (patch.op === 'set-service-env') {
@@ -326,19 +329,44 @@ function applyResolvedPatch(
       : {}),
   };
 
-  if (patch.op === 'set-service-image' && serviceVolumeSourcesBeforeImageChange !== null) {
-    return {
-      ...nextSpec,
-      volumes: unique([
-        ...spec.volumes.filter((volume) => !serviceVolumeSourcesBeforeImageChange!.has(volume)),
-        ...services.flatMap((service) => declaredNamedVolumes(service.volumes ?? [])),
-      ]),
-    };
-  }
-
   return nextSpec;
 }
 
+function applySetServiceImagePatch(
+  spec: InfrastructureSpec,
+  matchedServices: InfrastructureService[],
+  image: string,
+): InfrastructureSpec {
+  const matchedNames = new Set(matchedServices.map((service) => service.name));
+  const renamedServices = new Map<string, string>();
+  const previousVolumeSources = new Set<string>();
+  const rebuiltServices = spec.services.map((service) => {
+    if (!matchedNames.has(service.name)) return service;
+    for (const source of (service.volumes ?? []).map(mountSource)) previousVolumeSources.add(source);
+    const rebuiltService = rebuildServiceForTrustedImage(service, image);
+    if (rebuiltService.name !== service.name) renamedServices.set(service.name, rebuiltService.name);
+    return rebuiltService;
+  });
+  const services = rebuiltServices.map((service) => rewriteRenamedServiceDependencies(service, renamedServices));
+
+  return {
+    ...spec,
+    services,
+    volumes: unique([
+      ...spec.volumes.filter((volume) => !previousVolumeSources.has(volume)),
+      ...services.flatMap((service) => declaredNamedVolumes(service.volumes ?? [])),
+    ]),
+  };
+}
+
+function rewriteRenamedServiceDependencies(
+  service: InfrastructureService,
+  renamedServices: Map<string, string>,
+): InfrastructureService {
+  if (!service.dependsOn || renamedServices.size === 0) return service;
+  const dependsOn = service.dependsOn.map((dependency) => renamedServices.get(dependency) ?? dependency);
+  return { ...service, dependsOn: unique(dependsOn) };
+}
 function evaluatePatchRelevance(
   patch: SpecPatch,
   matchedServices: InfrastructureService[],
@@ -423,6 +451,7 @@ function rebuildServiceForTrustedImage(service: InfrastructureService, image: st
   const roleChanged = previousProfile?.role !== undefined && profile?.role !== undefined && previousProfile.role !== profile.role;
   const familyChanged = previousProfile?.base !== undefined && profile?.base !== undefined && previousProfile.base !== profile.base;
   const shouldResetProfileFields = roleChanged || familyChanged;
+  const nextName = getRenamedDatabaseServiceName(service.name, previousProfile?.base, profile?.base, familyChanged);
   const nextPorts = profile?.defaultPorts.length
     ? profile.defaultPorts
     : shouldResetProfileFields
@@ -435,14 +464,16 @@ function rebuildServiceForTrustedImage(service: InfrastructureService, image: st
     ? profile.defaultVolumes.map((mount) => {
         const target = mount.split(':')[1] ?? '';
         const existing = shouldResetProfileFields ? undefined : (service.volumes ?? []).find((candidate) => target && candidate.endsWith(':' + target));
-        return existing ?? mount.replace(/^data:/, `${service.name}-data:`);
+        return existing ?? mount.replace(/^data:/, `${nextName}-data:`);
       })
     : shouldResetProfileFields
       ? undefined
       : service.volumes;
 
+  const { ports: _ports, environment: _environment, volumes: _volumes, ...serviceWithoutProfileFields } = service;
   return {
-    ...service,
+    ...serviceWithoutProfileFields,
+    name: nextName,
     kind: inferServiceKind(image),
     image,
     ...(nextPorts && nextPorts.length > 0 ? { ports: nextPorts } : {}),
@@ -451,6 +482,21 @@ function rebuildServiceForTrustedImage(service: InfrastructureService, image: st
   };
 }
 
+function getRenamedDatabaseServiceName(
+  currentName: string,
+  previousBase: string | undefined,
+  nextBase: string | undefined,
+  familyChanged: boolean,
+): string {
+  if (!familyChanged || !previousBase || !nextBase) return currentName;
+  if (currentName === previousBase) return nextBase;
+  const replicaMatch = new RegExp(`^${escapeRegExp(previousBase)}-(\\d+)$`).exec(currentName);
+  return replicaMatch ? `${nextBase}-${replicaMatch[1]}` : currentName;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 function mergeImageProfileEnvironment(
   currentEnvironment: Record<string, string> | undefined,
   previousDefaults: Record<string, string>,
@@ -473,6 +519,7 @@ function resolveStatefulDatabaseReplicaGroup(
   spec: InfrastructureSpec,
   selector: ServiceSelector,
   matchedServices: InfrastructureService[],
+  options: { allowServiceTargetKind?: boolean } = {},
 ): StatefulDatabaseReplicaGroup | null {
   const groups = new Map<string, InfrastructureService[]>();
   const logicalGroups: StatefulDatabaseReplicaGroup[] = [];
@@ -495,7 +542,7 @@ function resolveStatefulDatabaseReplicaGroup(
     .map(([baseName, services]) => ({ baseName, services: sortNumberedReplicaServices(services) }))
   ]
     .filter((group) => group.services.length > 0)
-    .filter((group) => matchesReplicaGroupSelector(group, selector, matchedServices));
+    .filter((group) => matchesReplicaGroupSelector(group, selector, matchedServices, options));
 
   return candidates.length === 1 ? candidates[0]! : null;
 }
@@ -504,9 +551,10 @@ function matchesReplicaGroupSelector(
   group: StatefulDatabaseReplicaGroup,
   selector: ServiceSelector,
   matchedServices: InfrastructureService[],
+  options: { allowServiceTargetKind?: boolean } = {},
 ): boolean {
   const imageFamilies = new Set(group.services.map((service) => imageFamily(service.image)));
-  if (selector.targetKind === 'service') return false;
+  if (selector.targetKind === 'service' && options.allowServiceTargetKind !== true) return false;
   if (selector.name && selector.name !== group.baseName && !group.services.some((service) => service.name === selector.name)) return false;
   if (selector.nameLike) {
     const needle = selector.nameLike.toLowerCase();
@@ -678,3 +726,8 @@ function declaredNamedVolumes(volumeMounts: string[]): string[] {
 function unique(values: string[]): string[] {
   return [...new Set(values.filter((value) => value.length > 0))];
 }
+
+
+
+
+

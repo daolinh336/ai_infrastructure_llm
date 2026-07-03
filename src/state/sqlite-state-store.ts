@@ -5,8 +5,12 @@ import path from 'node:path';
 import Database from 'better-sqlite3';
 import {
   DomainValidationError,
+  validateExecutionPlan,
+  validateInfrastructureSpec,
   validateInfrastructureStateSnapshot,
 } from '../domain/schemas.js';
+import { namespaceInfrastructureSpec } from '../domain/project-identity.js';
+import { normalizeStatefulDatabaseReplicaVolumes } from '../domain/stateful-database-volumes.js';
 import type {
   AgentObservation,
   ApprovalResult,
@@ -111,7 +115,7 @@ export async function loadState(
       )
       .all() as StateOperationRow[];
 
-    return validateInfrastructureStateSnapshot({
+    return canonicalizeStateSnapshotForStorage({
       schemaVersion: snapshot.schema_version,
       current: parseJsonField<VerifiedRuntimeSnapshot | null>(
         snapshot.current_json,
@@ -190,7 +194,7 @@ export async function loadProjectState(
         return null;
       }
 
-      return validateInfrastructureStateSnapshot({
+      return canonicalizeStateSnapshotForStorage({
         schemaVersion: singleton.schema_version,
         current: matchesCurrent ? current : null,
         pendingPreview: matchesPendingPreview ? pendingPreview : null,
@@ -200,7 +204,7 @@ export async function loadProjectState(
       });
     }
 
-    return validateInfrastructureStateSnapshot({
+    return canonicalizeStateSnapshotForStorage({
       schemaVersion: row.schema_version,
       current: parseJsonField<VerifiedRuntimeSnapshot | null>(row.current_json, 'project_current_json'),
       pendingPreview: parseJsonField<PendingPreviewState | null>(row.pending_preview_json, 'project_pending_preview_json'),
@@ -243,7 +247,7 @@ export async function listProjectStates(
         ].join(' '))
         .all(row.project_name) as StateOperationRow[];
 
-      return validateInfrastructureStateSnapshot({
+      return canonicalizeStateSnapshotForStorage({
         schemaVersion: row.schema_version,
         current: parseJsonField<VerifiedRuntimeSnapshot | null>(row.current_json, 'project_current_json'),
         pendingPreview: parseJsonField<PendingPreviewState | null>(row.pending_preview_json, 'project_pending_preview_json'),
@@ -267,7 +271,7 @@ export async function saveState(
   stateSnapshot: InfrastructureStateSnapshot,
   options: StateStoreOptions = {},
 ): Promise<void> {
-  const validStateSnapshot = validateInfrastructureStateSnapshot(stateSnapshot);
+  const validStateSnapshot = canonicalizeStateSnapshotForStorage(stateSnapshot);
   const database = openDatabaseForWrite(options);
 
   try {
@@ -620,12 +624,14 @@ export function createPendingPreviewState(
   input: CreatePendingPreviewInput,
 ): PendingPreviewState {
   const createdAt = input.createdAt ?? new Date().toISOString();
+  const desired = canonicalizeSpecForStorage(input.plan.spec);
+  const plan = validateExecutionPlan({ ...input.plan, spec: desired });
 
   return {
     id: `pending-preview-${toStableId(createdAt)}`,
     request: input.request,
-    desired: input.plan.spec,
-    plan: input.plan,
+    desired,
+    plan,
     composeArtifact: createComposeArtifactRecord(
       input.dryRunPreview.artifactTargetPath,
       input.composeYaml,
@@ -900,6 +906,67 @@ function validatePendingPreviewForState(
   }).pendingPreview as PendingPreviewState;
 }
 
+function canonicalizeStateSnapshotForStorage(
+  stateSnapshot: unknown,
+): InfrastructureStateSnapshot {
+  const snapshot = validateInfrastructureStateSnapshot(stateSnapshot);
+  return validateInfrastructureStateSnapshot({
+    ...snapshot,
+    current: snapshot.current ? canonicalizeVerifiedSnapshotForStorage(snapshot.current) : null,
+    pendingPreview: snapshot.pendingPreview ? canonicalizePendingPreviewForStorage(snapshot.pendingPreview) : null,
+  });
+}
+
+function canonicalizeVerifiedSnapshotForStorage(
+  snapshot: VerifiedRuntimeSnapshot,
+): VerifiedRuntimeSnapshot {
+  const desired = canonicalizeSpecForStorage(snapshot.desired);
+  return {
+    ...snapshot,
+    desired,
+    ...(snapshot.resourceRefs
+      ? { resourceRefs: canonicalizeRuntimeResourceRefs(snapshot.resourceRefs, desired) }
+      : {}),
+  };
+}
+
+function canonicalizePendingPreviewForStorage(
+  pendingPreview: PendingPreviewState,
+): PendingPreviewState {
+  const desired = canonicalizeSpecForStorage(pendingPreview.desired);
+  return {
+    ...pendingPreview,
+    desired,
+    plan: validateExecutionPlan({ ...pendingPreview.plan, spec: desired }),
+    ...(pendingPreview.approvedAction !== undefined
+      ? {
+          approvedAction: pendingPreview.approvedAction
+            ? {
+                ...pendingPreview.approvedAction,
+                validatedSpec: desired,
+              }
+            : null,
+        }
+      : {}),
+  };
+}
+
+function canonicalizeSpecForStorage(spec: InfrastructureSpec): InfrastructureSpec {
+  return validateInfrastructureSpec(
+    namespaceInfrastructureSpec(normalizeStatefulDatabaseReplicaVolumes(spec)),
+  );
+}
+
+function canonicalizeRuntimeResourceRefs(
+  refs: RuntimeResourceRefs,
+  desired: InfrastructureSpec,
+): RuntimeResourceRefs {
+  return {
+    ...refs,
+    projectName: desired.projectName,
+  };
+}
+
 function parseJsonField<T>(value: string | null, label: string): T | null {
   if (value === null) {
     return null;
@@ -941,6 +1008,8 @@ function getErrorMessage(error: unknown): string {
 
   return String(error);
 }
+
+
 
 
 

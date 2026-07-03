@@ -1,4 +1,6 @@
 import { stdin as input, stdout as output } from 'node:process';
+import { mkdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Command } from 'commander';
 import chalk from 'chalk';
@@ -13,7 +15,7 @@ import { toReplicaContainerNames } from '../execution/container-names.js';
 import { clearManagedProjectState, clearManagedStateAfterDestroyAll, listProjectStates, loadProjectState, loadState, saveStateOperationRecord, saveVerifiedRuntimeSnapshot } from '../state/sqlite-state-store.js';
 import { StatusService } from '../status/status-service.js';
 import { registerPlanCommand } from './plan-command.js';
-import type { PendingPreviewState, VerifiedRuntimeSnapshot } from '../domain/types.js';
+import type { DriftReport, PendingPreviewState, RuntimeActualState, VerifiedRuntimeSnapshot } from '../domain/types.js';
 import {
   collectDestroyAllTargets,
   createDockerMcpGatewayFromEnv,
@@ -256,11 +258,10 @@ program
       try {
         await mcpClient.initialize();
         const { drift, actual } = await engine.detectRuntimeDrift(state.current, mcpClient);
-        console.log(chalk.cyan('Live drift:'));
+        const driftReportPath = await writeProjectDriftReport(project, state.current, drift, actual);
+        console.log(chalk.cyan('Live drift for project "' + project + '":'));
         console.log('- ' + drift.summary);
-        for (const finding of drift.findings) {
-          console.log('  - [' + finding.severity + '] ' + finding.message);
-        }
+        console.log('- Report file: ' + driftReportPath);
 
         if (drift.status === 'none') {
           const resourceRefs = buildResourceRefs(project, actual, state.current.desired);
@@ -577,6 +578,50 @@ function destroySnapshotFromPendingPreview(
   };
 }
 
+
+async function writeProjectDriftReport(
+  projectName: string,
+  snapshot: VerifiedRuntimeSnapshot,
+  drift: DriftReport,
+  actual: RuntimeActualState,
+): Promise<string> {
+  const reportsDir = path.resolve('state', 'reports');
+  await mkdir(reportsDir, { recursive: true });
+  const safeTimestamp = drift.checkedAt.replace(/[:.]/g, '-');
+  const reportPath = path.join(reportsDir, `${projectName}-drift-${safeTimestamp}.md`);
+  const desired = snapshot.desired;
+  const lines = [
+    `# Drift Report: ${projectName}`,
+    '',
+    `- Checked at: ${drift.checkedAt}`,
+    `- Status: ${drift.status}`,
+    `- Summary: ${drift.summary}`,
+    `- SQLite snapshot: ${snapshot.id}`,
+    '',
+    '## Desired From SQLite',
+    '',
+    `- Project: ${desired.projectName}`,
+    `- Services: ${desired.services.map((service) => `${service.name} x${service.replicas ?? 1}`).join(', ') || 'none'}`,
+    `- Networks: ${desired.networks.join(', ') || 'none'}`,
+    `- Volumes: ${desired.volumes.join(', ') || 'none'}`,
+    '',
+    '## Actual From Docker',
+    '',
+    `- Containers: ${actual.containers.map((container) => `${container.name} (${container.status ?? 'unknown'})`).join(', ') || 'none'}`,
+    `- Networks: ${actual.networks.map((network) => network.name).join(', ') || 'none'}`,
+    `- Volumes: ${actual.volumes.map((volume) => volume.name).join(', ') || 'none'}`,
+    `- Images: ${actual.images.map((image) => image.reference).join(', ') || 'none'}`,
+    '',
+    '## Findings',
+    '',
+    ...(drift.findings.length > 0
+      ? drift.findings.map((finding) => `- [${finding.severity}] ${finding.resourceType}/${finding.resourceName}: ${finding.message}`)
+      : ['- none']),
+    '',
+  ];
+  await writeFile(reportPath, lines.join('\n'), 'utf8');
+  return reportPath;
+}
 program.parseAsync(process.argv).catch((error: unknown) => {
   if (isCommanderDisplayExitError(error)) {
     return;
@@ -609,4 +654,6 @@ function getCommanderExitCode(error: unknown): number {
   }
   return 1;
 }
+
+
 

@@ -51,12 +51,14 @@ import type {
   RuntimeResourceRefs,
   VerificationReport,
   AttemptScope,
+  ProgressEvent,
+  ProgressReporter,
 } from '../domain/types.js';
 import { validateVerificationReport } from '../domain/schemas.js';
 import { buildDriftReport } from './drift-detector.js';
 import { toReplicaContainerNames } from './container-names.js';
 import { isProtectedDockerNetwork } from './protected-docker-resources.js';
-import { isTrustedImageReference } from '../domain/supported-images.js';
+import { normalizeTrustedImageReference, isSupportedImageReference } from '../domain/supported-images.js';
 
 export interface ExecutionResult {
   composeYaml: string;
@@ -94,6 +96,7 @@ export interface ExecutionEngineOptions {
   stateStore?: StateStoreOptions;
   artifactDirectory?: string;
   dockerPullRetry?: Partial<DockerPullRetryPolicy>;
+  progress?: ProgressReporter;
 }
 
 export interface DockerPullRetryPolicy {
@@ -120,6 +123,10 @@ const DEFAULT_DOCKER_PULL_RETRY_POLICY: DockerPullRetryPolicy = {
 
 export class ExecutionEngine {
   constructor(private readonly options: ExecutionEngineOptions = {}) {}
+
+  private report(phase: ProgressEvent['phase'], message: string, toolName?: string): void {
+    this.options.progress?.({ phase, message, ...(toolName ? { toolName } : {}) });
+  }
 
   async dryRun(result: AgentRunResult): Promise<ExecutionResult> {
     const validResult = validateAgentRunResult(result);
@@ -299,7 +306,7 @@ export class ExecutionEngine {
     ]);
 
     const spec = normalizeStatefulDatabaseReplicaVolumes(approvedAction.validatedSpec);
-    const unsupportedImages = spec.services.filter((service) => !isTrustedImageReference(service.image));
+    const unsupportedImages = spec.services.filter((service) => !isSupportedImageReference(service.image));
     if (unsupportedImages.length > 0) {
       throw new Error(
         'Unsupported trusted image catalog reference(s): ' +
@@ -341,6 +348,7 @@ export class ExecutionEngine {
       // All-or-nothing guard: do not mutate pre-existing stopped containers.
       // If a desired container already exists but is not running, starting it
       // would change state that was not created by this deployment attempt.
+      this.report('execution', 'Scanning existing Docker containers...');
       const existingContainers = await dockerMcpClient.listContainers(true);
       const desiredContainerNames = new Set(
         spec.services.flatMap((service) => toReplicaContainerNames(spec.projectName, service)),
@@ -366,32 +374,41 @@ export class ExecutionEngine {
       }
 
       // Step 1: Create networks
+      this.report('execution', 'Scanning existing Docker networks...');
       const existingNetworks = await dockerMcpClient.listNetworks();
       for (const network of spec.networks) {
         if (existingNetworks.some((existing) => existing.name === network)) {
+          this.report('execution', 'Network "' + network + '" already exists; reusing.', 'createNetwork');
           networksCreated.push(network);
           continue;
         }
+        this.report('execution', 'Creating network "' + network + '"...', 'createNetwork');
         await dockerMcpClient.createNetwork(network, labels);
         createdNetworks.push(network);
         networksCreated.push(network);
       }
 
       // Step 2: Create volumes
+      this.report('execution', 'Scanning existing Docker volumes...');
       const existingVolumes = await dockerMcpClient.listVolumes();
       for (const volume of spec.volumes) {
         if (existingVolumes.some((existing) => existing.name === volume)) {
+          this.report('execution', 'Volume "' + volume + '" already exists; reusing.', 'createVolume');
           continue;
         }
+        this.report('execution', 'Creating volume "' + volume + '"...', 'createVolume');
         await dockerMcpClient.createVolume(volume, labels);
         createdVolumes.push(volume);
       }
 
       // Step 3: Pull images
-      const uniqueImages = [...new Set(spec.services.map((s) => s.image))];
+      const uniqueImages = [...new Set(spec.services.map((service) => normalizeTrustedImageReference(service.image) ?? service.image))];
+      this.report('execution', 'Images to pull: ' + (uniqueImages.length ? uniqueImages.join(', ') : 'none'));
       for (const image of uniqueImages) {
+        this.report('execution', 'Pulling image "' + image + '"...', 'pullImage');
         await this.pullImageWithRetry(dockerMcpClient, image);
         imagesPulled.push(image);
+        this.report('execution', 'Pulled image "' + image + '".', 'pullImage');
       }
 
       // Step 4: Create and start containers in dependency order
@@ -401,11 +418,12 @@ export class ExecutionEngine {
         const service = spec.services.find((s) => s.name === step.resourceName);
         if (!service) continue;
 
-        const command = getRuntimeKeepaliveCommand(service.image);
+        const serviceImage = normalizeTrustedImageReference(service.image) ?? service.image;
+        const command = getRuntimeKeepaliveCommand(serviceImage);
         for (const [replicaIndex, containerName] of toReplicaContainerNames(spec.projectName, service).entries()) {
           const containerSpec: import('../domain/types.js').ContainerCreateSpec = {
             name: containerName,
-            image: service.image,
+            image: serviceImage,
             ...(command ? { command } : {}),
             ports: service.ports,
             environment: service.environment,
@@ -418,15 +436,19 @@ export class ExecutionEngine {
             (container) => container.name === containerSpec.name,
           );
           if (existingContainer) {
+            this.report('execution', 'Container "' + containerSpec.name + '" already exists; keeping current runtime.', 'createContainer');
             containersStarted.push({ name: containerSpec.name, id: containerSpec.name });
             continue;
           }
 
           attemptedContainers.push(containerSpec.name);
+          this.report('execution', 'Creating container "' + containerSpec.name + '" from ' + containerSpec.image + '...', 'createContainer');
           const containerId = await dockerMcpClient.createContainer(containerSpec);
           createdContainers.push(containerSpec.name);
+          this.report('execution', 'Starting container "' + containerSpec.name + '"...', 'startContainer');
           await dockerMcpClient.startContainer(containerSpec.name);
           containersStarted.push({ name: containerSpec.name, id: containerId });
+          this.report('execution', 'Container "' + containerSpec.name + '" is started.', 'startContainer');
         }
       }
     } catch (error) {
@@ -803,6 +825,9 @@ export class ExecutionEngine {
 
     for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
       try {
+        if (policy.maxAttempts > 1) {
+          this.report('execution', 'Pull attempt ' + String(attempt) + '/' + String(policy.maxAttempts) + ' for image "' + image + '"...', 'pullImage');
+        }
         await mcpClient.pullImage(image);
         return;
       } catch (error) {
@@ -814,7 +839,9 @@ export class ExecutionEngine {
           throw new Error(buildDockerPullFailureMessage(image, failures));
         }
 
-        await sleep(getDockerPullRetryDelayMs(policy, attempt));
+        const delayMs = getDockerPullRetryDelayMs(policy, attempt);
+        this.report('execution', 'Pull failed for image "' + image + '"; retrying in ' + String(delayMs) + 'ms: ' + message, 'pullImage');
+        await sleep(delayMs);
       }
     }
   }

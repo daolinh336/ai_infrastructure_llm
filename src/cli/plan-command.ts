@@ -1,6 +1,12 @@
+import {
+  diffAdjustScope,
+  validateAdjustReplicas,
+  detectSupportedAdjustChanges,
+  detectAdjustPortConflicts,
+} from './adjust-policy.js';
 import type { Command } from 'commander';
 import chalk from 'chalk';
-import type { AgentRunResult, InfrastructureSpec } from '../domain/types.js';
+import type { AgentRunResult, ApprovedAction, InfrastructureSpec, VerifiedRuntimeSnapshot, VerificationReport } from '../domain/types.js';
 import { ReActAgent } from '../agent/react-agent.js';
 import {
   ClosedLoopGuard,
@@ -17,6 +23,7 @@ import {
 } from '../execution/execution-engine.js';
 
 import { runClosedLoopDeploy } from './deploy-loop.js';
+import { buildResourceRefs } from '../agent/standard-verifier-agent.js';
 import { createProvider } from '../llm/provider.js';
 import {
   getStateDatabasePath,
@@ -25,11 +32,12 @@ import {
   projectExists,
   saveVerifiedRuntimeSnapshot,
 } from '../state/sqlite-state-store.js';
-import { StaticGateway } from '../static-gateway/static-gateway.js';
+import { StaticGateway, type StaticGatewayResult } from '../static-gateway/static-gateway.js';
 import { normalizeProjectName } from '../domain/project-identity.js';
 import {
   createDockerMcpGatewayFromEnv,
   createProgressFileLogger,
+  createProgressPrinter,
   getErrorMessage,
   loadDockerPullRetryPolicyFromEnv,
   printDetailedDryRunPreview,
@@ -42,6 +50,7 @@ import {
   requestRevisionClarification,
   requestRuntimeApproval,
 } from './shared.js';
+import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 
 export function registerPlanCommand(program: Command): void {
   program
@@ -84,7 +93,14 @@ export function registerPlanCommand(program: Command): void {
     )
     .action(async (prompt, options) => {
       const traceLogPath = `${process.cwd()}\\agent-trace.log`;
-      const reportProgress = createProgressFileLogger(traceLogPath);
+      const reportProgressToFile = createProgressFileLogger(traceLogPath);
+      const printProgress = createProgressPrinter();
+      const reportProgress: ReturnType<typeof createProgressFileLogger> = (event) => {
+        reportProgressToFile(event);
+        if (event.phase === 'execution' || event.phase === 'observe') {
+          printProgress(event);
+        }
+      };
       console.log(chalk.cyan(`Agent trace log: ${traceLogPath}`));
       const saveStateRequested = Boolean(options.saveState);
       const deployRequested = Boolean(options.deploy);
@@ -160,15 +176,48 @@ export function registerPlanCommand(program: Command): void {
         phase: 'gate',
         message: 'acting... run pre-ReAct LLM gate and validators.',
       });
-      const staticValidationPrompt = adjustRequested
-        ? [
-            `Adjust existing infrastructure project "${requestedProjectName}".`,
-            'Use this saved project state as context for validating the adjustment request.',
-            JSON.stringify(adjustCurrentSnapshot?.desired, null, 2),
-            `User adjustment request: ${input.prompt}`,
-          ].join('\n')
-        : input.prompt;
-      const gatewayResult = await gateway.validate(staticValidationPrompt);
+      const gatewayResult: StaticGatewayResult = adjustRequested
+        ? {
+            status: 'validated',
+            validatedQuery: validateValidatedQuery({
+              raw: input.prompt,
+              normalizedPrompt: input.prompt,
+              intent: 'update',
+              draft: {
+                raw: input.prompt,
+                normalizedPrompt: input.prompt,
+                intent: 'update',
+                projectName: requestedProjectName,
+                services: [],
+                destructive: false,
+                missingInformation: [],
+              },
+              riskFlags: [],
+              securityFindings: [],
+              resourceEstimate: {
+                totalContainers: 0,
+                maxCpu: null,
+                maxMemoryGb: null,
+              },
+              clarificationRequired: false,
+              clarificationQuestion: null,
+            }),
+            issues: [],
+            metrics: {
+              intentAccepted: 1,
+              intentRejected: 0,
+              unsafeRejected: 0,
+              clarificationRequired: 0,
+              schemaValidationPassed: 1,
+              schemaValidationFailed: 0,
+              securityBlocked: 0,
+              resourceLimitBlocked: 0,
+              imageWhitelistBlocked: 0,
+              runtimeCallsDuringStaticValidation: 0,
+              reactInvocationsAfterStaticValidationFailure: 0,
+            },
+          }
+        : await gateway.validate(input.prompt);
 
       console.log(chalk.cyan('Static validation:'));
 
@@ -211,6 +260,7 @@ export function registerPlanCommand(program: Command): void {
       );
       const engine = new ExecutionEngine({
         dockerPullRetry: loadDockerPullRetryPolicyFromEnv(),
+        progress: reportProgress,
       });
       let result: AgentRunResult;
       if (adjustRequested && requestedProjectName) {
@@ -261,6 +311,66 @@ export function registerPlanCommand(program: Command): void {
           ...revisionResult.revisedSpec,
           projectName: requestedProjectName,
         });
+
+        const supportedAdjustChanges = detectSupportedAdjustChanges(revisedSpec, currentSnapshot.desired);
+        if (supportedAdjustChanges.length === 0) {
+          console.error(chalk.red('CLI failed.'));
+          console.error(chalk.yellow('T\u00ednh n\u0103ng \u0111ang ph\u00e1t tri\u1ec3n.'));
+          console.error(chalk.yellow('--adjust hi\u1ec7n ch\u1ec9 h\u1ed7 tr\u1ee3 \u0111\u1ed5i port ho\u1eb7c t\u0103ng/gi\u1ea3m replicas cho backend/database.'));
+          process.exitCode = 1;
+          return;
+        }
+
+        const adjustScopeViolations = diffAdjustScope(revisedSpec, currentSnapshot.desired);
+        if (adjustScopeViolations.length > 0) {
+          console.error(chalk.red('CLI failed.'));
+          console.error(chalk.yellow('T\u00ednh n\u0103ng \u0111ang ph\u00e1t tri\u1ec3n.'));
+          console.error(chalk.yellow('--adjust hi\u1ec7n ch\u1ec9 h\u1ed7 tr\u1ee3 \u0111\u1ed5i port ho\u1eb7c t\u0103ng/gi\u1ea3m replicas cho backend/database.'));
+          for (const violation of adjustScopeViolations) {
+            console.error(chalk.gray(`- ${violation.message}`));
+          }
+          process.exitCode = 1;
+          return;
+        }
+
+        const adjustReplicaViolations = validateAdjustReplicas(revisedSpec, currentSnapshot.desired);
+        if (adjustReplicaViolations.length > 0) {
+          console.error(chalk.red('CLI failed.'));
+          console.error(chalk.yellow('T\u00ednh n\u0103ng \u0111ang ph\u00e1t tri\u1ec3n.'));
+          for (const violation of adjustReplicaViolations) {
+            console.error(chalk.red(`- ${violation.serviceName}: ${violation.message}`));
+          }
+          process.exitCode = 1;
+          return;
+        }
+
+        const adjustPortMcpClient = createDockerMcpGatewayFromEnv();
+        try {
+          await adjustPortMcpClient.initialize();
+          const usedHostPorts = await adjustPortMcpClient.listUsedHostPorts();
+          const adjustPortConflicts = detectAdjustPortConflicts(
+            revisedSpec,
+            usedHostPorts,
+            requestedProjectName,
+          );
+          if (adjustPortConflicts.length > 0 && !deployRequested) {
+            console.error(chalk.red('CLI failed.'));
+            console.error(chalk.red('Adjust port guard rejected the requested change: not ok.'));
+            for (const conflict of adjustPortConflicts) {
+              console.error(chalk.red(`- ${conflict.message}`));
+            }
+            process.exitCode = 1;
+            return;
+          }
+          if (adjustPortConflicts.length > 0 && deployRequested) {
+            console.log(chalk.yellow('Adjust port guard found conflict(s); deploy verifier loop will ask y/n/other.'));
+            for (const conflict of adjustPortConflicts) {
+              console.log(chalk.yellow(`- ${conflict.message}`));
+            }
+          }
+        } finally {
+          await adjustPortMcpClient.shutdown();
+        }
         result = {
           status: 'planned',
           request: {
@@ -284,7 +394,20 @@ export function registerPlanCommand(program: Command): void {
             { source: 'observe:user_feedback', message: adjustFeedback },
             { source: 'observe:planner_revision', message: revisionResult.revisionSummary },
           ],
-          trace: [],
+          trace: [
+            {
+              id: 'adjust-reason',
+              phase: 'reason',
+              message: 'Adjust request: ' + input.prompt,
+              toolName: 'reviseFromFeedback',
+            },
+            {
+              id: 'adjust-observe',
+              phase: 'observe',
+              message: revisionResult.revisionSummary,
+              toolName: null,
+            },
+          ],
         };
       } else {
         const validatedQuery = requestedProjectName
@@ -616,6 +739,21 @@ export function registerPlanCommand(program: Command): void {
             console.log(
               `- missing operations: ${capabilityReport?.missingOperations.join(', ') || 'none'}`,
             );
+            const adjustRollbackSnapshot = adjustRequested ? adjustCurrentSnapshot : null;
+            if (adjustRollbackSnapshot) {
+              console.log(chalk.cyan('Adjust deploy: destroying previous runtime before applying revised compose...'));
+              const destroyResult = await engine.destroyWithDocker(adjustRollbackSnapshot, mcpClient, {
+                projectName: adjustRollbackSnapshot.desired.projectName,
+                removeVolumes: false,
+              });
+              if (destroyResult.verificationReport.status !== 'passed') {
+                throw new Error(
+                  'Adjust deploy could not fully destroy previous runtime before apply: ' +
+                    destroyResult.verificationReport.issues.join('; '),
+                );
+              }
+              console.log(chalk.green('Previous runtime destroyed; applying adjusted runtime.'));
+            }
             const deployLoopResult = await runClosedLoopDeploy({
               agent,
               engine,
@@ -627,6 +765,7 @@ export function registerPlanCommand(program: Command): void {
               requestRevisionClarification,
               saveVerifiedRuntimeSnapshot,
               log: (message) => console.log(chalk.cyan(message)),
+              progress: reportProgress,
             });
 
             if (deployLoopResult.status === 'passed') {
@@ -635,6 +774,13 @@ export function registerPlanCommand(program: Command): void {
                   'Saved verified runtime state to SQLite after deploy.',
                 ),
               );
+              if (adjustRollbackSnapshot) {
+                await cleanupRemovedAdjustVolumesAndRefreshState(
+                  mcpClient,
+                  adjustRollbackSnapshot,
+                  deployLoopResult.currentApprovedAction,
+                );
+              }
               if (deployLoopResult.successfulDeployResult) {
                 printDockerDeploySummary(
                   deployLoopResult.currentApprovedAction.validatedSpec,
@@ -644,13 +790,19 @@ export function registerPlanCommand(program: Command): void {
                 );
               }
             } else {
-              await discardManagedProjectState(deployLoopResult.currentApprovedAction.validatedSpec.projectName);
               console.log(
                 chalk.red(
                   `Closed-loop deploy ended with status: ${deployLoopResult.status}`,
                 ),
               );
-              console.log(chalk.yellow('All deployment state for this project was discarded.'));
+              if (adjustRollbackSnapshot) {
+                console.log(chalk.yellow('Adjusted deployment failed; rolling back previous verified runtime...'));
+                await rollbackAdjustToSnapshot(engine, adjustRollbackSnapshot, mcpClient);
+                console.log(chalk.green('Rollback completed; previous verified runtime restored.'));
+              } else {
+                await discardManagedProjectState(deployLoopResult.currentApprovedAction.validatedSpec.projectName);
+                console.log(chalk.yellow('All deployment state for this project was discarded.'));
+              }
               const lastRevision = deployLoopResult.revisionHistory.at(-1);
               if (lastRevision) {
                 console.log(chalk.red('Failure details:'));
@@ -685,12 +837,22 @@ export function registerPlanCommand(program: Command): void {
               return;
             }
           } catch (error) {
-            if (deployResult.approvedAction) {
-              await discardManagedProjectState(deployResult.approvedAction.validatedSpec.projectName);
-            }
             console.log(chalk.red('Docker deploy failed:'));
             console.log(`- ${getErrorMessage(error)}`);
-            console.log(chalk.yellow('All deployment state for this project was discarded.'));
+            const adjustRollbackSnapshot = adjustRequested ? adjustCurrentSnapshot : null;
+            if (adjustRollbackSnapshot) {
+              try {
+                console.log(chalk.yellow('Adjusted deployment failed; rolling back previous verified runtime...'));
+                await rollbackAdjustToSnapshot(engine, adjustRollbackSnapshot, mcpClient);
+                console.log(chalk.green('Rollback completed; previous verified runtime restored.'));
+              } catch (rollbackError) {
+                console.log(chalk.red('Rollback failed:'));
+                console.log(`- ${getErrorMessage(rollbackError)}`);
+              }
+            } else if (deployResult.approvedAction) {
+              await discardManagedProjectState(deployResult.approvedAction.validatedSpec.projectName);
+              console.log(chalk.yellow('All deployment state for this project was discarded.'));
+            }
             process.exitCode = 1;
             return;
           } finally {
@@ -719,6 +881,135 @@ export function registerPlanCommand(program: Command): void {
             ),
       );
     });
+}
+
+
+
+async function cleanupRemovedAdjustVolumesAndRefreshState(
+  mcpClient: DockerMcpGateway,
+  previousSnapshot: VerifiedRuntimeSnapshot,
+  approvedAction: ApprovedAction,
+): Promise<void> {
+  const previousVolumes = new Set(previousSnapshot.desired.volumes);
+  const nextVolumes = new Set(approvedAction.validatedSpec.volumes);
+  const removedVolumes = [...previousVolumes].filter((volume) => !nextVolumes.has(volume));
+
+  if (removedVolumes.length > 0) {
+    console.log(chalk.cyan('Adjust deploy: removing volumes no longer declared in desired state...'));
+    mcpClient.setAllowMutations(true);
+    try {
+      for (const volume of removedVolumes) {
+        await mcpClient.removeVolume(volume);
+        console.log(chalk.gray(`- removed volume: ${volume}`));
+      }
+    } finally {
+      mcpClient.setAllowMutations(false);
+    }
+  }
+
+  const actual = await mcpClient.observeActualState();
+  const verificationReport: VerificationReport = {
+    status: 'passed',
+    scope: 'tool-runtime',
+    checkedAt: new Date().toISOString(),
+    issues: [],
+    findings: [],
+    evidence: removedVolumes.length > 0
+      ? ['Adjusted runtime deployed and volumes removed from desired state were deleted.']
+      : ['Adjusted runtime deployed; no volumes needed removal.'],
+    errorReason: null,
+    revisionHint: null,
+    confidence: 0.95,
+  };
+
+  await saveVerifiedRuntimeSnapshot({
+    approvedAction,
+    actual,
+    verificationReport,
+    operation: 'deploy',
+    resourceRefs: buildResourceRefs(approvedAction.validatedSpec.projectName, actual, approvedAction.validatedSpec),
+  });
+}
+
+async function rollbackAdjustToSnapshot(
+  engine: ExecutionEngine,
+  snapshot: VerifiedRuntimeSnapshot,
+  mcpClient: DockerMcpGateway,
+): Promise<void> {
+  const rollbackResult = buildPlannedResultFromSnapshot(snapshot, 'Rollback to previous verified snapshot after failed adjust deploy.');
+  const rollbackPreparation = await engine.prepareDeploy(rollbackResult);
+  if (!rollbackPreparation.approvalRequest) {
+    throw new Error('Rollback preparation failed preflight; previous verified snapshot could not be redeployed.');
+  }
+  const respondedAt = new Date().toISOString();
+  const rollbackExecution = await engine.completeDeploy(rollbackPreparation, {
+    id: `rollback-${Date.now()}`,
+    requestId: rollbackPreparation.approvalRequest.id,
+    decision: 'approved',
+    respondedAt,
+    approvedBy: 'cli-user',
+    reason: 'system rollback after failed adjust deploy',
+  });
+  if (!rollbackExecution.approvedAction) {
+    throw new Error('Rollback ApprovedAction was not created.');
+  }
+
+  await engine.destroyWithDocker(null, mcpClient, {
+    projectName: snapshot.desired.projectName,
+    removeVolumes: false,
+  });
+  await engine.deployWithDocker(rollbackExecution.approvedAction, mcpClient);
+  const actual = await mcpClient.observeActualState();
+  const verificationReport: VerificationReport = {
+    status: 'passed',
+    scope: 'tool-runtime',
+    checkedAt: new Date().toISOString(),
+    issues: [],
+    findings: [],
+    evidence: ['Rollback redeployed previous verified snapshot after failed adjust deploy.'],
+    errorReason: null,
+    revisionHint: null,
+    confidence: 0.95,
+  };
+  await saveVerifiedRuntimeSnapshot({
+    sourceSnapshot: snapshot,
+    actual,
+    verificationReport,
+    operation: 'deploy',
+    resourceRefs: buildResourceRefs(snapshot.desired.projectName, actual, snapshot.desired),
+  });
+}
+
+function buildPlannedResultFromSnapshot(
+  snapshot: VerifiedRuntimeSnapshot,
+  summary: string,
+): AgentRunResult {
+  return {
+    status: 'planned',
+    request: snapshot.request,
+    plan: {
+      summary,
+      spec: snapshot.desired,
+      assumptions: ['Using previous verified snapshot as rollback source of truth.'],
+      steps: [
+        { id: 'generate-compose', description: 'Regenerate compose from previous verified spec.', action: 'generate-compose' },
+        { id: 'write-state', description: 'Persist rollback desired-state snapshot.', action: 'write-state', dependsOn: ['generate-compose'] },
+        { id: 'deploy-compose', description: 'Redeploy previous verified runtime.', action: 'deploy-compose', dependsOn: ['write-state'] },
+        { id: 'inspect-drift', description: 'Inspect runtime after rollback.', action: 'inspect-drift', dependsOn: ['deploy-compose'] },
+      ],
+    },
+    observations: [
+      { source: 'observe:state', message: 'Loaded previous verified snapshot for rollback.' },
+    ],
+    trace: [
+      {
+        id: 'rollback-reason',
+        phase: 'reason',
+        message: 'Rollback to previous verified snapshot after failed adjust deploy.',
+        toolName: null,
+      },
+    ],
+  };
 }
 
 function printDockerDeploySummary(

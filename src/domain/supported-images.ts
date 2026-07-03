@@ -227,6 +227,12 @@ export function isTrustedImageReference(reference: string): boolean {
   const tag = parsed.suffix.startsWith(':') ? parsed.suffix.slice(1) : parsed.suffix;
   return tag.length > 0 && profile.versions.includes(tag);
 }
+
+export function normalizeTrustedImageReference(reference: string): string | null {
+  const profile = getTrustedImageProfileByBase(splitImageReference(reference).base);
+  return profile === null ? null : (isTrustedImageReference(reference) ? reference : profile.image);
+}
+
 export function getTrustedImageProfile(reference: string): TrustedImageProfile | null {
   return isTrustedImageReference(reference) ? getTrustedImageProfileByBase(splitImageReference(reference).base) : null;
 }
