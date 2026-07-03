@@ -2,7 +2,6 @@ import {
   diffAdjustScope,
   validateAdjustReplicas,
   detectSupportedAdjustChanges,
-  detectAdjustPortConflicts,
 } from './adjust-policy.js';
 import type { Command } from 'commander';
 import chalk from 'chalk';
@@ -29,7 +28,6 @@ import {
   getStateDatabasePath,
   discardManagedProjectState,
   loadProjectState,
-  projectExists,
   saveVerifiedRuntimeSnapshot,
 } from '../state/sqlite-state-store.js';
 import { StaticGateway, type StaticGatewayResult } from '../static-gateway/static-gateway.js';
@@ -51,6 +49,7 @@ import {
   requestRuntimeApproval,
 } from './shared.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
+import { toReplicaContainerNames } from '../execution/container-names.js';
 
 export function registerPlanCommand(program: Command): void {
   program
@@ -68,11 +67,6 @@ export function registerPlanCommand(program: Command): void {
       true,
     )
     .option(
-      '--save-state',
-      'Persist the desired state snapshot without deploying Docker',
-      false,
-    )
-    .option(
       '--deploy',
       'After approval, write compose artifact and deploy to Docker via MCP',
       false,
@@ -83,7 +77,7 @@ export function registerPlanCommand(program: Command): void {
     )
     .option(
       '--adjust',
-      'Adjust an existing project plan instead of creating a new one',
+      'Adjust an existing deployed project; asks yes/no/other and deploys on approval',
       false,
     )
     .option(
@@ -102,17 +96,14 @@ export function registerPlanCommand(program: Command): void {
         }
       };
       console.log(chalk.cyan(`Agent trace log: ${traceLogPath}`));
-      const saveStateRequested = Boolean(options.saveState);
       const deployRequested = Boolean(options.deploy);
+      const adjustRequested = Boolean(options.adjust);
+      const applyRequested = deployRequested || adjustRequested;
       const input = cliInputSchema.parse({
         prompt,
-        dryRun:
-          deployRequested || saveStateRequested
-            ? false
-            : (options.dryRun ?? true),
+        dryRun: applyRequested ? false : true,
         provider: options.provider,
       });
-      const adjustRequested = Boolean(options.adjust);
       const requestedProjectName = options.prjName ? normalizeProjectName(String(options.prjName)) : null;
       if (!requestedProjectName) {
         console.error(chalk.red('CLI failed.'));
@@ -126,11 +117,18 @@ export function registerPlanCommand(program: Command): void {
         process.exitCode = 1;
         return;
       }
+      if (adjustRequested && deployRequested) {
+        console.error(chalk.red('CLI failed.'));
+        console.error('--adjust already runs approval + deploy. Remove --deploy and use the single adjust command.');
+        process.exitCode = 1;
+        return;
+      }
       if (requestedProjectName) {
-        const exists = await projectExists(requestedProjectName);
+        const existingProjectState = await loadProjectState(requestedProjectName);
+        const exists = existingProjectState?.current !== null && existingProjectState?.current !== undefined;
         if (adjustRequested && !exists) {
           console.error(chalk.red('CLI failed.'));
-          console.error(`Project "${requestedProjectName}" does not exist. Create a new project by removing --adjust.`);
+          console.error(`Project "${requestedProjectName}" does not have a verified deployment. Deploy the project before using --adjust.`);
           process.exitCode = 1;
           return;
         }
@@ -301,7 +299,7 @@ export function registerPlanCommand(program: Command): void {
           desiredSpec: currentSnapshot.desired,
           revisionObservation: {
             verificationReport: null,
-            userFeedback: { message: adjustFeedback, submittedAt: new Date().toISOString() },
+            userFeedback: { message: input.prompt, submittedAt: new Date().toISOString() },
             driftSummary: null,
           },
           stateSnapshot: projectState,
@@ -316,7 +314,7 @@ export function registerPlanCommand(program: Command): void {
         if (supportedAdjustChanges.length === 0) {
           console.error(chalk.red('CLI failed.'));
           console.error(chalk.yellow('T\u00ednh n\u0103ng \u0111ang ph\u00e1t tri\u1ec3n.'));
-          console.error(chalk.yellow('--adjust hi\u1ec7n ch\u1ec9 h\u1ed7 tr\u1ee3 \u0111\u1ed5i port ho\u1eb7c t\u0103ng/gi\u1ea3m replicas cho backend/database.'));
+          console.error(chalk.yellow('--adjust hiện chỉ hỗ trợ tăng/giảm replicas cho backend/database. Đổi port chưa được hỗ trợ.'));
           process.exitCode = 1;
           return;
         }
@@ -325,7 +323,7 @@ export function registerPlanCommand(program: Command): void {
         if (adjustScopeViolations.length > 0) {
           console.error(chalk.red('CLI failed.'));
           console.error(chalk.yellow('T\u00ednh n\u0103ng \u0111ang ph\u00e1t tri\u1ec3n.'));
-          console.error(chalk.yellow('--adjust hi\u1ec7n ch\u1ec9 h\u1ed7 tr\u1ee3 \u0111\u1ed5i port ho\u1eb7c t\u0103ng/gi\u1ea3m replicas cho backend/database.'));
+          console.error(chalk.yellow('--adjust hiện chỉ hỗ trợ tăng/giảm replicas cho backend/database. Đổi port chưa được hỗ trợ.'));
           for (const violation of adjustScopeViolations) {
             console.error(chalk.gray(`- ${violation.message}`));
           }
@@ -344,33 +342,6 @@ export function registerPlanCommand(program: Command): void {
           return;
         }
 
-        const adjustPortMcpClient = createDockerMcpGatewayFromEnv();
-        try {
-          await adjustPortMcpClient.initialize();
-          const usedHostPorts = await adjustPortMcpClient.listUsedHostPorts();
-          const adjustPortConflicts = detectAdjustPortConflicts(
-            revisedSpec,
-            usedHostPorts,
-            requestedProjectName,
-          );
-          if (adjustPortConflicts.length > 0 && !deployRequested) {
-            console.error(chalk.red('CLI failed.'));
-            console.error(chalk.red('Adjust port guard rejected the requested change: not ok.'));
-            for (const conflict of adjustPortConflicts) {
-              console.error(chalk.red(`- ${conflict.message}`));
-            }
-            process.exitCode = 1;
-            return;
-          }
-          if (adjustPortConflicts.length > 0 && deployRequested) {
-            console.log(chalk.yellow('Adjust port guard found conflict(s); deploy verifier loop will ask y/n/other.'));
-            for (const conflict of adjustPortConflicts) {
-              console.log(chalk.yellow(`- ${conflict.message}`));
-            }
-          }
-        } finally {
-          await adjustPortMcpClient.shutdown();
-        }
         result = {
           status: 'planned',
           request: {
@@ -493,24 +464,18 @@ export function registerPlanCommand(program: Command): void {
 
       reportProgress({
         phase: 'execution',
-        message: deployRequested
+        message: applyRequested
           ? 'acting... render dry-run output and run deploy preflight.'
-          : input.dryRun
-            ? 'acting... render dry-run output and compose preview.'
-            : 'acting... persist pending preview memory without Docker deployment.',
+          : 'acting... render dry-run output and compose preview.',
       });
-      const execution = deployRequested
+      const execution = applyRequested
         ? await engine.prepareDeploy(result)
-        : input.dryRun
-          ? await engine.dryRun(result)
-          : await engine.savePendingPreview(result);
+        : await engine.dryRun(result);
       reportProgress({
         phase: 'execution',
-        message: deployRequested
+        message: applyRequested
           ? 'observe... deploy preflight prepared; no Docker deployment executed.'
-          : input.dryRun
-            ? 'observe... dry-run completed without state mutation.'
-            : 'observe... pending preview saved; no Docker deployment executed.',
+          : 'observe... dry-run completed without state mutation.',
       });
 
       console.log(chalk.cyan('Summary:'));
@@ -532,7 +497,7 @@ export function registerPlanCommand(program: Command): void {
       }
       console.log();
 
-      if (input.dryRun || deployRequested) {
+      if (input.dryRun || applyRequested) {
         printDetailedDryRunPreview(
           execution.dryRunPreview,
           execution.secretResolution,
@@ -541,7 +506,7 @@ export function registerPlanCommand(program: Command): void {
 
       console.log(
         chalk.cyan(
-          deployRequested
+          applyRequested
             ? 'docker-compose.yaml preview:'
             : 'Generated docker-compose.yaml:',
         ),
@@ -568,7 +533,7 @@ export function registerPlanCommand(program: Command): void {
         console.log();
       }
 
-      if (deployRequested) {
+      if (applyRequested) {
         let currentResult = result;
         let deployPreparation = execution as DeployPreparationResult;
         printPreflightReport(deployPreparation.preflight);
@@ -872,13 +837,7 @@ export function registerPlanCommand(program: Command): void {
       console.log();
 
       console.log(
-        input.dryRun
-          ? chalk.yellow(
-              'Dry run only. No state saved and no Docker deployment executed.',
-            )
-          : chalk.green(
-              'Pending preview saved. No Docker deployment executed.',
-            ),
+        chalk.yellow('Dry run only. No state saved and no Docker deployment executed.'),
       );
     });
 }
@@ -907,7 +866,10 @@ async function cleanupRemovedAdjustVolumesAndRefreshState(
     }
   }
 
-  const actual = await mcpClient.observeActualState();
+  const containerNames = approvedAction.validatedSpec.services.flatMap((service) =>
+    toReplicaContainerNames(approvedAction.validatedSpec.projectName, service),
+  );
+  const actual = await mcpClient.observeActualStateWithInspect({ containerNames });
   const verificationReport: VerificationReport = {
     status: 'passed',
     scope: 'tool-runtime',
@@ -959,7 +921,10 @@ async function rollbackAdjustToSnapshot(
     removeVolumes: false,
   });
   await engine.deployWithDocker(rollbackExecution.approvedAction, mcpClient);
-  const actual = await mcpClient.observeActualState();
+  const containerNames = snapshot.desired.services.flatMap((service) =>
+    toReplicaContainerNames(snapshot.desired.projectName, service),
+  );
+  const actual = await mcpClient.observeActualStateWithInspect({ containerNames });
   const verificationReport: VerificationReport = {
     status: 'passed',
     scope: 'tool-runtime',

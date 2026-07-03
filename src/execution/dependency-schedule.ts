@@ -7,7 +7,6 @@ import {
 } from '../domain/schemas.js';
 import type {
   DependencyAwareExecutionSchedule,
-  DependencyGraphEntry,
   DetailedDryRunPreview,
   DryRunPolicyFinding,
   ExecutionPlan,
@@ -15,6 +14,7 @@ import type {
   InfrastructureService,
   InfrastructureSpec,
 } from '../domain/types.js';
+import { buildServiceDependencyGraph } from '../domain/topology-graph.js';
 
 import { getImageReferenceBase } from '../domain/supported-images.js';
 import { normalizeStatefulDatabaseReplicaVolumes } from '../domain/stateful-database-volumes.js';
@@ -34,8 +34,9 @@ export function buildDependencyAwareExecutionSchedule(
   const validSpec = normalizeStatefulDatabaseReplicaVolumes(
     validateInfrastructureSpec(spec),
   );
-  const dependents = buildDependentsMap(validSpec.services);
-  const serviceStartOrder = orderServicesByDependency(validSpec.services, dependents);
+  const graph = buildServiceDependencyGraph(validSpec.services);
+  const dependents = graph.dependents;
+  const serviceStartOrder = graph.serviceStartOrder;
   const steps: ExecutionScheduleStep[] = [];
   let order = 1;
 
@@ -123,7 +124,7 @@ export function buildDependencyAwareExecutionSchedule(
   return validateDependencyAwareExecutionSchedule({
     projectName: validSpec.projectName,
     steps,
-    dependencyGraph: buildDependencyGraph(validSpec.services, dependents),
+    dependencyGraph: graph.dependencyGraph,
     serviceStartOrder,
     destroyOrder: [...serviceStartOrder].reverse(),
     warnings: buildScheduleWarnings(validSpec.services, serviceStartOrder),
@@ -357,79 +358,6 @@ function getRepairedSecret(
   );
 }
 
-function orderServicesByDependency(
-  services: InfrastructureService[],
-  dependents: Map<string, string[]>,
-): string[] {
-  const originalOrder = new Map(services.map((service, index) => [service.name, index]));
-  const inDegree = new Map(
-    services.map((service) => [service.name, service.dependsOn?.length ?? 0]),
-  );
-  const queue = services
-    .filter((service) => (inDegree.get(service.name) ?? 0) === 0)
-    .map((service) => service.name);
-  const ordered: string[] = [];
-
-  sortServiceNamesByOriginalOrder(queue, originalOrder);
-
-  while (queue.length) {
-    const serviceName = queue.shift();
-    if (!serviceName) {
-      break;
-    }
-
-    ordered.push(serviceName);
-
-    for (const dependent of dependents.get(serviceName) ?? []) {
-      inDegree.set(dependent, (inDegree.get(dependent) ?? 0) - 1);
-
-      if ((inDegree.get(dependent) ?? 0) === 0) {
-        queue.push(dependent);
-        sortServiceNamesByOriginalOrder(queue, originalOrder);
-      }
-    }
-  }
-
-  if (ordered.length !== services.length) {
-    const unresolved = services
-      .map((service) => service.name)
-      .filter((serviceName) => !ordered.includes(serviceName));
-    throw new Error(
-      `Circular service dependency detected: ${unresolved.join(', ')}.`,
-    );
-  }
-
-  return ordered;
-}
-
-function buildDependentsMap(services: InfrastructureService[]): Map<string, string[]> {
-  const dependents = new Map(services.map((service) => [service.name, [] as string[]]));
-
-  for (const service of services) {
-    for (const dependency of service.dependsOn ?? []) {
-      dependents.get(dependency)?.push(service.name);
-    }
-  }
-
-  const originalOrder = new Map(services.map((service, index) => [service.name, index]));
-  for (const dependentList of dependents.values()) {
-    sortServiceNamesByOriginalOrder(dependentList, originalOrder);
-  }
-
-  return dependents;
-}
-
-function buildDependencyGraph(
-  services: InfrastructureService[],
-  dependents: Map<string, string[]>,
-): DependencyGraphEntry[] {
-  return services.map((service) => ({
-    serviceName: service.name,
-    dependsOn: service.dependsOn ?? [],
-    dependents: dependents.get(service.name) ?? [],
-  }));
-}
-
 function buildScheduleWarnings(
   services: InfrastructureService[],
   serviceStartOrder: string[],
@@ -570,12 +498,6 @@ function getService(services: InfrastructureService[], name: string): Infrastruc
   return service;
 }
 
-function sortServiceNamesByOriginalOrder(
-  names: string[],
-  originalOrder: Map<string, number>,
-): void {
-  names.sort((left, right) => (originalOrder.get(left) ?? 0) - (originalOrder.get(right) ?? 0));
-}
 
 function countNonEmptyLines(value: string): number {
   return value.trim() === '' ? 0 : value.trim().split(/\r?\n/).length;

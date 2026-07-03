@@ -1,4 +1,39 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: abcabcabc
+      POSTGRES_PASSWORD: pw-a9bbcef1686eb85c659eb951
+    volumes:
+      - test-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U abcabcabc
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - test-app-network
+  api:
+    image: node:20-alpine
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+    environment: {}
+    depends_on:
+      - postgres
+    command:
+      - tail
+      - -f
+      - /dev/null
+    networks:
+      - test-app-network
   nginx:
     image: nginx:stable
     restart: unless-stopped
@@ -11,42 +46,7 @@ services:
       - api
     networks:
       - test-app-network
-  api:
-    image: node:20-alpine
-    restart: unless-stopped
-    deploy:
-      replicas: 2
-    environment: {}
-    depends_on:
-      - mongo-1
-    command:
-      - tail
-      - -f
-      - /dev/null
-    networks:
-      - test-app-network
-  mongo-1:
-    image: mongo:7
-    restart: unless-stopped
-    deploy:
-      replicas: 1
-    environment: {}
-    volumes:
-      - test-mongo-1-data:/data/db
-    healthcheck:
-      test:
-        - CMD
-        - mongosh
-        - --quiet
-        - --eval
-        - db.adminCommand('ping')
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - test-app-network
 networks:
   test-app-network: {}
 volumes:
-  test-mongo-1-data: {}
+  test-postgres-data: {}

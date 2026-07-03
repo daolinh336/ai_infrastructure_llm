@@ -307,14 +307,14 @@ export function validateTopologyGraph(spec: {
   if (proxyNames.length > 0 && backendNames.length === 0 && services.length > 1) {
     if (databaseNames.length > 0) {
       issues.push({
-        severity: 'error',
+        severity: 'warning',
         message: 'Incomplete topology: Reverse proxy and database are defined, but no backend app service exists to route traffic.',
         affectedServices: [...proxyNames, ...databaseNames],
         suggestion: 'Add a backend service to connect the proxy to the database, or remove one of the layers.',
       });
     } else {
       issues.push({
-        severity: 'error',
+        severity: 'warning',
         message: 'Incomplete topology: Reverse proxy is defined, but no backend app service exists to handle the traffic.',
         affectedServices: [...proxyNames],
         suggestion: 'Add a backend service that the reverse proxy can route traffic to.',

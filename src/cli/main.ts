@@ -15,7 +15,7 @@ import { toReplicaContainerNames } from '../execution/container-names.js';
 import { clearManagedProjectState, clearManagedStateAfterDestroyAll, listProjectStates, loadProjectState, loadState, saveStateOperationRecord, saveVerifiedRuntimeSnapshot } from '../state/sqlite-state-store.js';
 import { StatusService } from '../status/status-service.js';
 import { registerPlanCommand } from './plan-command.js';
-import type { DriftReport, PendingPreviewState, RuntimeActualState, VerifiedRuntimeSnapshot } from '../domain/types.js';
+import type { DriftReport, PendingPreviewState, RepairReport, RuntimeActualState, VerifiedRuntimeSnapshot } from '../domain/types.js';
 import {
   collectDestroyAllTargets,
   createDockerMcpGatewayFromEnv,
@@ -308,7 +308,14 @@ program
         }
 
         if (choice === 'n') {
-          console.log(chalk.yellow('No action taken. No Docker mutation was performed. SQLite unchanged.'));
+          await saveObservedDriftSnapshot({
+            snapshot: state.current,
+            actual,
+            drift,
+            operation: 'sync',
+            evidence: 'Drift check observed Docker runtime via MCP list+inspect; user skipped repair.',
+          });
+          console.log(chalk.yellow('No Docker mutation was performed. Saved observed actual state and drift report to SQLite.'));
           return;
         }
 
@@ -369,7 +376,15 @@ program
           console.log(chalk.green('Saved verified runtime state to SQLite after repair.'));
           await saveStateOperationRecord({ type: 'verified-runtime-saved', projectName: project, request: state.current.request, summary: 'Drift repaired from status --drift and verified runtime state synced to SQLite.' });
         } else {
-          console.log(chalk.yellow('Repair incomplete or drift remains; current state was not saved as healed.'));
+          await saveObservedDriftSnapshot({
+            snapshot: state.current,
+            actual: actualAfterRepair,
+            drift: driftAfterRepair,
+            operation: 'repair',
+            repairReport: report,
+            evidence: 'Repair ran from status --drift, but remaining drift was observed via MCP list+inspect.',
+          });
+          console.log(chalk.yellow('Repair incomplete or drift remains; saved observed actual state without marking it healed.'));
           await saveStateOperationRecord({ type: 'drift-observed', projectName: project, request: state.current.request, summary: 'Repair ' + report.status + ' from status --drift. Remaining drift: ' + driftAfterRepair.summary });
         }
       } catch (error) {
@@ -488,8 +503,7 @@ program
 program
 .command('repair')
 .description('Detect drift, preview repair plan, get approval, then deploy repair via MCP')
-.option('--approve-risky', 'Include approval-required repair actions in the approval request', false)
-.action(async (options) => {
+.action(async () => {
   const state = await loadState();
   const engine = new ExecutionEngine({
     dockerPullRetry: loadDockerPullRetryPolicyFromEnv(),
@@ -503,20 +517,20 @@ program
   const mcpClient = createDockerMcpGatewayFromEnv();
   try {
     await mcpClient.initialize();
-    const { drift } = await engine.detectRuntimeDrift(state.current, mcpClient);
+    const { drift, actual } = await engine.detectRuntimeDrift(state.current, mcpClient);
     console.log(chalk.cyan('Drift report for project "' + project + '":'));
     console.log('- ' + drift.summary);
     for (const finding of drift.findings) { console.log('  - [' + finding.severity + '] ' + finding.message); }
     if (drift.status === 'none') { console.log(chalk.green('No drift detected; nothing to repair.')); return; }
     const plan = buildRepairPlan(drift);
-    const actionsToApply = plan.actions.filter((a) => a.risk !== 'approval-required' || options.approveRisky);
+    const actionsToApply = plan.actions;
     console.log(chalk.cyan('Repair plan preview:'));
     console.log('- Total actions: ' + String(plan.actions.length));
     console.log('- Safe actions: ' + String(plan.actions.filter((a) => a.risk === 'safe').length));
     console.log('- Approval-required: ' + String(plan.actions.filter((a) => a.risk === 'approval-required').length));
     console.log('- Actions to run: ' + String(actionsToApply.length));
     for (const action of actionsToApply) { console.log('  - [' + action.risk + '] ' + action.kind + ' ' + action.resourceName); }
-    if (actionsToApply.length === 0) { console.log(chalk.yellow('No repair actions to run after filtering. Use --approve-risky to include approval-required actions.')); return; }
+    if (actionsToApply.length === 0) { console.log(chalk.yellow('No repair actions to run.')); return; }
     const readline = createInterface({ input, output });
     let approved = false;
     try {
@@ -525,6 +539,13 @@ program
     } finally { readline.close(); }
     if (!approved) {
       console.log(chalk.yellow('Repair rejected. No Docker mutation was performed.'));
+      await saveObservedDriftSnapshot({
+        snapshot: state.current,
+        actual,
+        drift,
+        operation: 'sync',
+        evidence: 'Repair command observed Docker runtime via MCP list+inspect; user rejected repair.',
+      });
       await saveStateOperationRecord({ type: 'repair-rejected', projectName: project, request: state.current.request, summary: 'Repair rejected by user. Drift detected: ' + drift.summary });
       return;
     }
@@ -543,7 +564,15 @@ program
       await saveVerifiedRuntimeSnapshot({ sourceSnapshot: state.current, actual: actualAfterRepair, verificationReport: { status: 'passed', scope: 'tool-runtime', checkedAt: new Date().toISOString(), issues: [], evidence: ['Repair applied successfully. Drift resolved.'], errorReason: null, revisionHint: null, confidence: 0.95 }, operation: 'repair', resourceRefs, driftReport: driftAfterRepair, repairReport: report });
       console.log(chalk.green('Saved verified runtime state to SQLite after repair.'));
     } else {
-      console.log(chalk.yellow('Repair incomplete or drift remains; current state was not saved as healed.'));
+      await saveObservedDriftSnapshot({
+        snapshot: state.current,
+        actual: actualAfterRepair,
+        drift: driftAfterRepair,
+        operation: 'repair',
+        repairReport: report,
+        evidence: 'Repair command ran, but remaining drift was observed via MCP list+inspect.',
+      });
+      console.log(chalk.yellow('Repair incomplete or drift remains; saved observed actual state without marking it healed.'));
       await saveStateOperationRecord({ type: 'drift-observed', projectName: project, request: state.current.request, summary: 'Repair ' + report.status + '. Remaining drift: ' + driftAfterRepair.summary });
     }
   } catch (error) {
@@ -576,6 +605,40 @@ function destroySnapshotFromPendingPreview(
     appliedAt: null,
     savedAt: observedAt,
   };
+}
+
+async function saveObservedDriftSnapshot(input: {
+  snapshot: VerifiedRuntimeSnapshot;
+  actual: RuntimeActualState;
+  drift: DriftReport;
+  operation: 'repair' | 'sync';
+  evidence: string;
+  repairReport?: RepairReport;
+}): Promise<void> {
+  const project = input.snapshot.desired.projectName;
+  const verificationStatus = input.drift.status === 'none'
+    ? 'passed'
+    : input.drift.status === 'uncertain'
+      ? 'uncertain'
+      : 'failed';
+  await saveVerifiedRuntimeSnapshot({
+    sourceSnapshot: input.snapshot,
+    actual: input.actual,
+    verificationReport: {
+      status: verificationStatus,
+      scope: 'tool-runtime',
+      checkedAt: input.drift.checkedAt,
+      issues: input.drift.findings.map((finding) => finding.message),
+      evidence: [input.evidence],
+      errorReason: input.drift.status === 'none' ? null : input.drift.summary,
+      revisionHint: input.drift.status === 'none' ? null : 'Review the saved drift report before treating runtime as healthy.',
+      confidence: input.drift.status === 'none' ? 0.95 : input.drift.status === 'uncertain' ? 0.4 : 0.7,
+    },
+    operation: input.operation,
+    resourceRefs: buildResourceRefs(project, input.actual, input.snapshot.desired),
+    driftReport: input.drift,
+    repairReport: input.repairReport ?? null,
+  });
 }
 
 

@@ -65,6 +65,21 @@ function serviceFromContainer(
   return service;
 }
 
+function syncManagedEnvironment(
+  desiredEnvironment: Record<string, string> | undefined,
+  actualEnvironment: Record<string, string> | null | undefined,
+): Record<string, string> | undefined {
+  if (!desiredEnvironment || actualEnvironment === null || actualEnvironment === undefined) {
+    return desiredEnvironment;
+  }
+  const syncedEnvironment = Object.fromEntries(
+    Object.keys(desiredEnvironment)
+      .filter((key) => key in actualEnvironment)
+      .map((key) => [key, actualEnvironment[key]!]),
+  );
+  return Object.keys(syncedEnvironment).length > 0 ? syncedEnvironment : undefined;
+}
+
 export function deriveSpecFromRuntime(
   actual: RuntimeActualState,
   sourceSpec: InfrastructureSpec,
@@ -86,6 +101,12 @@ export function deriveSpecFromRuntime(
         ...existing,
         image: container.image ?? existing.image,
       };
+      const syncedEnvironment = syncManagedEnvironment(existing.environment, container.environment);
+      if (syncedEnvironment) {
+        merged.environment = syncedEnvironment;
+      } else {
+        delete merged.environment;
+      }
       if (derived.desiredStatus) {
         merged.desiredStatus = derived.desiredStatus;
       } else {

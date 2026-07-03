@@ -23,16 +23,6 @@ function buildDatabaseGroups(services: InfrastructureService[]): Map<string, Dat
   return groups;
 }
 
-function serviceFingerprint(service: InfrastructureService): string {
-  return JSON.stringify({
-    kind: service.kind,
-    image: service.image,
-    environment: service.environment ?? {},
-    volumes: service.volumes ?? [],
-    dependsOn: service.dependsOn ?? [],
-  });
-}
-
 function databaseReplicaFingerprint(service: InfrastructureService): string {
   return JSON.stringify({
     kind: service.kind,
@@ -50,7 +40,7 @@ function normalizeDependsOn(dependencies: string[] | undefined, databaseGroupBas
 }
 
 
-export type SupportedAdjustChangeKind = 'port' | 'replicas';
+export type SupportedAdjustChangeKind = 'replicas';
 
 export interface SupportedAdjustChange {
   kind: SupportedAdjustChangeKind;
@@ -71,14 +61,6 @@ export function detectSupportedAdjustChanges(
   for (const service of revised.services) {
     const before = originalByName.get(service.name);
     if (before) {
-      if (JSON.stringify(before.ports ?? []) !== JSON.stringify(service.ports ?? [])) {
-        changes.push({
-          kind: 'port',
-          serviceName: service.name,
-          message: `Port change on service "${service.name}".`,
-        });
-      }
-
       const beforeReplicas = before.replicas ?? 1;
       const afterReplicas = service.replicas ?? 1;
       if (beforeReplicas !== afterReplicas && ADJUST_REPLICA_KINDS.has(service.kind)) {
@@ -136,13 +118,13 @@ export function diffAdjustScope(
   for (const service of original.services) {
     if (originalGroupedNames.has(service.name)) continue;
     if (!revisedByName.has(service.name)) {
-      violations.push({ message: `Adjust scope: service "${service.name}" was removed. Only port and replica changes are allowed.` });
+      violations.push({ message: `Adjust scope: service "${service.name}" was removed. Only backend/database replica changes are supported.` });
     }
   }
   for (const service of revised.services) {
     if (revisedGroupedNames.has(service.name)) continue;
     if (!originalByName.has(service.name)) {
-      violations.push({ message: `Adjust scope: service "${service.name}" was added. Only port and replica changes are allowed.` });
+      violations.push({ message: `Adjust scope: service "${service.name}" was added. Only backend/database replica changes are supported.` });
     }
   }
 
@@ -153,16 +135,17 @@ export function diffAdjustScope(
     if (!before) continue;
 
     if (service.kind !== before.kind) {
-      violations.push({ message: `Adjust scope: service "${service.name}" kind changed from ${before.kind} to ${service.kind}. Only port and replica changes are allowed.` });
+      violations.push({ message: `Adjust scope: service "${service.name}" kind changed from ${before.kind} to ${service.kind}. Only backend/database replica changes are supported.` });
     }
     if (service.image !== before.image) {
-      violations.push({ message: `Adjust scope: service "${service.name}" image changed "${before.image}" -> "${service.image}". Only port and replica changes are allowed.` });
+      violations.push({ message: `Adjust scope: service "${service.name}" image changed "${before.image}" -> "${service.image}". Only backend/database replica changes are supported.` });
     }
+    const portsChanged = JSON.stringify(service.ports ?? []) !== JSON.stringify(before.ports ?? []);
     const envChanged = JSON.stringify(service.environment ?? {}) !== JSON.stringify(before.environment ?? {});
     const volumesChanged = JSON.stringify(service.volumes ?? []) !== JSON.stringify(before.volumes ?? []);
     const dependsChanged = JSON.stringify(normalizeDependsOn(service.dependsOn, databaseGroupBaseNamesForDepends)) !== JSON.stringify(normalizeDependsOn(before.dependsOn, databaseGroupBaseNamesForDepends));
-    if (envChanged || volumesChanged || dependsChanged) {
-      violations.push({ message: `Adjust scope: service "${service.name}" changed a field other than ports or replicas. Only port and replica changes are allowed.` });
+    if (portsChanged || envChanged || volumesChanged || dependsChanged) {
+      violations.push({ message: `Adjust scope: service "${service.name}" changed a field other than replicas. Only backend/database replica changes are supported.` });
     }
   }
 
@@ -173,12 +156,12 @@ export function diffAdjustScope(
     const beforeFingerprints = [...new Set(beforeGroup.map(databaseReplicaFingerprint))].sort();
     const afterFingerprints = [...new Set(afterGroup.map(databaseReplicaFingerprint))].sort();
     if (JSON.stringify(beforeFingerprints) !== JSON.stringify(afterFingerprints)) {
-      violations.push({ message: `Adjust scope: database replica group "${baseName}" changed fields other than replica count or ports. Only port and replica changes are allowed.` });
+      violations.push({ message: `Adjust scope: database replica group "${baseName}" changed fields other than replica count. Only backend/database replica changes are supported.` });
     }
   }
 
   if (JSON.stringify(original.networks) !== JSON.stringify(revised.networks)) {
-    violations.push({ message: 'Adjust scope: networks changed. Only port and replica changes are allowed.' });
+    violations.push({ message: 'Adjust scope: networks changed. Only backend/database replica changes are supported.' });
   }
   const originalVolumes = new Set(original.volumes);
   const revisedVolumes = new Set(revised.volumes);
@@ -192,10 +175,10 @@ export function diffAdjustScope(
     return Boolean(match && databaseGroupBaseNames.has(match[1]!));
   });
   if (changedVolumes.length > 0 && !onlyDatabaseReplicaVolumesChanged) {
-    violations.push({ message: 'Adjust scope: named volumes changed. Only port and replica changes are allowed.' });
+    violations.push({ message: 'Adjust scope: named volumes changed. Only backend/database replica changes are supported.' });
   }
   if (original.projectName !== revised.projectName) {
-    violations.push({ message: 'Adjust scope: projectName changed. Only port and replica changes are allowed.' });
+    violations.push({ message: 'Adjust scope: projectName changed. Only backend/database replica changes are supported.' });
   }
 
   return violations;
@@ -270,45 +253,4 @@ export function validateAdjustReplicas(
   }
 
   return violations;
-}
-
-export interface AdjustPortConflict {
-  hostPort: string;
-  serviceName: string;
-  usedByContainer: string;
-  message: string;
-}
-
-export function detectAdjustPortConflicts(
-  revised: InfrastructureSpec,
-  usedHostPorts: Array<{ hostPort: string; containerName: string }>,
-  ownProjectName: string,
-): AdjustPortConflict[] {
-  const conflicts: AdjustPortConflict[] = [];
-  const usedByPort = new Map<string, string[]>();
-  for (const entry of usedHostPorts) {
-    const containers = usedByPort.get(entry.hostPort) ?? [];
-    containers.push(entry.containerName);
-    usedByPort.set(entry.hostPort, containers);
-  }
-
-  for (const service of revised.services) {
-    for (const port of service.ports ?? []) {
-      const hostPort = port.split(':')[0]?.trim();
-      if (!hostPort || !/^\d+$/.test(hostPort)) continue;
-      const occupants = (usedByPort.get(hostPort) ?? []).filter(
-        (containerName) => !containerName.startsWith(ownProjectName + '-'),
-      );
-      for (const containerName of occupants) {
-        conflicts.push({
-          hostPort,
-          serviceName: service.name,
-          usedByContainer: containerName,
-          message: `Adjust port: host port ${hostPort} requested by service "${service.name}" is already used by container "${containerName}".`,
-        });
-      }
-    }
-  }
-
-  return conflicts;
 }

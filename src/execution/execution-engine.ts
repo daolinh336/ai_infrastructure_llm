@@ -674,7 +674,10 @@ export class ExecutionEngine {
         : actionsSucceeded.length === 0
           ? 'failed'
           : 'partial';
-    const observed = await mcpClient.observeActualState();
+    const containerNames = snapshot.desired.services.flatMap((service) =>
+      toReplicaContainerNames(snapshot.desired.projectName, service),
+    );
+    const observed = await mcpClient.observeActualStateWithInspect({ containerNames });
     return {
       report: { status, actionsAttempted, actionsSucceeded, actionsFailed },
       actual: observed,

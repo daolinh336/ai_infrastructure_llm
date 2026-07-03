@@ -177,8 +177,25 @@ export function buildDriftReport(
       }
     }
 
-    if (service.environment && Object.keys(service.environment).length > 0 && container.environment) {
-      for (const [key, value] of Object.entries(service.environment)) {
+    const desiredEnvironment = service.environment ?? {};
+    const desiredEnvironmentEntries = Object.entries(desiredEnvironment);
+    if (desiredEnvironmentEntries.length > 0 && container.environment === null) {
+      findings.push(
+        finding(
+          'uncertain-runtime-evidence',
+          'unknown',
+          'runtime',
+          container.name,
+          'Container "' + container.name + '" inspect data did not include environment values, so environment drift cannot be verified.',
+          null,
+          null,
+          false,
+        ),
+      );
+    }
+
+    if (desiredEnvironmentEntries.length > 0 && container.environment) {
+      for (const [key, value] of desiredEnvironmentEntries) {
         if (!(key in container.environment)) {
           findings.push(
             finding(

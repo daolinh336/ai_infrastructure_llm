@@ -3,6 +3,7 @@ import { validateInfrastructureSpec } from '../domain/schemas.js';
 import { getImageReferenceBase } from '../domain/supported-images.js';
 import { normalizeStatefulDatabaseReplicaVolumes } from '../domain/stateful-database-volumes.js';
 import { namespaceInfrastructureSpec } from '../domain/project-identity.js';
+import { orderServicesByDependencies } from '../domain/topology-graph.js';
 import YAML from 'yaml';
 
 /**
@@ -99,9 +100,10 @@ export function renderCompose(spec: InfrastructureSpec): string {
   const validSpec = normalizeStatefulDatabaseReplicaVolumes(
     namespaceInfrastructureSpec(validateInfrastructureSpec(spec)),
   );
+  const orderedServices = orderServicesByDependencies(validSpec.services);
   const compose = {
     services: Object.fromEntries(
-      validSpec.services.map((service) => {
+      orderedServices.map((service) => {
         const imageBase = getImageReferenceBase(service.image);
         const healthcheck = DATABASE_HEALTHCHECKS[imageBase]?.(service.environment);
         const command = getRuntimeKeepaliveCommand(service.image);
@@ -130,4 +132,3 @@ export function renderCompose(spec: InfrastructureSpec): string {
 
   return YAML.stringify(compose, { aliasDuplicateObjects: false });
 }
-

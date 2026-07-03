@@ -119,14 +119,14 @@ export class StandardPlannerAgent implements PlannerAgent {
         patchPlanError = patchPlanResult.error;
         assumptions.push(...patchPlanResult.diagnostics);
       }
-      if (obs.userFeedback != null && (patchPlan === null || (patchPlan.patches.length === 0 && !isServiceTargetAmbiguityPatchPlan(patchPlan)))) {
+      if (obs.userFeedback != null) {
         const deterministicPatchPlan = buildDeterministicFeedbackPatchPlan(
           spec,
           obs.userFeedback.message,
           patchPlanError,
           feedbackIntent,
         );
-        if (deterministicPatchPlan.patches.length > 0 || isServiceTargetAmbiguityPatchPlan(deterministicPatchPlan)) {
+        if (shouldPreferDeterministicFeedbackPatchPlan(deterministicPatchPlan, patchPlan)) {
           assumptions.push(
             feedbackIntent !== null
               ? 'Revision patch source: semantic feedback intent fallback replaced empty/unavailable LLM patch plan.'
@@ -1417,17 +1417,26 @@ function buildDeterministicFeedbackPatchPlan(
     ambiguities.push(...intentPatchResult.ambiguities);
   }
 
-  const replicaRequests = patches.some((patch) => patch.op === 'set-service-replicas')
-    ? []
-    : parseReplicaFeedbackRequests(normalizedFeedback);
+  const replicaRequests = parseReplicaFeedbackRequests(normalizedFeedback);
   if (replicaRequests.length > 0) {
+    const explicitReplicaPatches: SpecPatch[] = [];
+    const explicitReplicaAmbiguities: string[] = [];
     for (const replicaRequest of replicaRequests) {
       const target = inferFeedbackServiceSelector(spec, replicaRequest.targetText, { preferReplicaServices: true });
       if (target.selector !== null && target.ambiguous === false) {
-        patches.push({ op: 'set-service-replicas', target: target.selector, replicas: replicaRequest.replicas, reason });
+        explicitReplicaPatches.push({ op: 'set-service-replicas', target: target.selector, replicas: replicaRequest.replicas, reason });
       } else {
-        ambiguities.push(target.reason ?? `Which existing service should receive ${replicaRequest.replicas} replica(s)?`);
+        explicitReplicaAmbiguities.push(target.reason ?? `Which existing service should receive ${replicaRequest.replicas} replica(s)?`);
       }
+    }
+    if (explicitReplicaPatches.length > 0 && explicitReplicaAmbiguities.length === 0) {
+      for (let index = patches.length - 1; index >= 0; index -= 1) {
+        if (patches[index]?.op === 'set-service-replicas') patches.splice(index, 1);
+      }
+      patches.push(...explicitReplicaPatches);
+    } else {
+      patches.push(...explicitReplicaPatches);
+      ambiguities.push(...explicitReplicaAmbiguities);
     }
   } else {
     const replicaRequest = patches.some((patch) => patch.op === 'set-service-replicas')
@@ -1811,6 +1820,24 @@ function resolveSingleStatefulDatabaseGroupForFeedback(
   return groups.length === 1 ? groups[0]! : null;
 }
 
+function shouldPreferDeterministicFeedbackPatchPlan(
+  deterministicPatchPlan: SpecPatchPlan,
+  llmPatchPlan: SpecPatchPlan | null,
+): boolean {
+  const hasDeterministicPatch = deterministicPatchPlan.patches.length > 0;
+  const hasDeterministicAmbiguity = isServiceTargetAmbiguityPatchPlan(deterministicPatchPlan);
+  if (!hasDeterministicPatch && !hasDeterministicAmbiguity) return false;
+  if (llmPatchPlan === null || (llmPatchPlan.patches.length === 0 && !isServiceTargetAmbiguityPatchPlan(llmPatchPlan))) {
+    return true;
+  }
+  if (deterministicPatchPlan.requiresUserInput || deterministicPatchPlan.ambiguities.length > 0) return false;
+
+  return deterministicPatchPlan.patches.every((patch) =>
+    patch.op === 'set-service-replicas'
+    && (patch.target.kind === 'backend' || patch.target.name === 'backend' || patch.target.nameLike === 'backend'),
+  );
+}
+
 function parseReplicaFeedback(feedback: string): number | null {
   const patterns = [
     /\b(?:total|overall|group|database\s+group|db\s+group)\b[^\d]{0,80}\b(?:is|are|to|=|thanh|thành|con|còn)?\s*(\d+)\b/i,
@@ -1832,17 +1859,26 @@ function parseReplicaFeedback(feedback: string): number | null {
 function parseReplicaFeedbackRequests(feedback: string): Array<{ replicas: number; targetText: string }> {
   const requests: Array<{ replicas: number; targetText: string }> = [];
   const serviceWords = '(?:backend|api|nodejs?|server|db|database|databse|postgres(?:ql)?|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka|web|nginx|proxy|reverse-proxy|frontend)';
-  const word = '(?!and\\b|va\\b|v[àa]\\b|,)[A-Za-z0-9_.-]+';
+  const word = '(?!and\\b|va\\b|,)[A-Za-z0-9_.-]+';
   const patterns = [
-    new RegExp(`\\b(\\d+)\\s*(?:instances?|replicas?|containers?)\\s*(?:of|for)?\\s*(${word}(?:\\s+${word}){0,3})`, 'gi'),
-    new RegExp(`\\b(${serviceWords})\\b[^\\d,;]{0,30}?\\b(\\d+)\\s*(?:instances?|replicas?|containers?)?`, 'gi'),
+    { pattern: new RegExp(`\\b(\\d+)\\s*(?:instances?|replicas?|containers?)\\s*(?:of|for)?\\s*(${word}(?:\\s+${word}){0,3})`, 'gi'), countIndex: 1, targetIndex: 2 },
+    { pattern: new RegExp(`\\b(${serviceWords})\\b[^\\d,;]{0,30}?\\b(\\d+)\\s*(?:instances?|replicas?|containers?)?`, 'gi'), countIndex: 2, targetIndex: 1 },
   ];
 
-  for (const pattern of patterns) {
+  for (const { pattern, countIndex, targetIndex } of patterns) {
     for (const match of feedback.matchAll(pattern)) {
-      const countText = match[1];
-      const targetText = match[2];
+      const countText = match[countIndex];
+      const targetText = match[targetIndex];
       if (!countText || !targetText) continue;
+      const betweenTargetAndCount = countIndex > targetIndex
+        ? feedback.slice((match.index ?? 0) + targetText.length, (match.index ?? 0) + match[0].lastIndexOf(countText))
+        : '';
+      if (/\b(?:and|va)\b/i.test(betweenTargetAndCount)) continue;
+      if (countIndex > targetIndex) {
+        const hasReplicaCue = /\b(?:instance|instances|replica|replicas|container|containers|len|xuong|con|to|thanh)\b/i.test(betweenTargetAndCount);
+        const hasNonReplicaCue = /\b(?:version|tag|image|port|host)\b/i.test(betweenTargetAndCount);
+        if (!hasReplicaCue || hasNonReplicaCue) continue;
+      }
       const replicas = Number(countText);
       if (!Number.isInteger(replicas) || replicas < 1 || replicas > 50) continue;
       if (!containsServiceHint(targetText)) continue;

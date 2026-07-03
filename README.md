@@ -9,7 +9,7 @@ The codebase is the source of truth for current behavior. Documentation in this 
 Key implementation entry points:
 
 - `src/cli/main.ts`: CLI commands for doctor, observe, status, destroy, destroy-all, and repair.
-- `src/cli/plan-command.ts`: natural-language deploy, dry-run, save-state, and runtime deploy flow.
+- `src/cli/plan-command.ts`: natural-language dry-run preview and runtime deploy flow.
 - `src/static-gateway/static-gateway.ts`: pre-ReAct validation and structured query gate.
 - `src/agent/`: ReAct orchestration, planner/verifier agents, internal tools, loop guards, and feedback revision helpers.
 - `src/domain/`: Zod schemas and domain types for specs, plans, state, approvals, runtime observations, drift, repair, and verification.
@@ -27,7 +27,7 @@ The CLI keeps the planning model, runtime execution, and saved state separate:
 - `InfrastructureSpec` is the canonical desired-state model.
 - `ExecutionPlan` explains the intended validate, preview, approve, deploy, observe, and verify procedure.
 - Docker Compose YAML is a generated artifact for preview and execution support, not the canonical model.
-- SQLite stores validated JSON payloads for pending previews, approved actions, verified desired/actual runtime snapshots, drift reports, repair reports, and history.
+- SQLite stores validated JSON payloads for approved actions, verified desired/actual runtime snapshots, drift reports, repair reports, and history.
 - Docker runtime mutations go through `DockerMcpGateway`, route metadata, policy checks, and an approval-controlled mutation gate.
 - Observation and verification use read-only MCP routes after runtime actions.
 
@@ -35,7 +35,6 @@ The CLI keeps the planning model, runtime execution, and saved state separate:
 
 ```bash
 npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres" --prjName web-stack
-npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres" --prjName web-stack --save-state
 npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --dry-run
 npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --deploy
 npm run dev -- doctor --docker
@@ -43,7 +42,6 @@ npm run dev -- observe
 npm run dev -- status
 npm run dev -- status --drift
 npm run dev -- repair
-npm run dev -- repair --approve-risky
 npm run dev -- destroy
 npm run dev -- destroy --remove-volumes
 npm run dev -- destroy-all
@@ -53,8 +51,8 @@ npm run dev -- destroy-all --remove-volumes
 Command behavior:
 
 - `plan --dry-run` validates a natural-language request, runs the Static Gateway, runs the ReAct agent, renders a detailed dry-run preview, and prints trace/observations without writing state or mutating Docker.
-- `plan --save-state` stores a pending preview in SQLite without Docker mutation.
 - `plan --deploy` approves, writes the compose artifact, deploys through Docker MCP, observes runtime state, verifies the result, and saves a verified runtime snapshot.
+- `plan --adjust` adjusts an existing verified deployment, always goes through yes/no/other approval, and deploys on approval without requiring `--deploy`.
 - `doctor --docker` performs read-only Docker setup checks.
 - `observe` lists current Docker containers, networks, volumes, and images through MCP.
 - `status` reads SQLite state and prints pending/current saved infrastructure status.

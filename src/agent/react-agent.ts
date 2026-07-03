@@ -11,8 +11,10 @@ import {
 } from '../domain/schemas.js';
 import { reactReasoningOutputJsonSchema, semanticInfrastructureIntentJsonSchema } from '../domain/structured-output-schemas.js';
 import { expandStatefulDatabaseReplicas } from '../domain/stateful-database-volumes.js';
+import { findServiceDependencyCycle, inferMissingServiceDependencies } from '../domain/topology-graph.js';
 import {
   SUPPORTED_IMAGE_BASES,
+  TRUSTED_IMAGE_PROFILES,
   getTrustedDefaultImageForBase,
   getImageReferenceBase,
   isSupportedImageReference,
@@ -361,8 +363,6 @@ export class ReActAgent {
     let validatedQuery = validateValidatedQuery(query);
     const observations: AgentObservation[] = [];
     const trace: ReActStep[] = [];
-    const previousState = await this.loadReasoningStateMemory(trace, observations);
-
     validatedQuery = await this.tryApplySemanticIntent(validatedQuery, trace, observations);
 
     recordStep(
@@ -377,7 +377,7 @@ export class ReActAgent {
       this.reportProgress,
     );
 
-    const reasoning = await this.observeStructuredReasoning(validatedQuery, trace, observations, previousState);
+    const reasoning = await this.observeStructuredReasoning(validatedQuery, trace, observations);
 
     const imageResolution = await this.resolveDraftImageReferences(
       validatedQuery,
@@ -724,7 +724,6 @@ export class ReActAgent {
     query: ValidatedQuery,
     trace: ReActStep[],
     observations: AgentObservation[],
-    previousState: InfrastructureStateSnapshot | null,
   ): Promise<ReActReasoningOutput | null> {
     try {
       this.reportProgress({
@@ -735,7 +734,7 @@ export class ReActAgent {
       const completion = await this.provider.completeStructured({
         system:
           'You are a ReAct infrastructure agent. Return structured reasoning only. Use bounded prior reasoning memory when it is relevant, but treat the current user query and validated state schemas as the source of truth. Do not call Docker, MCP, shell, or side-effecting tools. Treat your output as an observation; deterministic internal tools remain the execution authority.',
-        user: JSON.stringify(buildReasoningPromptInput(query, previousState)),
+        user: JSON.stringify(buildReasoningPromptInput(query)),
         purpose: 'react',
         schemaName: 'react_reasoning_output',
         schema: reactReasoningOutputJsonSchema,
@@ -918,42 +917,15 @@ interface ReasoningPromptInput {
   };
 }
 
-function buildReasoningPromptInput(
-  query: ValidatedQuery,
-  previousState: InfrastructureStateSnapshot | null,
-): ReasoningPromptInput {
-  const pendingPreview = previousState?.pendingPreview ?? null;
-  const current = previousState?.current ?? null;
-  const requestedProject = query.draft.projectName ?? null;
-  const canUsePriorMemory = requestedProject === null || [
-    current?.desired.projectName ?? null,
-    pendingPreview?.desired.projectName ?? null,
-  ].includes(requestedProject);
-  const trace = canUsePriorMemory ? (pendingPreview?.trace ?? []) : [];
-  const observations = canUsePriorMemory ? (pendingPreview?.observations ?? []) : [];
-
+function buildReasoningPromptInput(query: ValidatedQuery): ReasoningPromptInput {
   return {
     query,
     memory: {
-      summary: previousState ? formatStateMemoryObservation(previousState) : 'No saved infrastructure state found.',
-      currentProject: current?.desired.projectName ?? null,
-      pendingPreviewProject: pendingPreview?.desired.projectName ?? null,
-      priorReasoning: trace
-        .filter((step) => step.phase === 'reason' || step.toolName === 'llm_reasoning')
-        .slice(-8)
-        .map((step) => ({
-          id: step.id,
-          phase: step.phase,
-          message: truncateMemoryText(step.message),
-          toolName: step.toolName,
-        })),
-      priorObservations: observations
-        .filter((observation) => observation.source.startsWith('observe:'))
-        .slice(-8)
-        .map((observation) => ({
-          source: observation.source,
-          message: truncateMemoryText(observation.message),
-        })),
+      summary: 'State memory intentionally omitted from planning context.',
+      currentProject: null,
+      pendingPreviewProject: null,
+      priorReasoning: [],
+      priorObservations: [],
     },
   };
 }
@@ -1094,7 +1066,12 @@ function buildImageSelectionClarification(
     return null;
   }
 
-  const recommendedImage = inferRecommendedImage(query, reasoning);
+  const targetDraftService = selectImageClarificationTarget(query, reasoning);
+  if (!targetDraftService) {
+    return null;
+  }
+
+  const recommendedImage = inferRecommendedImageForService(query, targetDraftService, reasoning);
   const provisionalQuery: ValidatedQuery = {
     ...query,
     draft: {
@@ -1112,7 +1089,11 @@ function buildImageSelectionClarification(
   };
 
   const provisionalSpec = buildSpecFromDraft(provisionalQuery);
+  const targetServiceName = targetDraftService.name;
   const targetService =
+    (targetServiceName
+      ? provisionalSpec.services.find((service) => service.name === targetServiceName)
+      : undefined) ??
     provisionalSpec.services.find((service) => service.image === recommendedImage) ??
     provisionalSpec.services[0];
 
@@ -1124,11 +1105,11 @@ function buildImageSelectionClarification(
     id: `select-image:${targetService.name}`,
     severity: 'blocking',
     field: 'services[].image',
-    message: `ReAct reasoning interpreted the request "${query.normalizedPrompt}" but no image/runtime was specified. Choose the default image to create the preview.`,
-    reason: `LLM reasoning: ${reasoning ? reasoning.summary : 'none'}. You can confirm it or choose another option; you can still revise after the dry run if needed.`,
+    message: `ReAct reasoning interpreted the request "${query.normalizedPrompt}" but no image/runtime was specified for service "${targetService.name}". Choose a supported image to create the preview.`,
+    reason: `LLM reasoning: ${reasoning ? reasoning.summary : 'none'}. Choose one supported catalog image. If none fit, run plan again with a different supported image/runtime from the whitelist.`,
     affectedServices: [targetService.name],
     choices: buildImageSelectionCandidates(targetService.name, recommendedImage),
-    allowOther: true,
+    allowOther: false,
   });
 
   recordStep(
@@ -1136,7 +1117,7 @@ function buildImageSelectionClarification(
     observations,
     {
       phase: 'reason',
-      message: `The request has no explicit image/runtime; ReAct reasoning proposes "${recommendedImage}" and asks the user to confirm before planning.`,
+      message: `Service "${targetService.name}" has no explicit image/runtime; ReAct reasoning proposes "${recommendedImage}" and asks the user to confirm before planning.`,
       toolName: null,
     },
     reportProgress,
@@ -1168,6 +1149,33 @@ function buildImageSelectionClarification(
     observations,
     trace,
   };
+}
+
+function selectImageClarificationTarget(
+  query: ValidatedQuery,
+  reasoning: ReActReasoningOutput | null,
+): DraftServiceQuery | null {
+  const unresolved = query.draft.services.filter((service) => service.image === null);
+  if (unresolved.length === 0) return null;
+
+  const scored = unresolved.map((service, index) => ({
+    service,
+    index,
+    score: imageClarificationPriority(service, inferRecommendedImageForService(query, service, reasoning)),
+  }));
+
+  scored.sort((left, right) => right.score - left.score || left.index - right.index);
+  return scored[0]?.service ?? null;
+}
+
+function imageClarificationPriority(service: DraftServiceQuery, recommendedImage: string): number {
+  const serviceText = service.name?.toLowerCase() ?? '';
+  const imageBase = getImageBase(recommendedImage);
+
+  if (/\b(backend|api|node|nodejs|server)\b/.test(serviceText) || getServiceKind(imageBase) === 'backend') return 30;
+  if (/\b(db|database|postgres|postgresql|postresql)\b/.test(serviceText) || getServiceKind(imageBase) === 'database') return 20;
+  if (/\b(web|website|nginx|ngix|proxy|reverse proxy)\b/.test(serviceText) || getServiceKind(imageBase) === 'reverse-proxy') return 10;
+  return 0;
 }
 
 function hasGenericDeployTargetSignal(query: ValidatedQuery): boolean {
@@ -1221,23 +1229,14 @@ function buildImageSelectionCandidates(
   serviceName: string,
   recommendedImage: string,
 ): ClarificationChoice[] {
-  const all = [
-    {
-      image: 'nginx:stable',
-      label: 'nginx - static web server',
-      description: 'Serves a static website (HTML/CSS/JS). Suitable for a static web request.',
-    },
-    {
-      image: 'httpd:2.4',
-      label: 'httpd - static web server',
-      description: 'Apache httpd, another static web server option.',
-    },
-    {
-      image: 'node:20-alpine',
-      label: 'node - backend app server',
-      description: 'Node.js for a backend/API application.',
-    },
-  ];
+  const recommendedRole = getServiceKind(getImageBase(recommendedImage));
+  const all = TRUSTED_IMAGE_PROFILES
+    .filter((profile) => profile.role === recommendedRole)
+    .map((profile) => ({
+      image: profile.image,
+      label: `${profile.base} - ${formatTrustedImageRole(profile.role)}`,
+      description: `${profile.image} from the trusted image whitelist.`,
+    }));
 
   const ordered = [
     ...all.filter((candidate) => candidate.image === recommendedImage),
@@ -1251,7 +1250,6 @@ function buildImageSelectionCandidates(
     value: `setServiceImage:${serviceName}:${candidate.image}`,
   }));
 }
-
 function buildUnsupportedImageClarification(
   query: ValidatedQuery,
   targetService: DraftServiceQuery,
@@ -1265,7 +1263,7 @@ function buildUnsupportedImageClarification(
     targetService.name ??
     getImageReferenceBase(resolution.candidates[0] ?? resolution.raw) ??
     'service';
-  const suggestedImages = buildSuggestedImageReferences(resolution);
+  const suggestedImages = buildSuggestedImageReferences(resolution, inferUnsupportedImageRole(query, targetService, resolution.raw));
   const defaultImage = suggestedImages[0] ?? 'nginx:stable';
   const provisionalQuery = validateValidatedQuery({
     ...query,
@@ -1289,8 +1287,8 @@ function buildUnsupportedImageClarification(
     id: `unsupported-image:${resolvedServiceName}`,
     severity: 'blocking',
     field: 'services[].image',
-    message: `The requested image/runtime "${resolution.raw}" is not currently supported by the catalog. Choose one of the suggested images to continue planning, or select Other to keep a custom value.`,
-    reason: question,
+    message: `The requested image/runtime "${resolution.raw}" is not currently supported by the catalog. Choose one supported image to continue planning.`,
+    reason: `${question} Custom images are not accepted here; if none fit, run plan again with a supported image/runtime from the whitelist.`,
     affectedServices: [resolvedServiceName],
     choices: suggestedImages.map((image, index) => ({
       id: String(index + 1),
@@ -1301,7 +1299,7 @@ function buildUnsupportedImageClarification(
           : 'Alternative supported image/runtime suggestion.',
       value: `setServiceImage:${resolvedServiceName}:${image}`,
     })),
-    allowOther: true,
+    allowOther: false,
   });
 
   recordStep(
@@ -1319,7 +1317,7 @@ function buildUnsupportedImageClarification(
     status: 'clarification',
     clarificationQuestion: formatPlanningUncertaintyQuestion(uncertainty),
     clarificationChoices: uncertainty.choices,
-    allowOther: true,
+    allowOther: false,
     uncertainties: [uncertainty],
     clarificationContext: {
       query: provisionalQuery,
@@ -1335,16 +1333,20 @@ function buildUnsupportedImageClarification(
   };
 }
 
-function buildSuggestedImageReferences(resolution: ImageReferenceResolution): string[] {
+function buildSuggestedImageReferences(
+  resolution: ImageReferenceResolution,
+  preferredRole?: InfrastructureService['kind'],
+): string[] {
   const suggested = resolution.candidates.map(
     (candidate) => DEFAULT_IMAGE_BY_BASE.get(candidate) ?? candidate,
   );
 
   if (!suggested.length) {
-    return ['nginx:stable', 'httpd:2.4', 'node:20-alpine'];
+    return getTrustedDefaultImagesForRole(preferredRole ?? 'backend').slice(0, 3);
   }
 
-  const fallbacks = ['nginx:stable', 'httpd:2.4', 'node:20-alpine'];
+  const candidateRole = getServiceKind(getImageBase(suggested[0]!));
+  const fallbacks = getTrustedDefaultImagesForRole(preferredRole ?? candidateRole);
   const unique = new Set<string>();
 
   for (const image of [...suggested, ...fallbacks]) {
@@ -1355,6 +1357,36 @@ function buildSuggestedImageReferences(resolution: ImageReferenceResolution): st
   }
 
   return [...unique];
+}
+
+function getTrustedDefaultImagesForRole(role: InfrastructureService['kind']): string[] {
+  return TRUSTED_IMAGE_PROFILES
+    .filter((profile) => profile.role === role)
+    .map((profile) => profile.image);
+}
+
+function inferUnsupportedImageRole(
+  query: ValidatedQuery,
+  service: DraftServiceQuery,
+  rawImage: string,
+): InfrastructureService['kind'] {
+  const text = [service.name ?? '', rawImage, query.normalizedPrompt].join(' ').toLowerCase();
+
+  if (/\b(db|database|postgres|postgresql|postresql|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka)\b/.test(text)) {
+    return 'database';
+  }
+
+  if (/\b(web|website|nginx|ngix|httpd|apache|traefik|caddy|haproxy|proxy|reverse[- ]?proxy|frontend)\b/.test(text)) {
+    return 'reverse-proxy';
+  }
+
+  return 'backend';
+}
+
+function formatTrustedImageRole(role: string): string {
+  if (role === 'reverse-proxy') return 'reverse proxy / web entrypoint';
+  if (role === 'database') return 'database';
+  return 'backend runtime';
 }
 
 function buildImageResolutionQuestion(resolution: ImageReferenceResolution): string {
@@ -1391,13 +1423,13 @@ function buildSpecFromDraft(query: ValidatedQuery): InfrastructureSpec {
     buildServiceFromDraft(service, index, topology, volumes),
   );
 
-  applyInferredDependencies(services);
+  const servicesWithDependencies = inferMissingServiceDependencies(services);
 
   return expandStatefulDatabaseReplicas({
     projectName: query.draft.projectName ?? 'sample-infra',
     networks: ['app-network'],
     volumes: [...volumes],
-    services,
+    services: servicesWithDependencies,
   });
 }
 
@@ -1463,27 +1495,6 @@ function shouldUseDefaultServiceName(
       name === 'node' &&
       (topology.hasReverseProxy || topology.hasDatabase))
   );
-}
-
-function applyInferredDependencies(services: InfrastructureService[]): void {
-  const databaseNames = services
-    .filter((service) => service.kind === 'database')
-    .map((service) => service.name);
-  const backendNames = services
-    .filter((service) => service.kind === 'backend')
-    .map((service) => service.name);
-
-  for (const service of services) {
-    if (service.dependsOn?.length) continue;
-
-    if (service.kind === 'backend' && databaseNames.length) {
-      service.dependsOn = databaseNames;
-    }
-
-    if (service.kind === 'reverse-proxy' && backendNames.length) {
-      service.dependsOn = backendNames;
-    }
-  }
 }
 
 function inferPlanAssumptions(query: ValidatedQuery, spec: InfrastructureSpec): string[] {
@@ -1586,7 +1597,7 @@ function detectPlanningUncertainties(spec: InfrastructureSpec): PlanningUncertai
     }
   }
 
-  const cyclePath = findDependencyCycle(spec.services);
+  const cyclePath = findServiceDependencyCycle(spec.services);
   if (cyclePath.length) {
     uncertainties.push(
       validatePlanningUncertainty({
@@ -1629,7 +1640,10 @@ function applyClarificationAnswer(
   const choiceValue = answer.selectedChoiceId !== null
     ? uncertainty.choices.find((choice) => choice.id === answer.selectedChoiceId)?.value ?? null
     : null;
-  const resolvedValue = choiceValue ?? inferChoiceValueFromOtherText(uncertainty, answer.otherText);
+  const otherValue = uncertainty.allowOther
+    ? inferChoiceValueFromOtherText(uncertainty, answer.otherText)
+    : null;
+  const resolvedValue = choiceValue ?? otherValue;
 
   if (resolvedValue === null) {
     throw new Error('Clarification answer did not resolve to a supported planning change.');
@@ -1777,53 +1791,6 @@ function formatPlanningUncertaintyQuestion(uncertainty: PlanningUncertainty): st
     'Choose one option so ReAct can use the answer as an observation and continue planning:',
     ...choices,
   ].join('\n');
-}
-
-function findDependencyCycle(services: InfrastructureService[]): string[] {
-  const servicesByName = new Map(services.map((service) => [service.name, service]));
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const path: string[] = [];
-
-  function visit(serviceName: string): string[] | null {
-    if (visiting.has(serviceName)) {
-      const startIndex = path.indexOf(serviceName);
-      return [...path.slice(Math.max(startIndex, 0)), serviceName];
-    }
-
-    if (visited.has(serviceName)) {
-      return null;
-    }
-
-    const service = servicesByName.get(serviceName);
-    if (!service) {
-      return null;
-    }
-
-    visiting.add(serviceName);
-    path.push(serviceName);
-
-    for (const dependencyName of service.dependsOn ?? []) {
-      const cycle = visit(dependencyName);
-      if (cycle !== null) {
-        return cycle;
-      }
-    }
-
-    path.pop();
-    visiting.delete(serviceName);
-    visited.add(serviceName);
-    return null;
-  }
-
-  for (const service of services) {
-    const cycle = visit(service.name);
-    if (cycle !== null) {
-      return cycle;
-    }
-  }
-
-  return [];
 }
 
 function repairInfrastructureSpec(spec: InfrastructureSpec): InfrastructureSpec {

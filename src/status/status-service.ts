@@ -43,6 +43,37 @@ function isRunningStatus(status: string | null): boolean {
   return status === 'running';
 }
 
+function formatDesiredEnvironment(environment: Record<string, string> | undefined): string {
+  const keys = Object.keys(environment ?? {});
+  return keys.length > 0 ? `${keys.length} managed key(s)` : 'none';
+}
+
+function formatEnvironmentComparison(
+  desiredEnvironment: Record<string, string> | undefined,
+  actualEnvironment: Record<string, string> | null | undefined,
+): string {
+  const desiredEntries = Object.entries(desiredEnvironment ?? {});
+  if (desiredEntries.length === 0) return 'none (ok)';
+  if (actualEnvironment === undefined) return `${desiredEntries.length} managed key(s) unknown (not inspected)`;
+  if (actualEnvironment === null) return `${desiredEntries.length} managed key(s) unknown (inspect missing env)`;
+
+  const missingKeys = desiredEntries
+    .filter(([key]) => !(key in actualEnvironment))
+    .map(([key]) => key);
+  const mismatchedKeys = desiredEntries
+    .filter(([key, value]) => key in actualEnvironment && actualEnvironment[key] !== value)
+    .map(([key]) => key);
+  if (missingKeys.length === 0 && mismatchedKeys.length === 0) {
+    return `${desiredEntries.length} managed key(s) (ok)`;
+  }
+
+  const details = [
+    missingKeys.length > 0 ? `missing: ${missingKeys.join(',')}` : null,
+    mismatchedKeys.length > 0 ? `mismatch: ${mismatchedKeys.join(',')}` : null,
+  ].filter((entry): entry is string => entry !== null);
+  return `${details.join('; ')} (DRIFT)`;
+}
+
 function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string[] {
   const desired = current.desired;
   const containers = current.actual.containers;
@@ -61,7 +92,7 @@ function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string
     if (serviceContainers.length === 0) {
       const desiredStatus = service.desiredStatus ?? 'running';
       lines.push(
-        `  - ${label} | MISSING | expected: ${expectedNames.join(', ')} | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | desired: ${desiredStatus} | status: absent (DRIFT)`,
+        `  - ${label} | MISSING | expected: ${expectedNames.join(', ')} | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | env: ${formatDesiredEnvironment(service.environment)} | desired: ${desiredStatus} | status: absent (DRIFT)`,
       );
       continue;
     }
@@ -81,8 +112,9 @@ function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string
       const shouldComparePorts = desiredStatus === 'running' && isRunningStatus(container.status);
       const portsOk = !shouldComparePorts || desiredPortMappingsPresent(service.ports, container.ports ?? []);
       const portsMarker = shouldComparePorts ? (portsOk ? '(ok)' : '(DRIFT)') : '(not checked)';
+      const envComparison = formatEnvironmentComparison(service.environment, container.environment);
       lines.push(
-        `  - ${label} | container: ${container.name} | image: ${service.image} ${imageOk ? '==' : '!='} ${container.image ?? 'unknown'} ${imageOk ? '(ok)' : '(DRIFT)'} | lifecycle: ${desiredStatus} ${lifecycleOk ? '==' : '!='} ${status} ${lifecycleOk ? '(ok)' : '(DRIFT)'} | ports: ${desiredPorts} ${portsOk ? '==' : '!='} ${actualPorts} ${portsMarker}`,
+        `  - ${label} | container: ${container.name} | image: ${service.image} ${imageOk ? '==' : '!='} ${container.image ?? 'unknown'} ${imageOk ? '(ok)' : '(DRIFT)'} | lifecycle: ${desiredStatus} ${lifecycleOk ? '==' : '!='} ${status} ${lifecycleOk ? '(ok)' : '(DRIFT)'} | ports: ${desiredPorts} ${portsOk ? '==' : '!='} ${actualPorts} ${portsMarker} | env: ${envComparison}`,
       );
     }
 
@@ -90,7 +122,7 @@ function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string
     for (const missingName of missingNames) {
       const desiredStatus = service.desiredStatus ?? 'running';
       lines.push(
-        `  - ${label} | MISSING | expected: ${missingName} | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | desired: ${desiredStatus} | status: absent (DRIFT)`,
+        `  - ${label} | MISSING | expected: ${missingName} | image: ${service.image} | ports: ${(service.ports ?? []).join(', ') || 'none'} | env: ${formatDesiredEnvironment(service.environment)} | desired: ${desiredStatus} | status: absent (DRIFT)`,
       );
     }
   }

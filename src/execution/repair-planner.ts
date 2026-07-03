@@ -38,6 +38,7 @@ export function buildRepairPlan(report: DriftReport): RepairPlan {
         break;
       case 'image-mismatch':
       case 'port-mismatch':
+      case 'env-mismatch':
         actions.push(action('recreate-container', 'approval-required', finding.resourceName, finding.message));
         break;
       default:
