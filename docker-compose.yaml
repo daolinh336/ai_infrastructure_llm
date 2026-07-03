@@ -10,24 +10,22 @@ services:
     depends_on:
       - api
     networks:
-      - test2-app-network
+      - test-app-network
   api:
-    image: node:20-alpine
+    image: python:latest
     restart: unless-stopped
     deploy:
       replicas: 2
     environment: {}
     depends_on:
-      - postgres-1
-      - postgres-2
-      - postgres-3
+      - postgres
     command:
       - tail
       - -f
       - /dev/null
     networks:
-      - test2-app-network
-  postgres-1:
+      - test-app-network
+  postgres:
     image: postgres:16
     restart: unless-stopped
     deploy:
@@ -35,68 +33,20 @@ services:
     environment:
       POSTGRES_DB: app
       POSTGRES_USER: abcabcabc
-      POSTGRES_PASSWORD: pw-3deffeec781d7733fb448b06
+      POSTGRES_PASSWORD: pw-9ca6cf2b60296a25cf6781af
     volumes:
-      - test2-postgres-data-1:/var/lib/postgresql/data
+      - test-postgres-data:/var/lib/postgresql/data
     healthcheck:
       test:
         - CMD-SHELL
-        - pg_isready -U app
+        - pg_isready -U abcabcabc
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     networks:
-      - test2-app-network
-  postgres-2:
-    image: postgres:16
-    restart: unless-stopped
-    deploy:
-      replicas: 1
-    environment:
-      POSTGRES_DB: app
-      POSTGRES_USER: abcabcabc
-      POSTGRES_PASSWORD: pw-7a245b68ab154eab7dd4b50e
-    depends_on:
-      - postgres-1
-    volumes:
-      - test2-postgres-data-2:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - pg_isready -U app
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - test2-app-network
-  postgres-3:
-    image: postgres:16
-    restart: unless-stopped
-    deploy:
-      replicas: 1
-    environment:
-      POSTGRES_DB: app
-      POSTGRES_USER: abcabcabc
-      POSTGRES_PASSWORD: pw-3868e6374317b6656b952ea5
-    depends_on:
-      - postgres-1
-    volumes:
-      - test2-postgres-data-3:/var/lib/postgresql/data
-    healthcheck:
-      test:
-        - CMD-SHELL
-        - pg_isready -U app
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - test2-app-network
+      - test-app-network
 networks:
-  test2-app-network: {}
+  test-app-network: {}
 volumes:
-  test2-postgres-data-1: {}
-  test2-postgres-data-2: {}
-  test2-postgres-data-3: {}
+  test-postgres-data: {}

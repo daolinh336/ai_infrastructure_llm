@@ -30,6 +30,7 @@ import type {
   VerifierRemediationPatchPlan,
   UserFeedback,
   RevisionObservation,
+  SemanticInfrastructureIntent,
 } from './types.js';
 import { loadInfrastructureSchemaLimitConfig } from '../config/runtime-limits.js';
 
@@ -101,6 +102,7 @@ export const draftServiceQuerySchema = z
     image: z.string().min(1).nullable(),
     port: z.number().int().nullable(),
     replicas: z.number().int().nullable(),
+    dependsOn: z.array(identifierSchema).optional(),
     requestedMounts: z.array(z.string().min(1)),
     privileged: z.boolean().nullable(),
     networkMode: z.string().min(1).nullable(),
@@ -217,6 +219,54 @@ export const planningClarificationContextSchema = z
     ),
     assumptions: z.array(z.string().min(1)),
     uncertainties: z.array(planningUncertaintySchema).min(1),
+  })
+  .strict();
+
+const semanticIntentPortSchema = z
+  .object({
+    host: z.number().int().min(1).max(65535).nullable(),
+    container: z.number().int().min(1).max(65535).nullable(),
+  })
+  .strict();
+
+const semanticIntentEnvHintSchema = z
+  .object({
+    key: environmentKeySchema,
+    value: z.string().min(1),
+  })
+  .strict();
+
+export const semanticIntentServiceSchema = z
+  .object({
+    id: identifierSchema,
+    role: z.enum(['reverse-proxy', 'backend', 'database']),
+    technology: z.string().min(1).nullable(),
+    imageHint: z.string().min(1).nullable(),
+    replicas: serviceReplicasSchema.nullable(),
+    ports: z.array(semanticIntentPortSchema),
+    envHints: z.array(semanticIntentEnvHintSchema),
+    volumeHints: z.array(z.string().min(1)),
+    dependsOn: z.array(identifierSchema),
+    confidence: z.number().min(0).max(1),
+    ambiguities: z.array(z.string().min(1)),
+  })
+  .strict();
+
+export const semanticInfrastructureIntentSchema = z
+  .object({
+    goal: z.string().min(1),
+    projectHint: identifierSchema.nullable(),
+    services: z.array(semanticIntentServiceSchema),
+    relationships: z.array(z.object({
+      from: identifierSchema,
+      to: identifierSchema,
+      type: z.enum(['depends-on', 'routes-to', 'connects-to']),
+    }).strict()),
+    constraints: z.array(z.string().min(1)),
+    assumptions: z.array(z.string().min(1)),
+    ambiguities: z.array(z.string().min(1)),
+    requiresUserInput: z.boolean(),
+    confidence: z.number().min(0).max(1),
   })
   .strict();
 
@@ -1428,6 +1478,14 @@ export function validateDraftQuery(value: unknown): DraftQuery {
 
 export function validateValidatedQuery(value: unknown): ValidatedQuery {
   return parseWithSchema(validatedQuerySchema, value, 'validated query') as ValidatedQuery;
+}
+
+export function validateSemanticInfrastructureIntent(value: unknown): SemanticInfrastructureIntent {
+  return parseWithSchema(
+    semanticInfrastructureIntentSchema,
+    value,
+    'semantic infrastructure intent',
+  ) as SemanticInfrastructureIntent;
 }
 
 export function validateReactReasoningOutput(value: unknown): ReActReasoningOutput {

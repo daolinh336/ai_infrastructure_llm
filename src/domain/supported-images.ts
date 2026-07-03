@@ -1,3 +1,8 @@
+import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import YAML from 'yaml';
+import { z } from 'zod';
+
 export const SUPPORTED_IMAGE_BASES = [
   'alpine',
   'ubuntu',
@@ -23,7 +28,6 @@ export const SUPPORTED_IMAGE_BASES = [
 ] as const;
 
 export type SupportedImageBase = (typeof SUPPORTED_IMAGE_BASES)[number];
-
 export type TrustedImageRole = 'reverse-proxy' | 'backend' | 'database';
 
 export interface TrustedImageProfile {
@@ -37,51 +41,87 @@ export interface TrustedImageProfile {
   crossFamilyReplacements: string[];
 }
 
+export interface TrustedImageCatalog {
+  trustedImages: TrustedImageProfile[];
+}
+
+export interface TrustedImageCatalogLoadOptions {
+  configPath?: string;
+}
+
+export class TrustedImageCatalogError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'TrustedImageCatalogError';
+  }
+}
+
+const trustedImageRoleSchema = z.enum(['reverse-proxy', 'backend', 'database']);
+const trustedImageProfileSchema = z.object({
+  base: z.enum(SUPPORTED_IMAGE_BASES),
+  image: z.string().trim().min(1),
+  role: trustedImageRoleSchema,
+  defaultPorts: z.array(z.string().trim().min(1)),
+  defaultEnvironment: z.record(z.string(), z.string()),
+  defaultVolumes: z.array(z.string().trim().min(1)),
+  sameRoleReplacements: z.array(z.string().trim().min(1)),
+  crossFamilyReplacements: z.array(z.string().trim().min(1)),
+}).strict();
+
+export const trustedImageCatalogSchema = z.object({
+  trustedImages: z.array(trustedImageProfileSchema).min(1),
+}).strict();
+
+const DEFAULT_TRUSTED_IMAGE_CATALOG_PATH = path.resolve(process.cwd(), 'config', 'trusted-images.yaml');
+const TRUSTED_IMAGE_CATALOG_PATH = process.env.TRUSTED_IMAGES_CONFIG?.trim()
+  ? path.resolve(process.cwd(), process.env.TRUSTED_IMAGES_CONFIG.trim())
+  : DEFAULT_TRUSTED_IMAGE_CATALOG_PATH;
+
 export const SUPPORTED_IMAGE_BASE_SET = new Set<string>(SUPPORTED_IMAGE_BASES);
 
-export const TRUSTED_IMAGE_PROFILES: TrustedImageProfile[] = [
-  { base: 'nginx', image: 'nginx:stable', role: 'reverse-proxy', defaultPorts: ['80:80'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['httpd:2.4', 'traefik:v3.0'], crossFamilyReplacements: [] },
-  { base: 'httpd', image: 'httpd:2.4', role: 'reverse-proxy', defaultPorts: ['80:80'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['nginx:stable', 'traefik:v3.0'], crossFamilyReplacements: [] },
-  { base: 'traefik', image: 'traefik:v3.0', role: 'reverse-proxy', defaultPorts: ['80:80'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['nginx:stable', 'httpd:2.4'], crossFamilyReplacements: [] },
-  { base: 'node', image: 'node:20-alpine', role: 'backend', defaultPorts: ['3000:3000'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['python:3.12-alpine'], crossFamilyReplacements: ['golang:1.22-alpine', 'eclipse-temurin:21-jre'] },
-  { base: 'python', image: 'python:3.12-alpine', role: 'backend', defaultPorts: ['8000:8000'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['node:20-alpine'], crossFamilyReplacements: ['golang:1.22-alpine', 'eclipse-temurin:21-jre'] },
-  { base: 'golang', image: 'golang:1.22-alpine', role: 'backend', defaultPorts: ['8080:8080'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['node:20-alpine', 'python:3.12-alpine'], crossFamilyReplacements: ['eclipse-temurin:21-jre'] },
-  { base: 'openjdk', image: 'openjdk:21-jdk-slim', role: 'backend', defaultPorts: ['8080:8080'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['eclipse-temurin:21-jre'], crossFamilyReplacements: ['node:20-alpine', 'python:3.12-alpine'] },
-  { base: 'eclipse-temurin', image: 'eclipse-temurin:21-jre', role: 'backend', defaultPorts: ['8080:8080'], defaultEnvironment: {}, defaultVolumes: [], sameRoleReplacements: ['openjdk:21-jdk-slim'], crossFamilyReplacements: ['node:20-alpine', 'python:3.12-alpine'] },
-  { base: 'postgres', image: 'postgres:16-alpine', role: 'database', defaultPorts: ['5432:5432'], defaultEnvironment: { POSTGRES_PASSWORD: 'change-me' }, defaultVolumes: ['data:/var/lib/postgresql/data'], sameRoleReplacements: [], crossFamilyReplacements: ['mysql:8.4', 'mariadb:11.4', 'mongo:7'] },
-  { base: 'mysql', image: 'mysql:8.4', role: 'database', defaultPorts: ['3306:3306'], defaultEnvironment: { MYSQL_ROOT_PASSWORD: 'change-me' }, defaultVolumes: ['data:/var/lib/mysql'], sameRoleReplacements: ['mariadb:11.4'], crossFamilyReplacements: ['postgres:16-alpine', 'mongo:7'] },
-  { base: 'mariadb', image: 'mariadb:11.4', role: 'database', defaultPorts: ['3306:3306'], defaultEnvironment: { MARIADB_ROOT_PASSWORD: 'change-me' }, defaultVolumes: ['data:/var/lib/mysql'], sameRoleReplacements: ['mysql:8.4'], crossFamilyReplacements: ['postgres:16-alpine', 'mongo:7'] },
-  { base: 'mongo', image: 'mongo:7', role: 'database', defaultPorts: ['27017:27017'], defaultEnvironment: {}, defaultVolumes: ['data:/data/db'], sameRoleReplacements: [], crossFamilyReplacements: ['postgres:16-alpine', 'mysql:8.4', 'mariadb:11.4'] },
-  { base: 'redis', image: 'redis:7-alpine', role: 'database', defaultPorts: ['6379:6379'], defaultEnvironment: {}, defaultVolumes: ['data:/data'], sameRoleReplacements: [], crossFamilyReplacements: [] },
-  { base: 'rabbitmq', image: 'rabbitmq:3-management', role: 'database', defaultPorts: ['5672:5672'], defaultEnvironment: {}, defaultVolumes: ['data:/var/lib/rabbitmq'], sameRoleReplacements: [], crossFamilyReplacements: [] },
-  { base: 'elasticsearch', image: 'elasticsearch:8.14.0', role: 'database', defaultPorts: ['9200:9200'], defaultEnvironment: {}, defaultVolumes: ['data:/usr/share/elasticsearch/data'], sameRoleReplacements: [], crossFamilyReplacements: [] },
-  { base: 'kafka', image: 'kafka:latest', role: 'database', defaultPorts: ['9092:9092'], defaultEnvironment: {}, defaultVolumes: ['data:/var/lib/kafka/data'], sameRoleReplacements: [], crossFamilyReplacements: [] },
-];
+let trustedImageCatalogCache: TrustedImageCatalog | null = null;
+let trustedImageProfileMapCache: ReadonlyMap<SupportedImageBase, TrustedImageProfile> | null = null;
 
+export function loadTrustedImageCatalog(options: TrustedImageCatalogLoadOptions = {}): TrustedImageCatalog {
+  const configPath = resolveTrustedImageCatalogPath(options.configPath);
+
+  if (!existsSync(configPath)) {
+    throw new TrustedImageCatalogError(`Trusted image catalog file not found: ${configPath}`);
+  }
+
+  const raw = readFileSync(configPath, 'utf8');
+  const parsed = YAML.parse(raw);
+  const catalog = trustedImageCatalogSchema.parse(parsed);
+  validateTrustedImageCatalog(catalog, configPath);
+  return catalog;
+}
+
+export function getTrustedImageCatalogPath(): string {
+  return TRUSTED_IMAGE_CATALOG_PATH;
+}
+
+export function resetTrustedImageCatalogCache(): void {
+  trustedImageCatalogCache = null;
+  trustedImageProfileMapCache = null;
+}
+
+export function getTrustedImageCatalog(): TrustedImageCatalog {
+  if (trustedImageCatalogCache === null) {
+    trustedImageCatalogCache = loadTrustedImageCatalog();
+  }
+
+  return trustedImageCatalogCache;
+}
+
+export const TRUSTED_IMAGE_PROFILES: TrustedImageProfile[] = getTrustedImageCatalog().trustedImages;
 export const TRUSTED_IMAGE_BASE_SET = new Set<string>(TRUSTED_IMAGE_PROFILES.map((profile) => profile.base));
 
 const IMAGE_BASE_SYNONYMS = new Map<string, SupportedImageBase>([
   ['nodejs', 'node'],
-  ['node.js', 'node'],
-  ['go', 'golang'],
-  ['java', 'openjdk'],
-  ['jdk', 'openjdk'],
-  ['temurin', 'eclipse-temurin'],
-  ['apache', 'httpd'],
-  ['apache2', 'httpd'],
-  ['apache-httpd', 'httpd'],
-  ['maria', 'mariadb'],
-  ['mongodb', 'mongo'],
-  ['elastic', 'elasticsearch'],
-  ['elastic-search', 'elasticsearch'],
-  ['rabbit', 'rabbitmq'],
-  ['rmq', 'rabbitmq'],
   ['postgresql', 'postgres'],
-  ['postgresql-db', 'postgres'],
-  ['postgres-db', 'postgres'],
-]);
-
-const COMMON_IMAGE_BASE_TYPOS = new Map<string, SupportedImageBase>([
+  ['mssql', 'mysql'],
+  ['maria', 'mariadb'],
+  ['mongo-db', 'mongo'],
   ['postresql', 'postgres'],
 ]);
 
@@ -120,20 +160,11 @@ export function canonicalizeImageBase(base: string): ImageBaseCanonicalization {
     };
   }
 
-  const commonTypo = COMMON_IMAGE_BASE_TYPOS.get(normalizedBase);
-  if (commonTypo !== undefined) {
+  const nearest = findNearestSupportedImageBase(normalizedBase);
+  if (nearest !== null) {
     return {
-      value: commonTypo,
-      changed: commonTypo !== normalizedBase,
-      reason: 'typo',
-    };
-  }
-
-  const typoMatch = findNearestSupportedImageBase(normalizedBase);
-  if (typoMatch !== null) {
-    return {
-      value: typoMatch,
-      changed: typoMatch !== normalizedBase,
+      value: nearest,
+      changed: nearest !== normalizedBase,
       reason: 'typo',
     };
   }
@@ -154,21 +185,31 @@ export function resolveImageReference(reference: string): ImageReferenceResoluti
       raw: reference,
       resolved: `${parsed.prefix}${canonical.value}${parsed.suffix}`,
       candidates: [canonical.value as SupportedImageBase],
-      confidence: 'high',
+      confidence: canonical.reason === 'exact' || canonical.reason === 'synonym' ? 'high' : 'low',
       reason: canonical.reason,
       needsClarification: false,
     };
   }
 
   const candidates = findCandidateSupportedImageBases(parsed.base);
+  if (candidates.length > 0) {
+    return {
+      raw: reference,
+      resolved: null,
+      candidates,
+      confidence: 'low',
+      reason: candidates.length === 1 ? 'typo' : 'ambiguous',
+      needsClarification: true,
+    };
+  }
 
   return {
     raw: reference,
     resolved: null,
-    candidates,
-    confidence: candidates.length ? 'low' : 'none',
-    reason: candidates.length ? 'ambiguous' : 'unsupported',
-    needsClarification: true,
+    candidates: [],
+    confidence: 'none',
+    reason: 'unsupported',
+    needsClarification: false,
   };
 }
 
@@ -179,12 +220,12 @@ export function isSupportedImageReference(reference: string): boolean {
 
 export function isTrustedImageReference(reference: string): boolean {
   const parsed = splitImageReference(reference);
-  return TRUSTED_IMAGE_BASE_SET.has(parsed.base);
+  return getTrustedImageProfileByBase(parsed.base) !== null;
 }
 
 export function getTrustedImageProfile(reference: string): TrustedImageProfile | null {
   const parsed = splitImageReference(reference);
-  return TRUSTED_IMAGE_PROFILES.find((profile) => profile.base === parsed.base) ?? null;
+  return getTrustedImageProfileByBase(parsed.base);
 }
 
 export function getTrustedReplacementImages(reference: string, role?: TrustedImageRole, includeCrossFamily = false): string[] {
@@ -196,8 +237,7 @@ export function getTrustedReplacementImages(reference: string, role?: TrustedIma
 
 export function getTrustedDefaultImageForBase(base: string): string | null {
   const canonical = canonicalizeImageBase(base);
-  const profile = TRUSTED_IMAGE_PROFILES.find((candidate) => candidate.base === canonical.value);
-  return profile?.image ?? null;
+  return getTrustedImageProfileByBase(canonical.value)?.image ?? null;
 }
 
 export function getImageReferenceBase(reference: string): string {
@@ -225,6 +265,35 @@ export function extractCanonicalImageBases(text: string): SupportedImageBase[] {
 
 export function textMentionsSupportedImage(text: string): boolean {
   return extractCanonicalImageBases(text).length > 0;
+}
+
+function getTrustedImageProfileByBase(base: string): TrustedImageProfile | null {
+  if (trustedImageProfileMapCache === null) {
+    trustedImageProfileMapCache = new Map(
+      getTrustedImageCatalog().trustedImages.map((profile) => [profile.base, profile]),
+    );
+  }
+
+  return trustedImageProfileMapCache.get(base as SupportedImageBase) ?? null;
+}
+
+function resolveTrustedImageCatalogPath(configPath?: string): string {
+  if (configPath?.trim()) {
+    return path.resolve(process.cwd(), configPath.trim());
+  }
+
+  return TRUSTED_IMAGE_CATALOG_PATH;
+}
+
+function validateTrustedImageCatalog(catalog: TrustedImageCatalog, configPath: string): void {
+  const seenBases = new Set<string>();
+
+  for (const profile of catalog.trustedImages) {
+    if (seenBases.has(profile.base)) {
+      throw new TrustedImageCatalogError(`Trusted image catalog contains duplicate base "${profile.base}" in ${configPath}`);
+    }
+    seenBases.add(profile.base);
+  }
 }
 
 function findNearestSupportedImageBase(input: string): SupportedImageBase | null {

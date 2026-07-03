@@ -8,7 +8,7 @@ import type {
   VerificationFinding,
 } from '../domain/types.js';
 import { expandStatefulDatabaseReplicas, getDatabaseDataVolumeTarget } from '../domain/stateful-database-volumes.js';
-import { getTrustedImageProfile } from '../domain/supported-images.js';
+import { getTrustedImageProfile, isTrustedImageReference } from '../domain/supported-images.js';
 
 export function applySpecPatchPlan(
   spec: InfrastructureSpec,
@@ -121,6 +121,10 @@ function evaluatePatchPolicy(
   patch: SpecPatch,
   matchedServices: InfrastructureService[],
 ): string | null {
+  if (patch.op === 'set-service-image' && !isTrustedImageReference(patch.image)) {
+    return `Image "${patch.image}" is not in the trusted image whitelist; the current plan was left unchanged. Choose one of the supported trusted images before applying this change.`;
+  }
+
   if (patch.op === 'remove-service') {
     if (isAutoSafeDatabaseRemoval(spec, matchedServices)) return null;
     return 'Removing a service requires explicit user confirmation.';
@@ -253,7 +257,8 @@ function applyResolvedPatch(
     });
   }
 
-  const services = spec.services.map((service) => {
+  let serviceVolumeSourcesBeforeImageChange: Set<string> | null = null;
+  const services: InfrastructureService[] = spec.services.map((service) => {
     if (service.name !== target.name) return service;
 
     if (patch.op === 'set-service-replicas') {
@@ -277,6 +282,7 @@ function applyResolvedPatch(
       return ports.length > 0 ? { ...service, ports } : rest;
     }
     if (patch.op === 'set-service-image') {
+      serviceVolumeSourcesBeforeImageChange = new Set((service.volumes ?? []).map(mountSource));
       return rebuildServiceForTrustedImage(service, patch.image);
     }
     if (patch.op === 'set-service-env') {
@@ -312,13 +318,25 @@ function applyResolvedPatch(
     return service;
   });
 
-  return {
+  const nextSpec: InfrastructureSpec = {
     ...spec,
     services,
     ...(patch.op === 'add-service-volume'
       ? { volumes: unique([...spec.volumes, ...declaredNamedVolumes([patch.volume])]) }
       : {}),
   };
+
+  if (patch.op === 'set-service-image' && serviceVolumeSourcesBeforeImageChange !== null) {
+    return {
+      ...nextSpec,
+      volumes: unique([
+        ...spec.volumes.filter((volume) => !serviceVolumeSourcesBeforeImageChange!.has(volume)),
+        ...services.flatMap((service) => declaredNamedVolumes(service.volumes ?? [])),
+      ]),
+    };
+  }
+
+  return nextSpec;
 }
 
 function evaluatePatchRelevance(
@@ -400,18 +418,28 @@ function inferServiceKind(image: string): InfrastructureService['kind'] {
 }
 
 function rebuildServiceForTrustedImage(service: InfrastructureService, image: string): InfrastructureService {
+  const previousProfile = getTrustedImageProfile(service.image);
   const profile = getTrustedImageProfile(image);
-  const nextPorts = profile?.defaultPorts.length ? profile.defaultPorts : service.ports;
-  const nextEnvironment = profile && Object.keys(profile.defaultEnvironment).length > 0
-    ? { ...profile.defaultEnvironment, ...(service.environment ?? {}) }
+  const roleChanged = previousProfile?.role !== undefined && profile?.role !== undefined && previousProfile.role !== profile.role;
+  const familyChanged = previousProfile?.base !== undefined && profile?.base !== undefined && previousProfile.base !== profile.base;
+  const shouldResetProfileFields = roleChanged || familyChanged;
+  const nextPorts = profile?.defaultPorts.length
+    ? profile.defaultPorts
+    : shouldResetProfileFields
+      ? undefined
+      : service.ports;
+  const nextEnvironment = profile
+    ? mergeImageProfileEnvironment(service.environment, previousProfile?.defaultEnvironment ?? {}, profile.defaultEnvironment, shouldResetProfileFields)
     : service.environment;
   const nextVolumes = profile?.defaultVolumes.length
     ? profile.defaultVolumes.map((mount) => {
         const target = mount.split(':')[1] ?? '';
-        const existing = (service.volumes ?? []).find((candidate) => target && candidate.endsWith(':' + target));
+        const existing = shouldResetProfileFields ? undefined : (service.volumes ?? []).find((candidate) => target && candidate.endsWith(':' + target));
         return existing ?? mount.replace(/^data:/, `${service.name}-data:`);
       })
-    : service.volumes;
+    : shouldResetProfileFields
+      ? undefined
+      : service.volumes;
 
   return {
     ...service,
@@ -421,6 +449,19 @@ function rebuildServiceForTrustedImage(service: InfrastructureService, image: st
     ...(nextEnvironment && Object.keys(nextEnvironment).length > 0 ? { environment: nextEnvironment } : {}),
     ...(nextVolumes && nextVolumes.length > 0 ? { volumes: nextVolumes } : {}),
   };
+}
+
+function mergeImageProfileEnvironment(
+  currentEnvironment: Record<string, string> | undefined,
+  previousDefaults: Record<string, string>,
+  nextDefaults: Record<string, string>,
+  shouldResetProfileFields: boolean,
+): Record<string, string> | undefined {
+  const customEnvironment = Object.fromEntries(
+    Object.entries(currentEnvironment ?? {}).filter(([key]) => !shouldResetProfileFields || !(key in previousDefaults)),
+  );
+  const merged = { ...nextDefaults, ...customEnvironment };
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
 type StatefulDatabaseReplicaGroup = {

@@ -23,48 +23,48 @@ interface ComposeHealthcheck {
   start_period?: string;
 }
 
-const DATABASE_HEALTHCHECKS: Record<string, ComposeHealthcheck> = {
-  postgres: {
-    test: ['CMD-SHELL', 'pg_isready -U app'],
+const DATABASE_HEALTHCHECKS: Record<string, (environment?: Record<string, string>) => ComposeHealthcheck> = {
+  postgres: (environment) => ({
+    test: ['CMD-SHELL', `pg_isready -U ${shellQuote(environment?.POSTGRES_USER ?? 'app')}`],
     interval: '10s',
     timeout: '5s',
     retries: 5,
     start_period: '10s',
-  },
-  mysql: {
+  }),
+  mysql: () => ({
     test: ['CMD', 'mysqladmin', 'ping', '-h', 'localhost'],
     interval: '10s',
     timeout: '5s',
     retries: 5,
     start_period: '15s',
-  },
-  mariadb: {
+  }),
+  mariadb: () => ({
     test: ['CMD', 'healthcheck.sh', '--connect', '--innodb_initialized'],
     interval: '10s',
     timeout: '5s',
     retries: 5,
     start_period: '15s',
-  },
-  mongo: {
+  }),
+  mongo: () => ({
     test: ['CMD', 'mongosh', '--quiet', '--eval', "db.adminCommand('ping')"],
     interval: '10s',
     timeout: '5s',
     retries: 5,
     start_period: '10s',
-  },
-  redis: {
+  }),
+  redis: () => ({
     test: ['CMD', 'redis-cli', 'ping'],
     interval: '10s',
     timeout: '3s',
     retries: 5,
-  },
-  elasticsearch: {
+  }),
+  elasticsearch: () => ({
     test: ['CMD-SHELL', 'curl -fs http://localhost:9200/_cluster/health || exit 1'],
     interval: '15s',
     timeout: '5s',
     retries: 5,
     start_period: '30s',
-  },
+  }),
 };
 
 // App-runtime images that ship with no default CMD and would exit immediately.
@@ -80,6 +80,11 @@ const KEEPALIVE_COMMAND: Record<string, string[]> = {
 export function getRuntimeKeepaliveCommand(image: string): string[] | undefined {
   const command = KEEPALIVE_COMMAND[getImageReferenceBase(image)];
   return command ? [...command] : undefined;
+}
+
+function shellQuote(value: string): string {
+  if (/^[A-Za-z0-9_./-]+$/.test(value)) return value;
+  return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
 function getAllowedHostPorts(service: { kind: string; name: string; image: string; ports?: string[] }): string[] {
@@ -98,7 +103,7 @@ export function renderCompose(spec: InfrastructureSpec): string {
     services: Object.fromEntries(
       validSpec.services.map((service) => {
         const imageBase = getImageReferenceBase(service.image);
-        const healthcheck = DATABASE_HEALTHCHECKS[imageBase];
+        const healthcheck = DATABASE_HEALTHCHECKS[imageBase]?.(service.environment);
         const command = getRuntimeKeepaliveCommand(service.image);
         const replicas = service.replicas ?? 1;
         const ports = getAllowedHostPorts(service);

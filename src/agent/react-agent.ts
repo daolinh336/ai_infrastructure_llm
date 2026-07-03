@@ -6,12 +6,14 @@ import {
   validateInfrastructureSpec,
   validatePlanningUncertainty,
   validateReactReasoningOutput,
+  validateSemanticInfrastructureIntent,
   validateValidatedQuery,
 } from '../domain/schemas.js';
-import { reactReasoningOutputJsonSchema } from '../domain/structured-output-schemas.js';
+import { reactReasoningOutputJsonSchema, semanticInfrastructureIntentJsonSchema } from '../domain/structured-output-schemas.js';
 import { expandStatefulDatabaseReplicas } from '../domain/stateful-database-volumes.js';
 import {
   SUPPORTED_IMAGE_BASES,
+  getTrustedDefaultImageForBase,
   getImageReferenceBase,
   isSupportedImageReference,
   type ImageReferenceResolution,
@@ -35,6 +37,7 @@ import type {
   ProgressReporter,
   ReActStep,
   ReActReasoningOutput,
+  SemanticInfrastructureIntent,
   ValidatedQuery,
   VerificationReport,
   GuardTelemetry,
@@ -54,6 +57,7 @@ import {
 import type { PlannerAgent, VerifierAgent } from './agent-interfaces.js';
 import { StandardPlannerAgent } from './standard-planner-agent.js';
 import { StandardVerifierAgent } from './standard-verifier-agent.js';
+import { mapSemanticIntentToValidatedQuery } from './semantic-intent-mapper.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 import { createVerifierRuntimeReader } from '../execution/runtime-environment-reader.js';
 import {
@@ -73,24 +77,28 @@ const DEFAULT_IMAGE_BY_BASE = new Map<string, string>([
   ['ubuntu', 'ubuntu:24.04'],
   ['debian', 'debian:12'],
   ['busybox', 'busybox:1.36'],
-  ['nginx', 'nginx:stable'],
-  ['httpd', 'httpd:2.4'],
-  ['traefik', 'traefik:v3.1'],
-  ['node', 'node:20-alpine'],
-  ['python', 'python:3.12-alpine'],
-  ['golang', 'golang:1.23-alpine'],
-  ['openjdk', 'eclipse-temurin:21-jdk'],
-  ['eclipse-temurin', 'eclipse-temurin:21-jdk'],
-  ['postgres', 'postgres:16'],
-  ['mysql', 'mysql:8'],
-  ['mariadb', 'mariadb:11'],
-  ['mongo', 'mongo:7'],
-  ['redis', 'redis:7-alpine'],
-  ['rabbitmq', 'rabbitmq:3-management'],
-  ['elasticsearch', 'docker.elastic.co/elasticsearch/elasticsearch:8.15.0'],
-  ['kafka', 'apache/kafka:3.8.0'],
+  ['nginx', getDefaultTrustedImage('nginx', 'nginx:stable')],
+  ['httpd', getDefaultTrustedImage('httpd', 'httpd:2.4')],
+  ['traefik', getDefaultTrustedImage('traefik', 'traefik:v3.0')],
+  ['node', getDefaultTrustedImage('node', 'node:20-alpine')],
+  ['python', getDefaultTrustedImage('python', 'python:3.12-alpine')],
+  ['golang', getDefaultTrustedImage('golang', 'golang:1.22-alpine')],
+  ['openjdk', getDefaultTrustedImage('openjdk', 'openjdk:21-jdk-slim')],
+  ['eclipse-temurin', getDefaultTrustedImage('eclipse-temurin', 'eclipse-temurin:21-jre')],
+  ['postgres', getDefaultTrustedImage('postgres', 'postgres:16-alpine')],
+  ['mysql', getDefaultTrustedImage('mysql', 'mysql:8.4')],
+  ['mariadb', getDefaultTrustedImage('mariadb', 'mariadb:11.4')],
+  ['mongo', getDefaultTrustedImage('mongo', 'mongo:7')],
+  ['redis', getDefaultTrustedImage('redis', 'redis:7-alpine')],
+  ['rabbitmq', getDefaultTrustedImage('rabbitmq', 'rabbitmq:3-management')],
+  ['elasticsearch', getDefaultTrustedImage('elasticsearch', 'elasticsearch:8.14.0')],
+  ['kafka', getDefaultTrustedImage('kafka', 'kafka:latest')],
   ['keycloak', 'quay.io/keycloak/keycloak:26.0'],
 ]);
+
+function getDefaultTrustedImage(base: string, fallback: string): string {
+  return getTrustedDefaultImageForBase(base) ?? fallback;
+}
 
 const REVERSE_PROXY_IMAGES = new Set(['nginx', 'httpd', 'traefik']);
 const STATEFUL_SERVICE_IMAGES = new Set([
@@ -205,6 +213,65 @@ export class ReActAgent {
     return this.planner.reviseFromFeedback(request);
   }
 
+  private async tryApplySemanticIntent(
+    query: ValidatedQuery,
+    trace: ReActStep[],
+    observations: AgentObservation[],
+  ): Promise<ValidatedQuery> {
+    try {
+      const completion = await this.provider.completeStructured({
+        system: [
+          'You are a semantic infrastructure intent reader.',
+          'Return structured JSON only. Summarize the user goal into service roles, technologies, replicas, ports, and relationships.',
+          'Do not choose runtime operations, do not call tools, and do not bypass trusted image policy; deterministic code maps technologies to images later.',
+        ].join(' '),
+        user: JSON.stringify({ raw: query.raw, normalizedPrompt: query.normalizedPrompt, intent: query.intent }),
+        purpose: 'react',
+        schemaName: 'semantic_infrastructure_intent',
+        schema: semanticInfrastructureIntentJsonSchema,
+      });
+      const semanticIntent = validateSemanticInfrastructureIntent(parseJsonResponse(completion.text));
+
+      if (query.draft.services.length > 0) {
+        recordStep(trace, observations, {
+          phase: 'observe',
+          message: 'Semantic intent was observed but not applied because the existing DraftQuery already contains service hints.',
+          toolName: 'llm_semantic_intent',
+        }, this.reportProgress);
+        return query;
+      }
+
+      const mapped = mapSemanticIntentToValidatedQuery(query, semanticIntent);
+
+      if (mapped.query === null) {
+        recordStep(trace, observations, {
+          phase: 'observe',
+          message: `Semantic intent was not applied. ${mapped.diagnostics.join(' ')}`,
+          toolName: 'llm_semantic_intent',
+        }, this.reportProgress);
+        return query;
+      }
+
+      recordStep(trace, observations, {
+        phase: 'observe',
+        message: formatSemanticIntentObservation(semanticIntent, mapped.diagnostics),
+        toolName: 'llm_semantic_intent',
+      }, this.reportProgress);
+      return mapped.query;
+    } catch (error) {
+      recordStep(trace, observations, {
+        phase: 'observe',
+        message: [
+          'Structured semantic intent output was invalid.',
+          getErrorMessage(error),
+          'Continuing with the existing deterministic parser output.',
+        ].join(' '),
+        toolName: 'llm_semantic_intent',
+      }, this.reportProgress);
+      return query;
+    }
+  }
+
   private async loadReasoningStateMemory(
     trace: ReActStep[],
     observations: AgentObservation[],
@@ -295,6 +362,8 @@ export class ReActAgent {
     const observations: AgentObservation[] = [];
     const trace: ReActStep[] = [];
     const previousState = await this.loadReasoningStateMemory(trace, observations);
+
+    validatedQuery = await this.tryApplySemanticIntent(validatedQuery, trace, observations);
 
     recordStep(
       trace,
@@ -949,6 +1018,19 @@ function formatReasoningObservation(reasoning: ReActReasoningOutput): string {
   ].join(' ');
 }
 
+function formatSemanticIntentObservation(
+  intent: SemanticInfrastructureIntent,
+  diagnostics: string[],
+): string {
+  return [
+    `Structured semantic intent accepted: ${intent.goal}.`,
+    `Services: ${intent.services.map((service) => `${service.id}:${service.role}:${service.technology ?? service.imageHint ?? 'unknown'}`).join(', ') || 'none'}.`,
+    `Relationships: ${intent.relationships.map((relationship) => `${relationship.from}->${relationship.to}:${relationship.type}`).join(', ') || 'none'}.`,
+    diagnostics.length ? `Diagnostics: ${diagnostics.join(' ')}` : '',
+    'This semantic output is advisory; deterministic mapping, validation, and policy remain authoritative.',
+  ].filter(Boolean).join(' ');
+}
+
 function buildImageSelectionClarification(
   query: ValidatedQuery,
   reasoning: ReActReasoningOutput | null,
@@ -1074,7 +1156,7 @@ function inferRecommendedImageForService(
   const serviceText = service.name?.toLowerCase() ?? '';
 
   if (/\b(db|database|postgres|postgresql|postresql)\b/.test(serviceText)) {
-    return 'postgres:16';
+    return getDefaultImage('postgres');
   }
 
   if (/\b(backend|api|node|nodejs|server)\b/.test(serviceText)) {
@@ -1317,6 +1399,7 @@ function buildServiceFromDraft(
     image,
     ...getDefaultEnvironment(imageBase),
     ...(replicas !== null ? { replicas } : {}),
+    ...(service.dependsOn?.length ? { dependsOn: [...service.dependsOn] } : {}),
     ...(hostPort !== null ? { ports: [`${hostPort}:${getDefaultContainerPort(imageBase, hostPort)}`] } : {}),
     ...(shouldUseSharedDataVolume ? { volumes: [`${volumeName}:${getDefaultVolumeTarget(imageBase)}`] } : {}),
   };
@@ -1344,6 +1427,8 @@ function applyInferredDependencies(services: InfrastructureService[]): void {
     .map((service) => service.name);
 
   for (const service of services) {
+    if (service.dependsOn?.length) continue;
+
     if (service.kind === 'backend' && databaseNames.length) {
       service.dependsOn = databaseNames;
     }
