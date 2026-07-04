@@ -90,7 +90,7 @@ const infrastructureIntentSchema = z.enum(['create', 'update', 'status', 'destro
 
 export const intentClassificationSchema = z
   .object({
-    scope: z.enum(['infrastructure', 'out-of-scope', 'unsafe']),
+    accepted: z.boolean(),
     intent: infrastructureIntentSchema.nullable(),
     reason: z.string().min(1, 'Intent classification reason must not be empty.'),
   })

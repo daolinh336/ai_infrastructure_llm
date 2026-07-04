@@ -1,3 +1,4 @@
+import { loadInfrastructureSchemaLimitConfig } from '../config/runtime-limits.js';
 import type { JsonSchema } from './types.js';
 
 const infrastructureIntentValues = ['create', 'update', 'status', 'destroy', 'drift'];
@@ -12,6 +13,12 @@ const nullableIntegerSchema = {
   nullable: true,
 };
 
+const serviceReplicasJsonSchema = () => ({
+  type: 'integer',
+  minimum: 1,
+  maximum: loadInfrastructureSchemaLimitConfig().maxServiceReplicas,
+});
+
 const nullableNumberSchema = {
   type: 'number',
   nullable: true,
@@ -25,9 +32,8 @@ const nullableBooleanSchema = {
 export const intentClassificationJsonSchema = {
   type: 'object',
   properties: {
-    scope: {
-      type: 'string',
-      enum: ['infrastructure', 'out-of-scope', 'unsafe'],
+    accepted: {
+      type: 'boolean',
     },
     intent: {
       type: 'string',
@@ -39,7 +45,7 @@ export const intentClassificationJsonSchema = {
       minLength: 1,
     },
   },
-  required: ['scope', 'intent', 'reason'],
+  required: ['accepted', 'intent', 'reason'],
 } satisfies JsonSchema;
 
 export const draftQueryJsonSchema = {
@@ -298,7 +304,7 @@ export const feedbackIntentJsonSchema = {
         hostPort: { type: 'integer', minimum: 1, maximum: 65535 },
         containerPort: { type: 'integer', minimum: 1, maximum: 65535 },
         name: { type: 'string', minLength: 1 },
-        replicas: { type: 'integer', minimum: 1, maximum: 50 },
+        replicas: serviceReplicasJsonSchema(),
         image: { type: 'string', minLength: 1 },
         environment: environmentEntriesJsonSchema,
         volumes: { type: 'array', items: { type: 'string', minLength: 1 } },
@@ -312,7 +318,7 @@ export const feedbackIntentJsonSchema = {
             name: { type: 'string', minLength: 1 },
             image: { type: 'string', minLength: 1 },
             desiredStatus: { type: 'string', enum: ['running', 'stopped'] },
-            replicas: { type: 'integer', minimum: 1, maximum: 50 },
+            replicas: serviceReplicasJsonSchema(),
             ports: { type: 'array', items: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' } },
             environment: environmentEntriesJsonSchema,
             dependsOn: { type: 'array', items: { type: 'string', minLength: 1 } },
@@ -337,7 +343,7 @@ const infrastructureServiceJsonSchema = {
     name: { type: 'string', minLength: 1 },
     image: { type: 'string', minLength: 1 },
     desiredStatus: { type: 'string', enum: ['running', 'stopped'] },
-    replicas: { type: 'integer', minimum: 1, maximum: 50 },
+    replicas: serviceReplicasJsonSchema(),
     ports: { type: 'array', items: { type: 'string', pattern: '^\\d{1,5}:\\d{1,5}$' } },
     environment: environmentEntriesJsonSchema,
     dependsOn: { type: 'array', items: { type: 'string', minLength: 1 } },
@@ -358,7 +364,7 @@ export const specPatchPlanJsonSchema = {
             properties: {
               op: { type: 'string', enum: ['set-service-replicas'] },
               ...patchBaseProperties,
-              replicas: { type: 'integer', minimum: 1, maximum: 50 },
+              replicas: serviceReplicasJsonSchema(),
             },
             required: [...patchBaseRequired, 'replicas'],
           },
@@ -538,7 +544,7 @@ export const verifierRemediationPatchPlanJsonSchema = {
               op: { type: 'string', enum: ['set-service-replicas'] },
               ...patchBaseProperties,
               ...patchRelevanceJsonSchemaProperties,
-              replicas: { type: 'integer', minimum: 1, maximum: 50 },
+              replicas: serviceReplicasJsonSchema(),
             },
             required: [...verifierPatchBaseRequired, 'replicas'],
           },

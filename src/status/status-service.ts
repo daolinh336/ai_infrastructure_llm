@@ -5,7 +5,8 @@ import type {
 import { desiredPortMappingsPresent } from '../domain/port-mappings.js';
 import { toReplicaContainerNames } from '../execution/container-names.js';
 import {
-  loadState,
+  listProjectStates,
+  loadProjectState,
   StateStoreError,
   type StateStoreOptions,
 } from '../state/sqlite-state-store.js';
@@ -13,11 +14,16 @@ import {
 export class StatusService {
   constructor(private readonly stateStore: StateStoreOptions = {}) {}
 
-  async showStatus(): Promise<string> {
-    let snapshot: InfrastructureStateSnapshot | null;
+  async showStatus(projectName?: string | null): Promise<string> {
+    let snapshots: InfrastructureStateSnapshot[];
 
     try {
-      snapshot = await loadState(this.stateStore);
+      if (projectName) {
+        const projectState = await loadProjectState(projectName, this.stateStore);
+        snapshots = projectState?.current ? [projectState] : [];
+      } else {
+        snapshots = (await listProjectStates(this.stateStore)).filter((snapshot) => snapshot.current);
+      }
     } catch (error) {
       if (error instanceof StateStoreError) {
         return ['Infrastructure state is invalid.', error.message].join('\n');
@@ -26,16 +32,20 @@ export class StatusService {
       throw error;
     }
 
-    if (!snapshot) {
-      return 'No infrastructure state found yet.';
+    if (snapshots.length === 0) {
+      return projectName
+        ? 'No verified infrastructure state found for project "' + projectName + '".'
+        : 'No verified infrastructure state found yet.';
     }
 
-    return [
-      `State schema version: ${snapshot.schemaVersion}`,
-      formatCurrentState(snapshot),
-      formatPendingPreview(snapshot),
-      `History records: ${snapshot.history.length}`,
-    ].join('\n');
+    return snapshots
+      .map((snapshot, index) => [
+        'Project ' + String(index + 1) + '/' + String(snapshots.length) + ': ' + snapshot.current!.desired.projectName,
+        'State schema version: ' + String(snapshot.schemaVersion),
+        formatCurrentState(snapshot),
+        'History records: ' + String(snapshot.history.length),
+      ].join('\n'))
+      .join('\n\n');
   }
 }
 
@@ -193,25 +203,4 @@ function formatRevisionHistory(
   return history
     .map((entry) => `#${entry.attemptIndex}:${entry.revisionDecision}`)
     .join(', ');
-}
-function formatPendingPreview(snapshot: InfrastructureStateSnapshot): string {
-  if (!snapshot.pendingPreview) {
-    return 'Pending preview: none';
-  }
-
-  const pending = snapshot.pendingPreview;
-  const artifactStatus = pending.composeArtifact.written
-    ? `written at ${pending.composeArtifact.writtenAt}`
-    : 'not written';
-
-  return [
-    `Pending preview project: ${pending.desired.projectName}`,
-    `Pending request: ${pending.request.raw}`,
-    `Pending services: ${pending.desired.services.map((service) => service.name).join(', ')}`,
-    `Pending preview created: ${pending.createdAt}`,
-    `Pending preview accepted: ${pending.acceptedAt ?? 'not accepted'}`,
-    `Compose artifact: ${pending.composeArtifact.targetPath} (${artifactStatus})`,
-    `Compose artifact hash: ${pending.composeArtifact.previewSha256}`,
-    `Dry-run containers if applied: ${pending.dryRunPreview?.totalContainers ?? 'unknown'}`,
-  ].join('\n');
 }

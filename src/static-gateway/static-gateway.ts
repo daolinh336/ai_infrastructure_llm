@@ -26,11 +26,12 @@ import type { LlmProvider } from '../llm/provider.js';
 
 const INTENT_CLASSIFIER_SYSTEM_PROMPT = [
   'INTENT_CLASSIFIER_V1',
-  'Classify the full user request before any infrastructure planning starts.',
-  'Do not accept a request only because it contains a create/deploy verb.',
-  'Return scope unsafe when the request asks to build or deploy systems for domination, coercion, cyber abuse, malware, exploitation, evasion, surveillance abuse, or other harmful control over people/systems.',
-  'Return scope infrastructure only when the actual requested outcome is allowed infrastructure management.',
-  'Return only JSON with shape: {"scope":"infrastructure|out-of-scope|unsafe","intent":"create|update|status|destroy|drift|null","reason":"..."}',
+  'Decide whether the full user request is related to infrastructure management before any infrastructure planning starts.',
+  'Return accepted=true when the request asks to create, update, inspect status, destroy, deploy, or check drift for infrastructure, services, containers, databases, networks, or app stacks.',
+  'Accept infrastructure requests even when details are missing, because the structured parser and later validators can ask for clarification.',
+  'Return accepted=false only when the request is not an infrastructure management request or no infrastructure action can be inferred.',
+  'When accepted=true, intent must be one of create, update, status, destroy, or drift. When accepted=false, intent must be null.',
+  'Return only JSON with shape: {"accepted":true|false,"intent":"create|update|status|destroy|drift|null","reason":"..."}',
 ].join('\n');
 
 const STRUCTURED_QUERY_PARSER_SYSTEM_PROMPT = [
@@ -122,26 +123,11 @@ export class StaticGateway {
       };
     }
 
-    if (classification.scope === 'unsafe') {
-      metrics.unsafeRejected = 1;
-      this.reportProgress({
-        phase: 'gate',
-        message: `observe... unsafe request rejected: ${classification.reason}`,
-        toolName: 'intent_classifier',
-      });
-      return {
-        status: 'rejected',
-        reason: classification.reason,
-        issues: [classification.reason],
-        metrics,
-      };
-    }
-
-    if (classification.scope === 'out-of-scope' || classification.intent === null) {
+    if (!classification.accepted || classification.intent === null) {
       metrics.intentRejected = 1;
       this.reportProgress({
         phase: 'gate',
-        message: `observe... out-of-scope request rejected: ${classification.reason}`,
+        message: `observe... request rejected by binary intent gate: ${classification.reason}`,
         toolName: 'intent_classifier',
       });
       return {
@@ -847,7 +833,6 @@ function createMetrics(): StaticGatewayMetrics {
   return {
     intentAccepted: 0,
     intentRejected: 0,
-    unsafeRejected: 0,
     clarificationRequired: 0,
     schemaValidationPassed: 0,
     schemaValidationFailed: 0,

@@ -43,6 +43,18 @@ function normalizeRuntimeResourceName(name: string, projectName: string): string
   return sanitizeIdentifier(stripProjectPrefix(name, projectName));
 }
 
+function belongsToProjectResource(
+  name: string,
+  projectName: string,
+  knownNames: ReadonlySet<string>,
+): boolean {
+  return (
+    name.startsWith(projectName + '-') ||
+    knownNames.has(name) ||
+    knownNames.has(normalizeRuntimeResourceName(name, projectName))
+  );
+}
+
 function serviceFromContainer(
   container: RuntimeContainerObservation,
   projectName: string,
@@ -86,10 +98,14 @@ export function deriveSpecFromRuntime(
 ): InfrastructureSpec {
   const projectName = sourceSpec.projectName;
   const sourceByName = new Map(sourceSpec.services.map((service) => [service.name, service]));
+  const sourceServiceNames = new Set(sourceSpec.services.map((service) => service.name));
+  const sourceNetworkNames = new Set(sourceSpec.networks);
+  const sourceVolumeNames = new Set(sourceSpec.volumes);
   const services: InfrastructureService[] = [];
   const seen = new Set<string>();
 
   for (const container of actual.containers) {
+    if (!belongsToProjectResource(container.name, projectName, sourceServiceNames)) continue;
     const derived = serviceFromContainer(container, projectName);
     if (!derived) continue;
     if (seen.has(derived.name)) continue;
@@ -126,12 +142,14 @@ export function deriveSpecFromRuntime(
   const finalServices = services;
 
   const observedNetworks = actual.networks
+    .filter((network) => belongsToProjectResource(network.name, projectName, sourceNetworkNames))
     .map((network) => normalizeRuntimeResourceName(network.name, projectName))
     .filter((name) => !isProtectedDockerNetwork(name))
     .filter((name) => IDENTIFIER_RE.test(name));
   const finalNetworks = observedNetworks.length > 0 ? observedNetworks : sourceSpec.networks;
 
   const observedVolumes = actual.volumes
+    .filter((volume) => belongsToProjectResource(volume.name, projectName, sourceVolumeNames))
     .map((volume) => normalizeRuntimeResourceName(volume.name, projectName))
     .filter((name) => IDENTIFIER_RE.test(name));
   const finalVolumes = observedVolumes;

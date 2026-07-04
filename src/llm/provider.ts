@@ -650,9 +650,9 @@ function classifyIntentForTest(prompt: string): IntentClassification {
 
   if (/\b(hack|exploit|malware|facebook)\b/i.test(prompt) || isHarmfulControlRequest(prompt)) {
     return {
-      scope: 'unsafe',
+      accepted: false,
       intent: null,
-      reason: 'Request is unsafe or unrelated to infrastructure deployment.',
+      reason: 'Request is not an accepted infrastructure management command.',
     };
   }
 
@@ -662,7 +662,7 @@ function classifyIntentForTest(prompt: string): IntentClassification {
     normalizedPrompt.includes('joke')
   ) {
     return {
-      scope: 'out-of-scope',
+      accepted: false,
       intent: null,
       reason: 'Request is not an infrastructure management command.',
     };
@@ -679,14 +679,14 @@ function classifyIntentForTest(prompt: string): IntentClassification {
 
   if (!hasInfrastructureTerm) {
     return {
-      scope: 'out-of-scope',
+      accepted: false,
       intent: null,
       reason: 'Request is not an infrastructure management command.',
     };
   }
 
   return {
-    scope: 'infrastructure',
+    accepted: true,
     intent,
     reason: 'Request appears to describe infrastructure management intent.',
   };

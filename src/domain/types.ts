@@ -16,7 +16,7 @@ export interface UserCommand {
 export type InfrastructureIntent = 'create' | 'update' | 'status' | 'destroy' | 'drift';
 
 export interface IntentClassification {
-  scope: 'infrastructure' | 'out-of-scope' | 'unsafe';
+  accepted: boolean;
   intent: InfrastructureIntent | null;
   reason: string;
 }
@@ -105,7 +105,6 @@ export interface RequestMetadata {
 export interface StaticGatewayMetrics {
   intentAccepted: number;
   intentRejected: number;
-  unsafeRejected: number;
   clarificationRequired: number;
   schemaValidationPassed: number;
   schemaValidationFailed: number;

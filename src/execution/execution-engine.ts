@@ -12,8 +12,14 @@ import type {
   DockerDeployResult,
   PreflightReport,
 } from '../domain/types.js';
-import { getRuntimeKeepaliveCommand, renderCompose } from '../compose/render-compose.js';
-import { resolveSecrets, type SecretResolutionResult } from '../compose/secret-resolver.js';
+import {
+  getRuntimeKeepaliveCommand,
+  renderCompose,
+} from '../compose/render-compose.js';
+import {
+  resolveSecrets,
+  type SecretResolutionResult,
+} from '../compose/secret-resolver.js';
 import { repairExposedSecrets } from '../compose/secret-policy-repair.js';
 import { writeGeneratedSecretsFile } from '../compose/generated-secrets-writer.js';
 import { validateAgentRunResult } from '../domain/schemas.js';
@@ -24,8 +30,6 @@ import {
 } from '../domain/stateful-database-volumes.js';
 import {
   createPendingPreviewState,
-  saveApprovedAction,
-  savePendingPreview as persistPendingPreview,
   type StateStoreOptions,
 } from '../state/sqlite-state-store.js';
 import {
@@ -58,7 +62,10 @@ import { validateVerificationReport } from '../domain/schemas.js';
 import { buildDriftReport } from './drift-detector.js';
 import { toReplicaContainerNames } from './container-names.js';
 import { isProtectedDockerNetwork } from './protected-docker-resources.js';
-import { normalizeTrustedImageReference, isSupportedImageReference } from '../domain/supported-images.js';
+import {
+  normalizeTrustedImageReference,
+  isSupportedImageReference,
+} from '../domain/supported-images.js';
 
 export interface ExecutionResult {
   composeYaml: string;
@@ -124,8 +131,16 @@ const DEFAULT_DOCKER_PULL_RETRY_POLICY: DockerPullRetryPolicy = {
 export class ExecutionEngine {
   constructor(private readonly options: ExecutionEngineOptions = {}) {}
 
-  private report(phase: ProgressEvent['phase'], message: string, toolName?: string): void {
-    this.options.progress?.({ phase, message, ...(toolName ? { toolName } : {}) });
+  private report(
+    phase: ProgressEvent['phase'],
+    message: string,
+    toolName?: string,
+  ): void {
+    this.options.progress?.({
+      phase,
+      message,
+      ...(toolName ? { toolName } : {}),
+    });
   }
 
   async dryRun(result: AgentRunResult): Promise<ExecutionResult> {
@@ -135,10 +150,15 @@ export class ExecutionEngine {
     }
 
     const secretResolution = resolveSecrets(validResult.plan.spec);
-    const secretRepair = repairExposedSecrets(secretResolution.updatedSpec, secretResolution);
+    const secretRepair = repairExposedSecrets(
+      secretResolution.updatedSpec,
+      secretResolution,
+    );
     const resolvedPlan = {
       ...validResult.plan,
-      spec: namespaceInfrastructureSpec(normalizeStatefulDatabaseReplicaVolumes(secretRepair.updatedSpec)),
+      spec: namespaceInfrastructureSpec(
+        normalizeStatefulDatabaseReplicaVolumes(secretRepair.updatedSpec),
+      ),
     };
 
     const composeYaml = renderCompose(resolvedPlan.spec);
@@ -167,15 +187,6 @@ export class ExecutionEngine {
     };
   }
 
-  async savePendingPreview(result: AgentRunResult): Promise<ExecutionResult> {
-    const executionResult = await this.dryRun(result);
-    await persistPendingPreview(
-      executionResult.pendingPreview,
-      this.options.stateStore,
-    );
-    return executionResult;
-  }
-
   async deploy(
     result: AgentRunResult,
     approvalGate: ApprovalGate,
@@ -191,11 +202,15 @@ export class ExecutionEngine {
       };
     }
 
-    const approval = await approvalGate.requestApproval(preparation.approvalRequest);
+    const approval = await approvalGate.requestApproval(
+      preparation.approvalRequest,
+    );
     return this.completeDeploy(preparation, approval);
   }
 
-  async prepareDeploy(result: AgentRunResult): Promise<DeployPreparationResult> {
+  async prepareDeploy(
+    result: AgentRunResult,
+  ): Promise<DeployPreparationResult> {
     const executionResult = await this.dryRun(result);
     const classification = classifyDeployApprovalAction();
     const preflight = runPhase8Preflight(executionResult);
@@ -263,12 +278,6 @@ export class ExecutionEngine {
       preparation.composeYaml,
     );
 
-    await saveApprovedAction(
-      preparation.pendingPreview,
-      approvedAction,
-      this.options.stateStore,
-    );
-
     const generatedSecretsPath = preparation.secretResolution
       ? await writeGeneratedSecretsFile(
           preparation.secretResolution.services,
@@ -288,10 +297,13 @@ export class ExecutionEngine {
   async deployWithDocker(
     approvedAction: ApprovedAction,
     dockerMcpClient: DockerMcpGateway,
-  ): Promise<DockerDeployResult & { operationId: string; attemptScope: AttemptScope }> {
-
+  ): Promise<
+    DockerDeployResult & { operationId: string; attemptScope: AttemptScope }
+  > {
     if (!dockerMcpClient.isInitialized) {
-      throw new Error('DockerMcpGateway must be initialized before deployWithDocker');
+      throw new Error(
+        'DockerMcpGateway must be initialized before deployWithDocker',
+      );
     }
     await preflightDockerMcpMutationCapabilities(dockerMcpClient, [
       'pullImage',
@@ -305,22 +317,32 @@ export class ExecutionEngine {
       'removeVolume',
     ]);
 
-    const spec = normalizeStatefulDatabaseReplicaVolumes(approvedAction.validatedSpec);
-    const unsupportedImages = spec.services.filter((service) => !isSupportedImageReference(service.image));
+    const spec = normalizeStatefulDatabaseReplicaVolumes(
+      approvedAction.validatedSpec,
+    );
+    const unsupportedImages = spec.services.filter(
+      (service) => !isSupportedImageReference(service.image),
+    );
     if (unsupportedImages.length > 0) {
       throw new Error(
         'Unsupported trusted image catalog reference(s): ' +
-          unsupportedImages.map((service) => `${service.name}=${service.image}`).join(', '),
+          unsupportedImages
+            .map((service) => `${service.name}=${service.image}`)
+            .join(', '),
       );
     }
     const replicatedServicesWithPorts = spec.services.filter(
-      (service) => (service.replicas ?? 1) > 1 && (service.ports?.length ?? 0) > 0,
+      (service) =>
+        (service.replicas ?? 1) > 1 && (service.ports?.length ?? 0) > 0,
     );
     if (replicatedServicesWithPorts.length > 0) {
       throw new Error(
         'Replicated services cannot publish fixed host ports during direct Docker deploy: ' +
           replicatedServicesWithPorts
-            .map((service) => service.name + ' (' + (service.ports ?? []).join(', ') + ')')
+            .map(
+              (service) =>
+                service.name + ' (' + (service.ports ?? []).join(', ') + ')',
+            )
             .join(', '),
       );
     }
@@ -351,25 +373,39 @@ export class ExecutionEngine {
       this.report('execution', 'Scanning existing Docker containers...');
       const existingContainers = await dockerMcpClient.listContainers(true);
       const desiredContainerNames = new Set(
-        spec.services.flatMap((service) => toReplicaContainerNames(spec.projectName, service)),
+        spec.services.flatMap((service) =>
+          toReplicaContainerNames(spec.projectName, service),
+        ),
       );
-      const staleProjectContainers = existingContainers.filter((container) =>
-        container.name.startsWith(spec.projectName + '-') && !desiredContainerNames.has(container.name),
+      const staleProjectContainers = sortContainersForRemoval(
+        existingContainers.filter(
+          (container) =>
+            container.name.startsWith(spec.projectName + '-') &&
+            !desiredContainerNames.has(container.name),
+        ),
+        spec.projectName,
+        spec,
       );
       for (const container of staleProjectContainers) {
         await dockerMcpClient.stopContainer(container.name);
         await dockerMcpClient.removeContainer(container.name);
       }
       const blockedExistingContainers = spec.services
-        .flatMap((service) => toReplicaContainerNames(spec.projectName, service))
-        .map((name) => existingContainers.find((container) => container.name === name))
+        .flatMap((service) =>
+          toReplicaContainerNames(spec.projectName, service),
+        )
+        .map((name) =>
+          existingContainers.find((container) => container.name === name),
+        )
         .filter((container): container is NonNullable<typeof container> =>
           Boolean(container && container.status !== 'running'),
         );
       if (blockedExistingContainers.length > 0) {
         throw new Error(
           'All-or-nothing deploy blocked by existing non-running container(s): ' +
-            blockedExistingContainers.map((container) => container.name).join(', '),
+            blockedExistingContainers
+              .map((container) => container.name)
+              .join(', '),
         );
       }
 
@@ -378,11 +414,19 @@ export class ExecutionEngine {
       const existingNetworks = await dockerMcpClient.listNetworks();
       for (const network of spec.networks) {
         if (existingNetworks.some((existing) => existing.name === network)) {
-          this.report('execution', 'Network "' + network + '" already exists; reusing.', 'createNetwork');
+          this.report(
+            'execution',
+            'Network "' + network + '" already exists; reusing.',
+            'createNetwork',
+          );
           networksCreated.push(network);
           continue;
         }
-        this.report('execution', 'Creating network "' + network + '"...', 'createNetwork');
+        this.report(
+          'execution',
+          'Creating network "' + network + '"...',
+          'createNetwork',
+        );
         await dockerMcpClient.createNetwork(network, labels);
         createdNetworks.push(network);
         networksCreated.push(network);
@@ -393,19 +437,42 @@ export class ExecutionEngine {
       const existingVolumes = await dockerMcpClient.listVolumes();
       for (const volume of spec.volumes) {
         if (existingVolumes.some((existing) => existing.name === volume)) {
-          this.report('execution', 'Volume "' + volume + '" already exists; reusing.', 'createVolume');
+          this.report(
+            'execution',
+            'Volume "' + volume + '" already exists; reusing.',
+            'createVolume',
+          );
           continue;
         }
-        this.report('execution', 'Creating volume "' + volume + '"...', 'createVolume');
+        this.report(
+          'execution',
+          'Creating volume "' + volume + '"...',
+          'createVolume',
+        );
         await dockerMcpClient.createVolume(volume, labels);
         createdVolumes.push(volume);
       }
 
       // Step 3: Pull images
-      const uniqueImages = [...new Set(spec.services.map((service) => normalizeTrustedImageReference(service.image) ?? service.image))];
-      this.report('execution', 'Images to pull: ' + (uniqueImages.length ? uniqueImages.join(', ') : 'none'));
+      const uniqueImages = [
+        ...new Set(
+          spec.services.map(
+            (service) =>
+              normalizeTrustedImageReference(service.image) ?? service.image,
+          ),
+        ),
+      ];
+      this.report(
+        'execution',
+        'Images to pull: ' +
+          (uniqueImages.length ? uniqueImages.join(', ') : 'none'),
+      );
       for (const image of uniqueImages) {
-        this.report('execution', 'Pulling image "' + image + '"...', 'pullImage');
+        this.report(
+          'execution',
+          'Pulling image "' + image + '"...',
+          'pullImage',
+        );
         await this.pullImageWithRetry(dockerMcpClient, image);
         imagesPulled.push(image);
         this.report('execution', 'Pulled image "' + image + '".', 'pullImage');
@@ -418,43 +485,84 @@ export class ExecutionEngine {
         const service = spec.services.find((s) => s.name === step.resourceName);
         if (!service) continue;
 
-        const serviceImage = normalizeTrustedImageReference(service.image) ?? service.image;
+        const serviceImage =
+          normalizeTrustedImageReference(service.image) ?? service.image;
         const command = getRuntimeKeepaliveCommand(serviceImage);
-        for (const [replicaIndex, containerName] of toReplicaContainerNames(spec.projectName, service).entries()) {
-          const containerSpec: import('../domain/types.js').ContainerCreateSpec = {
-            name: containerName,
-            image: serviceImage,
-            ...(command ? { command } : {}),
-            ports: service.ports,
-            environment: service.environment,
-            volumes: getContainerVolumeMountsForReplica(service, replicaIndex),
-            networks: spec.networks.length > 0 ? [spec.networks[0]!] : undefined,
-            labels,
-          };
+        for (const [replicaIndex, containerName] of toReplicaContainerNames(
+          spec.projectName,
+          service,
+        ).entries()) {
+          const containerSpec: import('../domain/types.js').ContainerCreateSpec =
+            {
+              name: containerName,
+              image: serviceImage,
+              ...(command ? { command } : {}),
+              ports: service.ports,
+              environment: service.environment,
+              volumes: getContainerVolumeMountsForReplica(
+                service,
+                replicaIndex,
+              ),
+              networks:
+                spec.networks.length > 0 ? [spec.networks[0]!] : undefined,
+              labels,
+            };
 
           const existingContainer = existingContainers.find(
             (container) => container.name === containerSpec.name,
           );
           if (existingContainer) {
-            this.report('execution', 'Container "' + containerSpec.name + '" already exists; keeping current runtime.', 'createContainer');
-            containersStarted.push({ name: containerSpec.name, id: containerSpec.name });
+            this.report(
+              'execution',
+              'Container "' +
+                containerSpec.name +
+                '" already exists; keeping current runtime.',
+              'createContainer',
+            );
+            containersStarted.push({
+              name: containerSpec.name,
+              id: containerSpec.name,
+            });
             continue;
           }
 
           attemptedContainers.push(containerSpec.name);
-          this.report('execution', 'Creating container "' + containerSpec.name + '" from ' + containerSpec.image + '...', 'createContainer');
-          const containerId = await dockerMcpClient.createContainer(containerSpec);
+          this.report(
+            'execution',
+            'Creating container "' +
+              containerSpec.name +
+              '" from ' +
+              containerSpec.image +
+              '...',
+            'createContainer',
+          );
+          const containerId =
+            await dockerMcpClient.createContainer(containerSpec);
           createdContainers.push(containerSpec.name);
-          this.report('execution', 'Starting container "' + containerSpec.name + '"...', 'startContainer');
+          this.report(
+            'execution',
+            'Starting container "' + containerSpec.name + '"...',
+            'startContainer',
+          );
           await dockerMcpClient.startContainer(containerSpec.name);
           containersStarted.push({ name: containerSpec.name, id: containerId });
-          this.report('execution', 'Container "' + containerSpec.name + '" is started.', 'startContainer');
+          this.report(
+            'execution',
+            'Container "' + containerSpec.name + '" is started.',
+            'startContainer',
+          );
         }
       }
     } catch (error) {
       const cleanupReport = await this.cleanupPartialDeploy(
         dockerMcpClient,
-        { createdContainers: [...new Set([...createdContainers, ...attemptedContainers])], createdNetworks, createdVolumes },
+        {
+          createdContainers: [
+            ...new Set([...createdContainers, ...attemptedContainers]),
+          ],
+          createdNetworks,
+          createdVolumes,
+        },
         'deploy-failed',
       );
       throw new Error(
@@ -486,7 +594,9 @@ export class ExecutionEngine {
     options: { projectName?: string; removeVolumes?: boolean } = {},
   ): Promise<DestroyResult> {
     if (!mcpClient.isInitialized) {
-      throw new Error('DockerMcpGateway must be initialized before destroyWithDocker');
+      throw new Error(
+        'DockerMcpGateway must be initialized before destroyWithDocker',
+      );
     }
     await preflightDockerMcpMutationCapabilities(mcpClient, [
       'stopContainer',
@@ -496,7 +606,9 @@ export class ExecutionEngine {
     ]);
     const project = options.projectName ?? snapshot?.desired.projectName ?? '';
     if (!project) {
-      throw new Error('destroyWithDocker requires a project name from current state or options');
+      throw new Error(
+        'destroyWithDocker requires a project name from current state or options',
+      );
     }
     const desired = snapshot?.desired;
     const refs = snapshot?.resourceRefs;
@@ -509,13 +621,20 @@ export class ExecutionEngine {
     mcpClient.setAllowMutations(true);
     try {
       const expectedContainers = new Set(
-        desired?.services.flatMap((service) => toReplicaContainerNames(project, service)) ?? [],
+        desired?.services.flatMap((service) =>
+          toReplicaContainerNames(project, service),
+        ) ?? [],
       );
-      const projectContainers = actual.containers.filter(
-        (container) =>
-          container.name.startsWith(project + '-') ||
-          expectedContainers.has(container.name) ||
-          ((refs?.containers.includes(container.name) ?? false) && expectedContainers.has(container.name)),
+      const projectContainers = sortContainersForRemoval(
+        actual.containers.filter(
+          (container) =>
+            container.name.startsWith(project + '-') ||
+            expectedContainers.has(container.name) ||
+            ((refs?.containers.includes(container.name) ?? false) &&
+              expectedContainers.has(container.name)),
+        ),
+        project,
+        desired,
       );
       for (const container of projectContainers) {
         try {
@@ -523,7 +642,9 @@ export class ExecutionEngine {
           await mcpClient.removeContainer(container.name);
           containersRemoved.push(container.name);
         } catch (error) {
-          removalErrors.push(`Container "${container.name}" could not be removed: ${getErrorMessage(error)}`);
+          removalErrors.push(
+            `Container "${container.name}" could not be removed: ${getErrorMessage(error)}`,
+          );
         }
       }
 
@@ -533,14 +654,17 @@ export class ExecutionEngine {
           !isProtectedDockerNetwork(network.name) &&
           (network.name.startsWith(project + '-') ||
             (desired?.networks.includes(network.name) ?? false) ||
-            ((refs?.networks.includes(network.name) ?? false) && expectedNetworks.has(network.name))),
+            ((refs?.networks.includes(network.name) ?? false) &&
+              expectedNetworks.has(network.name))),
       );
       for (const network of projectNetworks) {
         try {
           await mcpClient.removeNetwork(network.name);
           networksRemoved.push(network.name);
         } catch (error) {
-          removalErrors.push(`Network "${network.name}" could not be removed: ${getErrorMessage(error)}`);
+          removalErrors.push(
+            `Network "${network.name}" could not be removed: ${getErrorMessage(error)}`,
+          );
         }
       }
 
@@ -550,14 +674,17 @@ export class ExecutionEngine {
           (volume) =>
             volume.name.startsWith(project + '-') ||
             (desired?.volumes.includes(volume.name) ?? false) ||
-            ((refs?.volumes.includes(volume.name) ?? false) && expectedVolumes.has(volume.name)),
+            ((refs?.volumes.includes(volume.name) ?? false) &&
+              expectedVolumes.has(volume.name)),
         );
         for (const volume of projectVolumes) {
           try {
             await mcpClient.removeVolume(volume.name);
             volumesRemoved.push(volume.name);
           } catch (error) {
-            removalErrors.push(`Volume "${volume.name}" could not be removed: ${getErrorMessage(error)}`);
+            removalErrors.push(
+              `Volume "${volume.name}" could not be removed: ${getErrorMessage(error)}`,
+            );
           }
         }
       }
@@ -589,14 +716,18 @@ export class ExecutionEngine {
     mcpClient: DockerMcpGateway,
   ): Promise<{ drift: DriftReport; actual: RuntimeActualState }> {
     if (!snapshot) {
-      throw new Error('No current verified runtime snapshot to detect drift against');
+      throw new Error(
+        'No current verified runtime snapshot to detect drift against',
+      );
     }
     await preflightDockerMcpReadCapabilities(mcpClient);
     const desired = snapshot.desired;
     const containerNames = desired.services.flatMap((service) =>
       toReplicaContainerNames(desired.projectName, service),
     );
-    const actual = await mcpClient.observeActualStateWithInspect({ containerNames });
+    const actual = await mcpClient.observeActualStateWithInspect({
+      containerNames,
+    });
     const drift = buildDriftReport(snapshot.desired, actual);
     return { drift, actual };
   }
@@ -609,7 +740,10 @@ export class ExecutionEngine {
     if (!snapshot) {
       throw new Error('No current verified runtime snapshot to repair');
     }
-    await preflightDockerMcpMutationCapabilities(mcpClient, repairActionsToOperations(actions));
+    await preflightDockerMcpMutationCapabilities(
+      mcpClient,
+      repairActionsToOperations(actions),
+    );
 
     const actionsAttempted: RepairAction[] = [];
     const actionsSucceeded: RepairAction[] = [];
@@ -677,7 +811,9 @@ export class ExecutionEngine {
     const containerNames = snapshot.desired.services.flatMap((service) =>
       toReplicaContainerNames(snapshot.desired.projectName, service),
     );
-    const observed = await mcpClient.observeActualStateWithInspect({ containerNames });
+    const observed = await mcpClient.observeActualStateWithInspect({
+      containerNames,
+    });
     return {
       report: { status, actionsAttempted, actionsSucceeded, actionsFailed },
       actual: observed,
@@ -705,7 +841,10 @@ export class ExecutionEngine {
           await mcpClient.removeContainer(name);
           succeeded.push('container:' + name);
         } catch (error) {
-          failed.push({ resource: 'container:' + name, error: getErrorMessage(error) });
+          failed.push({
+            resource: 'container:' + name,
+            error: getErrorMessage(error),
+          });
         }
       }
       for (const name of [...journal.createdNetworks].reverse()) {
@@ -714,7 +853,10 @@ export class ExecutionEngine {
           await mcpClient.removeNetwork(name);
           succeeded.push('network:' + name);
         } catch (error) {
-          failed.push({ resource: 'network:' + name, error: getErrorMessage(error) });
+          failed.push({
+            resource: 'network:' + name,
+            error: getErrorMessage(error),
+          });
         }
       }
       for (const name of [...journal.createdVolumes].reverse()) {
@@ -723,7 +865,10 @@ export class ExecutionEngine {
           await mcpClient.removeVolume(name);
           succeeded.push('volume:' + name);
         } catch (error) {
-          failed.push({ resource: 'volume:' + name, error: getErrorMessage(error) });
+          failed.push({
+            resource: 'volume:' + name,
+            error: getErrorMessage(error),
+          });
         }
       }
     } finally {
@@ -750,8 +895,8 @@ export class ExecutionEngine {
     try {
       // Remove containers created in this attempt scope
       const allContainers = await mcpClient.listContainers(true);
-      const scopeContainers = allContainers.filter(
-        (c) => c.name.startsWith(attemptScope.projectName + '-'),
+      const scopeContainers = allContainers.filter((c) =>
+        c.name.startsWith(attemptScope.projectName + '-'),
       );
       for (const container of scopeContainers) {
         const resourceName = 'container:' + container.name;
@@ -761,17 +906,24 @@ export class ExecutionEngine {
           await mcpClient.removeContainer(container.name);
           succeeded.push(resourceName);
         } catch (error) {
-          failed.push({ resource: resourceName, error: getErrorMessage(error) });
+          failed.push({
+            resource: resourceName,
+            error: getErrorMessage(error),
+          });
         }
       }
 
       // Remove networks created in this attempt scope
       const allNetworks = await mcpClient.listNetworks();
-      const specNetworks = await this.getSpecNetworksForScope(mcpClient, attemptScope);
+      const specNetworks = await this.getSpecNetworksForScope(
+        mcpClient,
+        attemptScope,
+      );
       const scopeNetworks = allNetworks.filter(
         (n) =>
           !isProtectedDockerNetwork(n.name) &&
-          (specNetworks.includes(n.name) || n.name.startsWith(attemptScope.projectName + '-')),
+          (specNetworks.includes(n.name) ||
+            n.name.startsWith(attemptScope.projectName + '-')),
       );
       for (const network of scopeNetworks) {
         const resourceName = 'network:' + network.name;
@@ -780,7 +932,10 @@ export class ExecutionEngine {
           await mcpClient.removeNetwork(network.name);
           succeeded.push(resourceName);
         } catch (error) {
-          failed.push({ resource: resourceName, error: getErrorMessage(error) });
+          failed.push({
+            resource: resourceName,
+            error: getErrorMessage(error),
+          });
         }
       }
     } finally {
@@ -829,27 +984,114 @@ export class ExecutionEngine {
     for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
       try {
         if (policy.maxAttempts > 1) {
-          this.report('execution', 'Pull attempt ' + String(attempt) + '/' + String(policy.maxAttempts) + ' for image "' + image + '"...', 'pullImage');
+          this.report(
+            'execution',
+            'Pull attempt ' +
+              String(attempt) +
+              '/' +
+              String(policy.maxAttempts) +
+              ' for image "' +
+              image +
+              '"...',
+            'pullImage',
+          );
         }
         await mcpClient.pullImage(image);
         return;
       } catch (error) {
         const message = getErrorMessage(error);
         const retryable = isRetryableDockerPullError(message);
-        failures.push({ image, attempt, maxAttempts: policy.maxAttempts, retryable, error: message });
+        failures.push({
+          image,
+          attempt,
+          maxAttempts: policy.maxAttempts,
+          retryable,
+          error: message,
+        });
 
         if (!retryable || attempt >= policy.maxAttempts) {
           throw new Error(buildDockerPullFailureMessage(image, failures));
         }
 
         const delayMs = getDockerPullRetryDelayMs(policy, attempt);
-        this.report('execution', 'Pull failed for image "' + image + '"; retrying in ' + String(delayMs) + 'ms: ' + message, 'pullImage');
+        this.report(
+          'execution',
+          'Pull failed for image "' +
+            image +
+            '"; retrying in ' +
+            String(delayMs) +
+            'ms: ' +
+            message,
+          'pullImage',
+        );
         await sleep(delayMs);
       }
     }
   }
 }
 
+function sortContainersForRemoval<T extends { name: string }>(
+  containers: T[],
+  projectName: string,
+  desired?: InfrastructureSpec,
+): T[] {
+  const desiredContainerRanks = new Map<string, number>();
+  if (desired) {
+    const destroyOrder =
+      buildDependencyAwareExecutionSchedule(desired).destroyOrder;
+    for (const [serviceRank, serviceName] of destroyOrder.entries()) {
+      const service = desired.services.find(
+        (candidate) => candidate.name === serviceName,
+      );
+      if (!service) continue;
+      for (const containerName of toReplicaContainerNames(
+        projectName,
+        service,
+      )) {
+        desiredContainerRanks.set(containerName, serviceRank);
+      }
+    }
+  }
+
+  return [...containers].sort((left, right) => {
+    const leftRank = getContainerRemovalRank(
+      left.name,
+      projectName,
+      desiredContainerRanks,
+    );
+    const rightRank = getContainerRemovalRank(
+      right.name,
+      projectName,
+      desiredContainerRanks,
+    );
+    return (
+      leftRank.serviceRank - rightRank.serviceRank ||
+      leftRank.baseName.localeCompare(rightRank.baseName) ||
+      rightRank.ordinal - leftRank.ordinal ||
+      right.name.localeCompare(left.name)
+    );
+  });
+}
+
+function getContainerRemovalRank(
+  containerName: string,
+  projectName: string,
+  desiredContainerRanks: Map<string, number>,
+): { serviceRank: number; baseName: string; ordinal: number } {
+  const strippedProjectName = stripProjectPrefix(containerName, projectName);
+  const suffixMatch = /^(.*)-([1-9][0-9]*)$/.exec(strippedProjectName);
+  return {
+    serviceRank:
+      desiredContainerRanks.get(containerName) ?? Number.MAX_SAFE_INTEGER,
+    baseName: suffixMatch ? suffixMatch[1]! : strippedProjectName,
+    ordinal: suffixMatch ? Number(suffixMatch[2]) : 1,
+  };
+}
+
+function stripProjectPrefix(name: string, projectName: string): string {
+  const prefix = projectName + '-';
+  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+}
 function verifyDestroy(
   project: string,
   desired: InfrastructureSpec | undefined,
@@ -862,25 +1104,38 @@ function verifyDestroy(
   const issues: string[] = [...removalErrors];
   const evidence: string[] = [];
   const expectedContainers = new Set(
-    desired ? desired.services.map((s) => project + '-' + s.name) : (refs?.containers ?? []),
+    desired
+      ? desired.services.map((s) => project + '-' + s.name)
+      : (refs?.containers ?? []),
   );
-  const expectedNetworks = new Set(desired ? desired.networks : (refs?.networks ?? []));
+  const expectedNetworks = new Set(
+    desired ? desired.networks : (refs?.networks ?? []),
+  );
   const expectedVolumes = new Set(removeVolumes ? (refs?.volumes ?? []) : []);
 
   for (const container of actual.containers) {
-    if (expectedContainers.has(container.name) || container.name.startsWith(project + '-')) {
+    if (
+      expectedContainers.has(container.name) ||
+      container.name.startsWith(project + '-')
+    ) {
       issues.push(`Container "${container.name}" still present after destroy.`);
     }
   }
   for (const network of actual.networks) {
     if (isProtectedDockerNetwork(network.name)) continue;
-    if (expectedNetworks.has(network.name) || network.name.startsWith(project + '-')) {
+    if (
+      expectedNetworks.has(network.name) ||
+      network.name.startsWith(project + '-')
+    ) {
       issues.push(`Network "${network.name}" still present after destroy.`);
     }
   }
   if (removeVolumes) {
     for (const volume of actual.volumes) {
-      if (expectedVolumes.has(volume.name) || volume.name.startsWith(project + '-')) {
+      if (
+        expectedVolumes.has(volume.name) ||
+        volume.name.startsWith(project + '-')
+      ) {
         issues.push(`Volume "${volume.name}" still present after destroy.`);
       }
     }
@@ -892,7 +1147,8 @@ function verifyDestroy(
     );
   }
 
-  const status: VerificationReport['status'] = issues.length === 0 ? 'passed' : 'failed';
+  const status: VerificationReport['status'] =
+    issues.length === 0 ? 'passed' : 'failed';
   return validateVerificationReport({
     status,
     scope: 'tool-runtime',
@@ -901,7 +1157,9 @@ function verifyDestroy(
     evidence,
     errorReason:
       issues.length > 0
-        ? 'Destroy verification found ' + String(issues.length) + ' remaining resource(s).'
+        ? 'Destroy verification found ' +
+          String(issues.length) +
+          ' remaining resource(s).'
         : null,
     revisionHint:
       issues.length > 0
@@ -970,8 +1228,12 @@ function isRetryableDockerPullError(message: string): boolean {
   return retryableSignals.some((signal) => normalized.includes(signal));
 }
 
-function getDockerPullRetryDelayMs(policy: DockerPullRetryPolicy, attempt: number): number {
-  const rawDelay = policy.initialDelayMs * policy.backoffFactor ** (attempt - 1);
+function getDockerPullRetryDelayMs(
+  policy: DockerPullRetryPolicy,
+  attempt: number,
+): number {
+  const rawDelay =
+    policy.initialDelayMs * policy.backoffFactor ** (attempt - 1);
   return Math.min(policy.maxDelayMs, Math.floor(rawDelay));
 }
 
@@ -980,13 +1242,16 @@ function buildDockerPullFailureMessage(
   failures: ReadonlyArray<DockerPullRetryAttempt>,
 ): string {
   const lastFailure = failures[failures.length - 1];
-  const retryableAttempts = failures.filter((failure) => failure.retryable).length;
+  const retryableAttempts = failures.filter(
+    (failure) => failure.retryable,
+  ).length;
   const reason = lastFailure?.retryable
     ? 'retryable pull error persisted after configured attempts'
     : 'non-retryable pull error';
   const history = failures
-    .map((failure) =>
-      `attempt ${failure.attempt}/${failure.maxAttempts}: ${failure.error}`,
+    .map(
+      (failure) =>
+        `attempt ${failure.attempt}/${failure.maxAttempts}: ${failure.error}`,
     )
     .join('; ');
 
@@ -1003,7 +1268,9 @@ function sleep(delayMs: number): Promise<void> {
   });
 }
 
-async function preflightDockerMcpReadCapabilities(mcpClient: DockerMcpGateway): Promise<void> {
+async function preflightDockerMcpReadCapabilities(
+  mcpClient: DockerMcpGateway,
+): Promise<void> {
   const candidate = mcpClient as DockerMcpGateway & {
     preflightReadCapabilities?: () => Promise<unknown>;
   };
@@ -1017,14 +1284,18 @@ async function preflightDockerMcpMutationCapabilities(
   operations: ReadonlyArray<string>,
 ): Promise<void> {
   const candidate = mcpClient as DockerMcpGateway & {
-    preflightMutationCapabilities?: (operations: ReadonlyArray<string>) => Promise<unknown>;
+    preflightMutationCapabilities?: (
+      operations: ReadonlyArray<string>,
+    ) => Promise<unknown>;
   };
   if (typeof candidate.preflightMutationCapabilities === 'function') {
     await candidate.preflightMutationCapabilities([...new Set(operations)]);
   }
 }
 
-function repairActionsToOperations(actions: ReadonlyArray<RepairAction>): string[] {
+function repairActionsToOperations(
+  actions: ReadonlyArray<RepairAction>,
+): string[] {
   const operations: string[] = [];
   for (const action of actions) {
     if (action.kind === 'start-container') operations.push('startContainer');
@@ -1032,17 +1303,18 @@ function repairActionsToOperations(actions: ReadonlyArray<RepairAction>): string
     if (action.kind === 'pull-image') operations.push('pullImage');
     if (action.kind === 'create-network') operations.push('createNetwork');
     if (action.kind === 'create-volume') operations.push('createVolume');
-    if (action.kind === 'recreate-container') operations.push('createContainer', 'startContainer');
+    if (action.kind === 'recreate-container')
+      operations.push('createContainer', 'startContainer');
   }
   return operations;
 }
 
 function buildOperationLabels(scope: AttemptScope): Record<string, string> {
   return {
-    'app': 'infra-react-agent',
-    'project': scope.projectName,
-    'operationId': scope.operationId,
-    'approvedActionId': scope.approvedActionId,
+    app: 'infra-react-agent',
+    project: scope.projectName,
+    operationId: scope.operationId,
+    approvedActionId: scope.approvedActionId,
     'managed-by': 'infra-react-agent',
   };
 }
@@ -1052,4 +1324,3 @@ function replicaIndexFromContainerName(containerName: string): number {
   if (!match) return 0;
   return Math.max(Number(match[1]) - 1, 0);
 }
-

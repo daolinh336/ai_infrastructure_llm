@@ -325,6 +325,10 @@ export function evaluateDryRunPolicy(
     }
   }
 
+  for (const finding of buildStatefulDatabasePrimaryDependencyFindings(validSpec)) {
+    findings.push(finding);
+  }
+
   for (const warning of schedule.warnings) {
     findings.push({
       severity: 'warning',
@@ -336,6 +340,54 @@ export function evaluateDryRunPolicy(
   }
 
   return findings;
+}
+
+function buildStatefulDatabasePrimaryDependencyFindings(
+  spec: InfrastructureSpec,
+): DryRunPolicyFinding[] {
+  return [...groupNumberedDatabaseReplicas(spec.services).values()]
+    .filter((group) => group.ordinals.length > 1 && group.ordinals[0] === 1)
+    .map((group) => ({
+      severity: 'warning',
+      code: 'stateful-database-primary-dependency',
+      message:
+        `Stateful database replica group "${group.baseName}" uses "${group.baseName}-1" as the primary dependency anchor; replica shrink removes highest suffix first (${group.baseName}-${group.ordinals[group.ordinals.length - 1]}, then lower suffixes) and never removes the last remaining replica.`,
+      resourceName: `${group.baseName}-1`,
+      resourceType: 'service',
+    }));
+}
+
+function groupNumberedDatabaseReplicas(
+  services: InfrastructureService[],
+): Map<string, { baseName: string; ordinals: number[] }> {
+  const groups = new Map<string, { baseName: string; ordinals: number[] }>();
+
+  for (const service of services) {
+    if (service.kind !== 'database') continue;
+
+    const parsed = parseNumberedReplicaServiceName(service.name);
+    if (parsed === null) continue;
+
+    const group = groups.get(parsed.baseName) ?? { baseName: parsed.baseName, ordinals: [] };
+    group.ordinals.push(parsed.ordinal);
+    groups.set(parsed.baseName, group);
+  }
+
+  for (const group of groups.values()) {
+    group.ordinals.sort((left, right) => left - right);
+  }
+
+  return groups;
+}
+
+function parseNumberedReplicaServiceName(name: string): { baseName: string; ordinal: number } | null {
+  const match = /^(.+)-(\d+)$/.exec(name);
+  if (!match) return null;
+
+  const ordinal = Number(match[2]);
+  if (!Number.isInteger(ordinal) || ordinal < 1) return null;
+
+  return { baseName: match[1]!, ordinal };
 }
 
 function getResolvedSecret(

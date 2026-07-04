@@ -75,7 +75,6 @@ export function printStaticGatewayMetrics(metrics: StaticGatewayMetrics): void {
   console.log(chalk.cyan('Static validation metrics:'));
   console.log(`- intentAccepted: ${metrics.intentAccepted}`);
   console.log(`- intentRejected: ${metrics.intentRejected}`);
-  console.log(`- unsafeRejected: ${metrics.unsafeRejected}`);
   console.log(`- clarificationRequired: ${metrics.clarificationRequired}`);
   console.log(`- schemaValidationPassed: ${metrics.schemaValidationPassed}`);
   console.log(`- schemaValidationFailed: ${metrics.schemaValidationFailed}`);
@@ -140,7 +139,8 @@ export function printDetailedDryRunPreview(
 ): void {
   console.log(chalk.cyan('Detailed dry-run preview:'));
   console.log(`Project: ${preview.projectName}`);
-  console.log(`Services: ${preview.totalServices}`);
+
+
   console.log(`Container count if applied: ${preview.totalContainers}`);
   console.log(`Compose artifact target: ${preview.artifactTargetPath} (not written)`);
   console.log(
@@ -230,6 +230,8 @@ function isUserFacingPolicyFinding(
       return true;
     case 'schedule-readiness-warning':
       return isTopologyDependencyWarning(finding.message);
+    case 'stateful-database-primary-dependency':
+      return true;
     case 'replica-preview':
       return getFindingServiceKind(finding, preview) === 'database';
     case 'exposed-host-port':
@@ -844,14 +846,8 @@ export function collectDestroyAllTargets(
   };
 
   addSnapshotTargets(state?.current ?? null);
-  if (state?.pendingPreview?.desired) {
-    projects.add(state.pendingPreview.desired.projectName);
-  }
   for (const projectState of projectStates) {
     addSnapshotTargets(projectState.current ?? null);
-    if (projectState.pendingPreview?.desired) {
-      projects.add(projectState.pendingPreview.desired.projectName);
-    }
   }
 
   for (const project of projects) {

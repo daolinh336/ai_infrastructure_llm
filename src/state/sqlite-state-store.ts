@@ -121,10 +121,7 @@ export async function loadState(
         snapshot.current_json,
         'current_json',
       ),
-      pendingPreview: parseJsonField<PendingPreviewState | null>(
-        snapshot.pending_preview_json,
-        'pending_preview_json',
-      ),
+      pendingPreview: null,
       history: historyRows.map((row) =>
         parseJsonField<StateOperationRecord>(row.payload_json, `history:${row.id}`),
       ),
@@ -186,28 +183,29 @@ export async function loadProjectState(
       }
 
       const current = parseJsonField<VerifiedRuntimeSnapshot | null>(singleton.current_json, 'current_json');
-      const pendingPreview = parseJsonField<PendingPreviewState | null>(singleton.pending_preview_json, 'pending_preview_json');
       const matchesCurrent = current?.desired.projectName === projectName;
-      const matchesPendingPreview = pendingPreview?.desired.projectName === projectName;
 
-      if (!matchesCurrent && !matchesPendingPreview) {
+      if (!matchesCurrent) {
         return null;
       }
 
       return canonicalizeStateSnapshotForStorage({
         schemaVersion: singleton.schema_version,
-        current: matchesCurrent ? current : null,
-        pendingPreview: matchesPendingPreview ? pendingPreview : null,
+        current,
+        pendingPreview: null,
         history: historyRows.map((historyRow) =>
           parseJsonField<StateOperationRecord>(historyRow.payload_json, `history:${historyRow.id}`),
         ),
       });
     }
 
+    const current = parseJsonField<VerifiedRuntimeSnapshot | null>(row.current_json, 'project_current_json');
+    if (!current) return null;
+
     return canonicalizeStateSnapshotForStorage({
       schemaVersion: row.schema_version,
-      current: parseJsonField<VerifiedRuntimeSnapshot | null>(row.current_json, 'project_current_json'),
-      pendingPreview: parseJsonField<PendingPreviewState | null>(row.pending_preview_json, 'project_pending_preview_json'),
+      current,
+      pendingPreview: null,
       history: historyRows.map((historyRow) =>
         parseJsonField<StateOperationRecord>(historyRow.payload_json, `history:${historyRow.id}`),
       ),
@@ -233,6 +231,7 @@ export async function listProjectStates(
       .prepare([
         'SELECT project_name, schema_version, current_json, pending_preview_json',
         'FROM project_state_snapshots',
+        'WHERE current_json IS NOT NULL',
         'ORDER BY project_name ASC',
       ].join(' '))
       .all() as Array<StateSnapshotRow & { project_name: string }>;
@@ -250,7 +249,7 @@ export async function listProjectStates(
       return canonicalizeStateSnapshotForStorage({
         schemaVersion: row.schema_version,
         current: parseJsonField<VerifiedRuntimeSnapshot | null>(row.current_json, 'project_current_json'),
-        pendingPreview: parseJsonField<PendingPreviewState | null>(row.pending_preview_json, 'project_pending_preview_json'),
+        pendingPreview: null,
         history: historyRows.map((historyRow) =>
           parseJsonField<StateOperationRecord>(historyRow.payload_json, `history:${historyRow.id}`),
         ),
@@ -265,7 +264,8 @@ export async function projectExists(
   projectName: string,
   options: StateStoreOptions = {},
 ): Promise<boolean> {
-  return (await loadProjectState(projectName, options)) !== null;
+  const state = await loadProjectState(projectName, options);
+  return state?.current !== null && state?.current !== undefined;
 }
 export async function saveState(
   stateSnapshot: InfrastructureStateSnapshot,
@@ -292,100 +292,6 @@ export async function saveState(
   } finally {
     database.close();
   }
-}
-
-export async function savePendingPreview(
-  pendingPreview: PendingPreviewState,
-  options: StateStoreOptions = {},
-): Promise<InfrastructureStateSnapshot> {
-  const existingState = (await loadState(options)) ?? createEmptyStateSnapshot();
-  const operation = createStateOperationRecord({
-    type: 'pending-preview-saved',
-    projectName: pendingPreview.desired.projectName,
-    request: pendingPreview.request,
-    summary: `Saved pending preview for project "${pendingPreview.desired.projectName}".`,
-    createdAt: pendingPreview.createdAt,
-  });
-  const nextState = validateInfrastructureStateSnapshot({
-    ...existingState,
-    pendingPreview,
-    history: [...existingState.history, operation],
-  });
-
-  await saveState(nextState, options);
-  return nextState;
-}
-
-export async function saveApprovalRejection(
-  pendingPreview: PendingPreviewState,
-  approval: ApprovalResult,
-  options: StateStoreOptions = {},
-): Promise<InfrastructureStateSnapshot> {
-  const existingState = (await loadState(options)) ?? createEmptyStateSnapshot();
-  const rejectedPreview = validatePendingPreviewForState({
-    ...pendingPreview,
-    approval,
-    approvedAction: null,
-  });
-  const operation = createStateOperationRecord({
-    type: 'approval-rejected',
-    projectName: pendingPreview.desired.projectName,
-    request: pendingPreview.request,
-    summary: `Approval rejected for project "${pendingPreview.desired.projectName}".`,
-    createdAt: approval.respondedAt,
-  });
-  const nextState = validateInfrastructureStateSnapshot({
-    ...existingState,
-    current: existingState.current,
-    pendingPreview: rejectedPreview,
-    history: [...existingState.history, operation],
-  });
-
-  await saveState(nextState, options);
-  return nextState;
-}
-
-export async function saveApprovedAction(
-  pendingPreview: PendingPreviewState,
-  approvedAction: ApprovedAction,
-  options: StateStoreOptions = {},
-): Promise<InfrastructureStateSnapshot> {
-  const existingState = (await loadState(options)) ?? createEmptyStateSnapshot();
-  const acceptedAt = approvedAction.approvalMarker.approvedAt;
-  const acceptedPreview = validatePendingPreviewForState({
-    ...pendingPreview,
-    composeArtifact: approvedAction.composeArtifact,
-    acceptedAt,
-    approval: approvedAction.approval,
-    approvedAction,
-  });
-  const composeWrittenOperation = createStateOperationRecord({
-    type: 'compose-artifact-written',
-    projectName: pendingPreview.desired.projectName,
-    request: pendingPreview.request,
-    summary: `Wrote compose artifact "${approvedAction.composeArtifact.targetPath}" for project "${pendingPreview.desired.projectName}".`,
-    createdAt: acceptedAt,
-  });
-  const approvedActionOperation = createStateOperationRecord({
-    type: 'approved-action-created',
-    projectName: pendingPreview.desired.projectName,
-    request: pendingPreview.request,
-    summary: `Created ApprovedAction for project "${pendingPreview.desired.projectName}".`,
-    createdAt: acceptedAt,
-  });
-  const nextState = validateInfrastructureStateSnapshot({
-    ...existingState,
-    current: existingState.current,
-    pendingPreview: acceptedPreview,
-    history: [
-      ...existingState.history,
-      composeWrittenOperation,
-      approvedActionOperation,
-    ],
-  });
-
-  await saveState(nextState, options);
-  return nextState;
 }
 
 export interface SaveVerifiedRuntimeSnapshotInput {
@@ -460,6 +366,7 @@ export async function saveVerifiedRuntimeSnapshot(
   const nextState = validateInfrastructureStateSnapshot({
     ...existingState,
     current: snapshot,
+    pendingPreview: null,
     history: [...existingState.history, operation],
   });
   await saveState(nextState, options);
@@ -514,7 +421,7 @@ export async function saveStateOperationRecord(
   const nextState = validateInfrastructureStateSnapshot({
     ...existingState,
     current: existingState.current,
-    pendingPreview: existingState.pendingPreview,
+    pendingPreview: null,
     history: [...existingState.history, record],
   });
   await saveState(nextState, options);
@@ -551,7 +458,7 @@ export async function clearManagedProjectState(
   const nextState = validateInfrastructureStateSnapshot({
     ...existingState,
     current: existingState.current?.desired.projectName === input.projectName ? null : existingState.current,
-    pendingPreview: existingState.pendingPreview?.desired.projectName === input.projectName ? null : existingState.pendingPreview,
+    pendingPreview: null,
     history: [...existingState.history, record],
   });
   await saveState(nextState, options);
@@ -573,7 +480,7 @@ export async function discardManagedProjectState(
   const nextState = validateInfrastructureStateSnapshot({
     ...existingState,
     current: existingState.current?.desired.projectName === projectName ? null : existingState.current,
-    pendingPreview: existingState.pendingPreview?.desired.projectName === projectName ? null : existingState.pendingPreview,
+    pendingPreview: null,
     history: existingState.history.filter((record) => record.projectName !== projectName),
   });
 
@@ -779,7 +686,7 @@ function upsertSnapshot(
       id: SINGLETON_STATE_ID,
       schemaVersion: stateSnapshot.schemaVersion,
       currentJson: stringifyNullableJson(stateSnapshot.current),
-      pendingPreviewJson: stringifyNullableJson(stateSnapshot.pendingPreview),
+      pendingPreviewJson: null,
       updatedAt: new Date().toISOString(),
     });
 }
@@ -798,16 +705,6 @@ function upsertProjectSnapshots(
       history: stateSnapshot.history.filter((entry) => entry.projectName === projectName),
     });
   }
-  if (stateSnapshot.pendingPreview) {
-    const projectName = stateSnapshot.pendingPreview.desired.projectName;
-    const existing = projects.get(projectName) ?? {
-      schemaVersion: stateSnapshot.schemaVersion,
-      current: null,
-      pendingPreview: null,
-      history: stateSnapshot.history.filter((entry) => entry.projectName === projectName),
-    };
-    projects.set(projectName, { ...existing, pendingPreview: stateSnapshot.pendingPreview });
-  }
 
   const upsertProject = database.prepare([
     'INSERT INTO project_state_snapshots',
@@ -825,7 +722,7 @@ function upsertProjectSnapshots(
       projectName,
       schemaVersion: projectState.schemaVersion,
       currentJson: stringifyNullableJson(projectState.current),
-      pendingPreviewJson: stringifyNullableJson(projectState.pendingPreview),
+      pendingPreviewJson: null,
       updatedAt: new Date().toISOString(),
     });
   }
@@ -895,17 +792,6 @@ function createStateOperationRecord(input: {
   };
 }
 
-function validatePendingPreviewForState(
-  pendingPreview: PendingPreviewState,
-): PendingPreviewState {
-  return validateInfrastructureStateSnapshot({
-    schemaVersion: STATE_SCHEMA_VERSION,
-    current: null,
-    pendingPreview,
-    history: [],
-  }).pendingPreview as PendingPreviewState;
-}
-
 function canonicalizeStateSnapshotForStorage(
   stateSnapshot: unknown,
 ): InfrastructureStateSnapshot {
@@ -913,8 +799,12 @@ function canonicalizeStateSnapshotForStorage(
   return validateInfrastructureStateSnapshot({
     ...snapshot,
     current: snapshot.current ? canonicalizeVerifiedSnapshotForStorage(snapshot.current) : null,
-    pendingPreview: snapshot.pendingPreview ? canonicalizePendingPreviewForStorage(snapshot.pendingPreview) : null,
+    pendingPreview: null,
   });
+}
+
+function canonicalizeSpecForStorage(spec: InfrastructureSpec): InfrastructureSpec {
+  return validateInfrastructureSpec(namespaceInfrastructureSpec(normalizeStatefulDatabaseReplicaVolumes(spec)));
 }
 
 function canonicalizeVerifiedSnapshotForStorage(
@@ -928,33 +818,6 @@ function canonicalizeVerifiedSnapshotForStorage(
       ? { resourceRefs: canonicalizeRuntimeResourceRefs(snapshot.resourceRefs, desired) }
       : {}),
   };
-}
-
-function canonicalizePendingPreviewForStorage(
-  pendingPreview: PendingPreviewState,
-): PendingPreviewState {
-  const desired = canonicalizeSpecForStorage(pendingPreview.desired);
-  return {
-    ...pendingPreview,
-    desired,
-    plan: validateExecutionPlan({ ...pendingPreview.plan, spec: desired }),
-    ...(pendingPreview.approvedAction !== undefined
-      ? {
-          approvedAction: pendingPreview.approvedAction
-            ? {
-                ...pendingPreview.approvedAction,
-                validatedSpec: desired,
-              }
-            : null,
-        }
-      : {}),
-  };
-}
-
-function canonicalizeSpecForStorage(spec: InfrastructureSpec): InfrastructureSpec {
-  return validateInfrastructureSpec(
-    namespaceInfrastructureSpec(normalizeStatefulDatabaseReplicaVolumes(spec)),
-  );
 }
 
 function canonicalizeRuntimeResourceRefs(

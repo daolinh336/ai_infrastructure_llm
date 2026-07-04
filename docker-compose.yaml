@@ -1,5 +1,5 @@
 services:
-  postgres:
+  postgres-1:
     image: postgres:16-alpine
     restart: unless-stopped
     deploy:
@@ -7,9 +7,32 @@ services:
     environment:
       POSTGRES_DB: app
       POSTGRES_USER: abcabcabc
-      POSTGRES_PASSWORD: pw-a9bbcef1686eb85c659eb951
+      POSTGRES_PASSWORD: pw-8f76cb7615f2af1b681aa0ca
     volumes:
-      - test-postgres-data:/var/lib/postgresql/data
+      - test-postgres-data-1:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U abcabcabc
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - test-app-network
+  postgres-2:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    deploy:
+      replicas: 1
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: abcabcabc
+      POSTGRES_PASSWORD: pw-fd98847a94ad70891602c7aa
+    depends_on:
+      - postgres-1
+    volumes:
+      - test-postgres-data-2:/var/lib/postgresql/data
     healthcheck:
       test:
         - CMD-SHELL
@@ -24,10 +47,11 @@ services:
     image: node:20-alpine
     restart: unless-stopped
     deploy:
-      replicas: 2
+      replicas: 1
     environment: {}
     depends_on:
-      - postgres
+      - postgres-1
+      - postgres-2
     command:
       - tail
       - -f
@@ -49,4 +73,5 @@ services:
 networks:
   test-app-network: {}
 volumes:
-  test-postgres-data: {}
+  test-postgres-data-1: {}
+  test-postgres-data-2: {}

@@ -227,18 +227,34 @@ export class DockerMcpGateway {
   async inspectContainer(
     containerName: string,
   ): Promise<RuntimeContainerObservation | null> {
-    const result = await this.executeRoute('inspectContainer', {
-      container_id: containerName,
-    });
+    let result: string;
+    try {
+      result = await this.executeRoute('inspectContainer', {
+        container_id: containerName,
+      });
+    } catch (error) {
+      if (isMissingDockerResourceError(error)) {
+        return null;
+      }
+      throw error;
+    }
     return parseInspectResult(result, containerName);
   }
 
   async inspectContainerSummary(
     containerName: string,
   ): Promise<RuntimeContainerSummary | null> {
-    const result = await this.executeRoute('inspectContainer', {
-      container_id: containerName,
-    });
+    let result: string;
+    try {
+      result = await this.executeRoute('inspectContainer', {
+        container_id: containerName,
+      });
+    } catch (error) {
+      if (isMissingDockerResourceError(error)) {
+        return null;
+      }
+      throw error;
+    }
     return parseInspectSummaryResult(result, containerName);
   }
 
@@ -401,9 +417,9 @@ export class DockerMcpGateway {
       this.listImages(),
     ]);
 
-    const candidateNames = options.containerNames?.length
-      ? options.containerNames
-      : containers.map((c) => c.name);
+    const requestedNames = options.containerNames ?? [];
+    const listedNames = containers.map((container) => container.name);
+    const candidateNames = Array.from(new Set([...requestedNames, ...listedNames]));
     const inspected = await Promise.all(
       candidateNames.map((name) => this.inspectContainer(name)),
     );
@@ -465,6 +481,15 @@ export class DockerMcpGateway {
 
 function inspectErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isMissingDockerResourceError(error: unknown): boolean {
+  const message = inspectErrorMessage(error).toLowerCase();
+  return (
+    message.includes('no such container') ||
+    message.includes('container not found') ||
+    message.includes('404')
+  );
 }
 
 function mapImageReference(ref: string): Record<string, unknown> {

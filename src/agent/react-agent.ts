@@ -311,12 +311,6 @@ export class ReActAgent {
     const validContext = validatePlanningClarificationContext(context);
     const validAnswer = validateClarificationAnswer(answer);
     const resolution = applyClarificationAnswer(validContext, validAnswer);
-    const resolvedQuery = resolution.query;
-    const resolvedSpec = resolution.spec ?? validateInfrastructureSpec(buildSpecFromDraft(resolvedQuery));
-    const remainingUncertainties = detectPlanningUncertainties(resolvedSpec).filter(
-      (uncertainty) => uncertainty.severity === 'blocking',
-    );
-
     const observations: AgentObservation[] = [
       {
         source: 'observe:user_clarification',
@@ -327,6 +321,32 @@ export class ReActAgent {
       },
     ];
     const trace: ReActStep[] = [];
+
+    const resolvedQuery = resolution.query;
+    const nextImageSelectionClarification = buildImageSelectionClarification(
+      resolvedQuery,
+      null,
+      trace,
+      observations,
+      this.reportProgress,
+    );
+    if (nextImageSelectionClarification?.status === 'clarification') {
+      if (nextImageSelectionClarification.clarificationContext) {
+        nextImageSelectionClarification.clarificationContext.assumptions = mergeAssumptions(
+          [
+            ...validContext.assumptions,
+            `User resolved planning uncertainty ${validAnswer.uncertaintyId} before continuing image selection.`,
+          ],
+          nextImageSelectionClarification.clarificationContext.assumptions,
+        );
+      }
+      return nextImageSelectionClarification;
+    }
+
+    const resolvedSpec = resolution.spec ?? validateInfrastructureSpec(buildSpecFromDraft(resolvedQuery));
+    const remainingUncertainties = detectPlanningUncertainties(resolvedSpec).filter(
+      (uncertainty) => uncertainty.severity === 'blocking',
+    );
 
     if (remainingUncertainties.length) {
       const primaryUncertainty = remainingUncertainties[0]!;
@@ -896,12 +916,9 @@ function formatStateMemoryObservation(snapshot: InfrastructureStateSnapshot): st
   const currentText = snapshot.current
     ? `current verified project "${snapshot.current.desired.projectName}" with actual source "${snapshot.current.actual.source}"`
     : 'no verified current runtime state';
-  const pendingText = snapshot.pendingPreview
-    ? `pending preview for project "${snapshot.pendingPreview.desired.projectName}" created at ${snapshot.pendingPreview.createdAt}`
-    : 'no pending preview';
 
   return [
-    `Loaded state memory: ${currentText}; ${pendingText}.`,
+    `Loaded state memory: ${currentText}.`,
     'Actual Docker runtime remains unverified unless current.actual.source comes from a read-only runtime observation.',
   ].join(' ');
 }
@@ -911,7 +928,6 @@ interface ReasoningPromptInput {
   memory: {
     summary: string;
     currentProject: string | null;
-    pendingPreviewProject: string | null;
     priorReasoning: Array<Pick<ReActStep, 'id' | 'phase' | 'message' | 'toolName'>>;
     priorObservations: AgentObservation[];
   };
@@ -923,7 +939,6 @@ function buildReasoningPromptInput(query: ValidatedQuery): ReasoningPromptInput 
     memory: {
       summary: 'State memory intentionally omitted from planning context.',
       currentProject: null,
-      pendingPreviewProject: null,
       priorReasoning: [],
       priorObservations: [],
     },
@@ -1077,10 +1092,10 @@ function buildImageSelectionClarification(
     draft: {
       ...query.draft,
       services: query.draft.services.map((service) =>
-        service.image === null
+        service === targetDraftService
           ? {
               ...service,
-              image: inferRecommendedImageForService(query, service, reasoning),
+              image: recommendedImage,
               name: service.name ?? 'web',
             }
           : service,
@@ -1149,6 +1164,10 @@ function buildImageSelectionClarification(
     observations,
     trace,
   };
+}
+
+function mergeAssumptions(primary: string[], secondary: string[]): string[] {
+  return [...primary, ...secondary.filter((assumption) => !primary.includes(assumption))];
 }
 
 function selectImageClarificationTarget(
@@ -1566,7 +1585,8 @@ function detectPlanningUncertainties(spec: InfrastructureSpec): PlanningUncertai
     if (
       service.kind === 'backend' &&
       databaseNames.length > 1 &&
-      databaseDependencies.length !== 1
+      databaseDependencies.length !== 1 &&
+      !isSingleDatabaseReplicaGroup(databaseNames, databaseDependencies)
     ) {
       uncertainties.push(
         validatePlanningUncertainty({
@@ -1623,6 +1643,45 @@ function detectPlanningUncertainties(spec: InfrastructureSpec): PlanningUncertai
   }
 
   return uncertainties;
+}
+
+function isSingleDatabaseReplicaGroup(
+  databaseNames: string[],
+  databaseDependencies: string[],
+): boolean {
+  const replicaGroups = new Map<string, Set<number>>();
+
+  for (const databaseName of databaseNames) {
+    const parsed = parseReplicaServiceName(databaseName);
+    if (parsed === null) return false;
+
+    const ordinals = replicaGroups.get(parsed.baseName) ?? new Set<number>();
+    ordinals.add(parsed.ordinal);
+    replicaGroups.set(parsed.baseName, ordinals);
+  }
+
+  if (replicaGroups.size !== 1) return false;
+
+  const [replicaGroupName, ordinals] = replicaGroups.entries().next().value as [string, Set<number>];
+  if (!ordinals.has(1)) return false;
+
+  const expectedDependencies = new Set(
+    [...ordinals].map((ordinal) => `${replicaGroupName}-${ordinal}`),
+  );
+
+  return databaseDependencies.length > 0 && databaseDependencies.every(
+    (dependencyName) => expectedDependencies.has(dependencyName),
+  );
+}
+
+function parseReplicaServiceName(name: string): { baseName: string; ordinal: number } | null {
+  const match = /^(.+)-(\d+)$/.exec(name);
+  if (!match) return null;
+
+  const ordinal = Number(match[2]);
+  if (!Number.isInteger(ordinal) || ordinal < 1) return null;
+
+  return { baseName: match[1]!, ordinal };
 }
 
 function applyClarificationAnswer(
@@ -1712,8 +1771,13 @@ function applyClarificationAnswer(
       hasBackend: true,
       hasDatabase: true,
     });
-    if (service.name === oldImageBase || service.name === oldDefaultName || service.name === 'web') {
-      service.name = getImageBase(imageRef);
+    const newImageBase = getImageBase(imageRef);
+    if (
+      service.name === oldImageBase ||
+      service.name === oldDefaultName ||
+      (service.name === 'web' && newImageBase !== oldImageBase)
+    ) {
+      service.name = newImageBase;
     }
     service.image = imageRef;
   } else {

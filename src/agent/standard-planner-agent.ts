@@ -126,7 +126,12 @@ export class StandardPlannerAgent implements PlannerAgent {
           patchPlanError,
           feedbackIntent,
         );
-        if (shouldPreferDeterministicFeedbackPatchPlan(deterministicPatchPlan, patchPlan)) {
+        if (shouldPreferDeterministicFeedbackPatchPlan(
+          deterministicPatchPlan,
+          patchPlan,
+          obs.userFeedback.message,
+          feedbackIntent,
+        )) {
           assumptions.push(
             feedbackIntent !== null
               ? 'Revision patch source: semantic feedback intent fallback replaced empty/unavailable LLM patch plan.'
@@ -1823,6 +1828,8 @@ function resolveSingleStatefulDatabaseGroupForFeedback(
 function shouldPreferDeterministicFeedbackPatchPlan(
   deterministicPatchPlan: SpecPatchPlan,
   llmPatchPlan: SpecPatchPlan | null,
+  feedback: string,
+  feedbackIntent: FeedbackIntent | null,
 ): boolean {
   const hasDeterministicPatch = deterministicPatchPlan.patches.length > 0;
   const hasDeterministicAmbiguity = isServiceTargetAmbiguityPatchPlan(deterministicPatchPlan);
@@ -1832,10 +1839,48 @@ function shouldPreferDeterministicFeedbackPatchPlan(
   }
   if (deterministicPatchPlan.requiresUserInput || deterministicPatchPlan.ambiguities.length > 0) return false;
 
+  const deterministicReplicaOnly = deterministicPatchPlan.patches.length > 0
+    && deterministicPatchPlan.patches.every((patch) =>
+      patch.op === 'set-service-replicas' && isSupportedDeterministicReplicaTarget(patch.target),
+    );
+  const llmHasReplicaPatch = llmPatchPlan.patches.some((patch) => patch.op === 'set-service-replicas');
+  if (deterministicReplicaOnly && !llmHasReplicaPatch && isClearReplicaOnlyFeedback(feedback, feedbackIntent)) {
+    return true;
+  }
+
   return deterministicPatchPlan.patches.every((patch) =>
     patch.op === 'set-service-replicas'
     && (patch.target.kind === 'backend' || patch.target.name === 'backend' || patch.target.nameLike === 'backend'),
   );
+}
+
+function isSupportedDeterministicReplicaTarget(target: ServiceSelector): boolean {
+  return target.kind === 'backend'
+    || target.kind === 'database'
+    || target.targetKind === 'replica-group'
+    || target.name === 'backend'
+    || target.name === 'database'
+    || target.name === 'db'
+    || target.nameLike === 'backend'
+    || target.nameLike === 'database'
+    || target.nameLike === 'db'
+    || target.imageFamily === 'postgres'
+    || target.imageFamily === 'mysql'
+    || target.imageFamily === 'mariadb'
+    || target.imageFamily === 'mongo'
+    || target.imageFamily === 'redis';
+}
+
+function isClearReplicaOnlyFeedback(feedback: string, feedbackIntent: FeedbackIntent | null): boolean {
+  const normalizedFeedback = feedback.toLowerCase();
+  const hasReplicaIntent = feedbackIntent?.intent === 'change-replicas'
+    || parseReplicaFeedbackRequests(feedback).length > 0
+    || parseReplicaFeedback(feedback) !== null;
+  if (!hasReplicaIntent) return false;
+
+  const hasNonReplicaCue = /\b(port|ports|host\s*port|image|tag|version|rename|name|env|environment|volume|mount|network|dependency|depends?)\b/i.test(normalizedFeedback)
+    || /\b(cong|anh|phien\s*ban|doi\s+ten|bien\s*moi\s*truong|mang|phu\s*thuoc)\b/i.test(normalizedFeedback);
+  return !hasNonReplicaCue;
 }
 
 function parseReplicaFeedback(feedback: string): number | null {
@@ -1917,7 +1962,7 @@ function parseTrustedImageVersionFeedback(feedback: string): string | null {
     if (resolved !== null) return resolved;
   }
 
-  const contextual = /\b(?:version|tag|phiên b?n|phien ban|xu?ng|xuong|lên|len|downgrade|upgrade)\s+(?:to\s+)?(v?\d+(?:\.\d+)*(?:-[a-z0-9_.-]+)?)\b/i.exec(feedback);
+  const contextual = /\b(?:version|tag|phiÃªn b?n|phien ban|xu?ng|xuong|lÃªn|len|downgrade|upgrade)\s+(?:to\s+)?(v?\d+(?:\.\d+)*(?:-[a-z0-9_.-]+)?)\b/i.exec(feedback);
   if (contextual) {
     for (const base of extractImageBaseMentions(feedback)) {
       const resolved = getTrustedImageForBaseVersion(base, contextual[1]!);

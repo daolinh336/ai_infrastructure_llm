@@ -15,7 +15,7 @@ Key implementation entry points:
 - `src/domain/`: Zod schemas and domain types for specs, plans, state, approvals, runtime observations, drift, repair, and verification.
 - `src/compose/`: Docker Compose rendering and generated secret handling.
 - `src/execution/`: approval/preflight, dependency scheduling, Docker MCP gateway, deploy/destroy/repair/drift execution, runtime limits, policy, and cleanup.
-- `src/state/sqlite-state-store.ts`: SQLite persistence for pending previews, approvals, verified runtime snapshots, history, and operation records.
+- `src/state/sqlite-state-store.ts`: SQLite persistence for verified runtime snapshots, history, and operation records.
 - `src/status/status-service.ts`: status rendering over saved state and runtime comparison reports.
 - `packages/docker-mcp-server-supernova/`: vendored Docker MCP server used by the default runtime profile.
 - `tests/`: unit, integration, e2e, policy, and chaos pipeline tests.
@@ -27,7 +27,7 @@ The CLI keeps the planning model, runtime execution, and saved state separate:
 - `InfrastructureSpec` is the canonical desired-state model.
 - `ExecutionPlan` explains the intended validate, preview, approve, deploy, observe, and verify procedure.
 - Docker Compose YAML is a generated artifact for preview and execution support, not the canonical model.
-- SQLite stores validated JSON payloads for approved actions, verified desired/actual runtime snapshots, drift reports, repair reports, and history.
+- SQLite stores validated JSON payloads for verified desired/actual runtime snapshots, drift reports, repair reports, and history.
 - Docker runtime mutations go through `DockerMcpGateway`, route metadata, policy checks, and an approval-controlled mutation gate.
 - Observation and verification use read-only MCP routes after runtime actions.
 
@@ -65,7 +65,7 @@ Command behavior:
 
 Runtime safety is enforced in code, not by documentation convention:
 
-- Static validation rejects empty, out-of-scope, unsafe, or malformed requests before ReAct planning starts.
+- Static validation uses a binary intent gate: infrastructure-related requests continue, non-infrastructure requests stop before ReAct planning starts.
 - Domain objects are validated with Zod before they become specs, plans, approvals, state records, or runtime reports.
 - Dry-run is the default path and does not write final artifacts or mutate Docker.
 - `plan --deploy` performs Docker mutation only after preflight and explicit approval.

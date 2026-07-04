@@ -29,6 +29,9 @@ export function inferMissingServiceDependencies(
 
     if (service.kind === 'reverse-proxy') {
       backendNames.forEach((name) => inferred.add(name));
+      if (backendNames.length === 0) {
+        databaseNames.forEach((name) => inferred.add(name));
+      }
     }
 
     inferred.delete(service.name);
