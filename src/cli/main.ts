@@ -546,7 +546,7 @@ async function requestDriftResolutionChoice(plan: RepairPlan): Promise<DriftReso
 async function syncSnapshotToRuntime(
   snapshot: VerifiedRuntimeSnapshot,
   actual: RuntimeActualState,
-  drift: DriftReport,
+  _drift: DriftReport,
 ): Promise<void> {
   const syncedDesired = deriveSpecFromRuntime(actual, snapshot.desired);
   const driftAfterSync = buildDriftReport(syncedDesired, actual);

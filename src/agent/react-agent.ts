@@ -987,11 +987,6 @@ function inferExplicitPromptImageForService(
   return null;
 }
 
-function truncateMemoryText(value: string): string {
-  const normalized = value.replace(/\s+/g, ' ').trim();
-  return normalized.length > 500 ? `${normalized.slice(0, 497)}...` : normalized;
-}
-
 function recordStep(
   trace: ReActStep[],
   observations: AgentObservation[],

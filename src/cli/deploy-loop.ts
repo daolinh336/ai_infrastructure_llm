@@ -8,7 +8,6 @@ import type {
   ExecutionPlan,
   PlannerRevisionRequest,
   RevisionHistoryRecord,
-  RevisionObservation,
   RuntimeIssueReport,
   RuntimeActualState,
   SpecPatchPlan,

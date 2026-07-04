@@ -8,7 +8,13 @@ coverage/
 .agents
 
 *.txt
+*.log
 29-5-2026.txt
+
+# Generated runtime artifacts
+docker-compose.yaml
+patch_temp.ps1
+report_template.docx
 
 
 docs/

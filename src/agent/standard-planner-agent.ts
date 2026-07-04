@@ -882,7 +882,7 @@ type NormalizedSpecPatchPlanShape = SpecPatchPlan & { issueAnalysis?: IssueAnaly
 function selectRevisionPatchPlanMode(
   request: PlannerRevisionRequest,
   feedbackIntent: FeedbackIntent | null,
-  findings: VerificationFinding[],
+  _findings: VerificationFinding[],
 ): RevisionPatchPlanMode {
 
   const semanticFeedbackIntent = feedbackIntent !== null

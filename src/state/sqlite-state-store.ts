@@ -13,7 +13,6 @@ import { namespaceInfrastructureSpec } from '../domain/project-identity.js';
 import { normalizeStatefulDatabaseReplicaVolumes } from '../domain/stateful-database-volumes.js';
 import type {
   AgentObservation,
-  ApprovalResult,
   ApprovedAction,
   ComposeArtifactRecord,
   DetailedDryRunPreview,
