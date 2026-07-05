@@ -1035,14 +1035,15 @@ function buildImageSelectionClarification(
     return null;
   }
 
+  const logicalServiceName = targetDraftService.name ?? targetService.name;
   const uncertainty = validatePlanningUncertainty({
-    id: `select-image:${targetService.name}`,
+    id: `select-image:${logicalServiceName}`,
     severity: 'blocking',
     field: 'services[].image',
-    message: `ReAct reasoning interpreted the request "${query.normalizedPrompt}" but no image/runtime was specified for service "${targetService.name}". Choose a supported image to create the preview.`,
+    message: `ReAct reasoning interpreted the request "${query.normalizedPrompt}" but no image/runtime was specified for service "${logicalServiceName}". Choose a supported image to create the preview.`,
     reason: `LLM reasoning: ${reasoning ? reasoning.summary : 'none'}. Choose one supported catalog image. If none fit, run plan again with a different supported image/runtime from the whitelist.`,
-    affectedServices: [targetService.name],
-    choices: buildImageSelectionCandidates(targetService.name, recommendedImage),
+    affectedServices: [logicalServiceName],
+    choices: buildImageSelectionCandidates(logicalServiceName, recommendedImage),
     allowOther: false,
   });
 
@@ -1051,7 +1052,7 @@ function buildImageSelectionClarification(
     observations,
     {
       phase: 'reason',
-      message: `Service "${targetService.name}" has no explicit image/runtime; ReAct reasoning proposes "${recommendedImage}" and asks the user to confirm before planning.`,
+      message: `Service "${logicalServiceName}" has no explicit image/runtime; ReAct reasoning proposes "${recommendedImage}" and asks the user to confirm before planning.`,
       toolName: null,
     },
     reportProgress,

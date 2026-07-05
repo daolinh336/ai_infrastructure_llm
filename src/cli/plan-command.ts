@@ -105,16 +105,17 @@ export function registerPlanCommand(program: Command): void {
         }
       };
       console.log(chalk.cyan(`Agent trace log: ${traceLogPath}`));
-      const deployRequested = Boolean(options.deploy);
-      const adjustRequested = Boolean(options.adjust);
+      const normalizedOptions = normalizePlanOptions(options);
+      const deployRequested = normalizedOptions.deployRequested;
+      const adjustRequested = normalizedOptions.adjustRequested;
       const applyRequested = deployRequested || adjustRequested;
       const input = cliInputSchema.parse({
         prompt,
         dryRun: applyRequested ? false : true,
-        provider: options.provider,
+        provider: normalizedOptions.provider,
       });
-      const requestedProjectName = options.prjName
-        ? normalizeProjectName(String(options.prjName))
+      const requestedProjectName = normalizedOptions.prjName
+        ? normalizeProjectName(normalizedOptions.prjName)
         : null;
       if (!requestedProjectName) {
         console.error(chalk.red('CLI failed.'));
@@ -1283,6 +1284,23 @@ function formatServiceSummary(spec: InfrastructureSpec): string {
 
 function formatList(values: string[]): string {
   return values.length > 0 ? values.join(', ') : 'none';
+}
+
+function normalizePlanOptions(options: Record<string, unknown>): {
+  deployRequested: boolean;
+  adjustRequested: boolean;
+  provider: string;
+  prjName: string | null;
+} {
+  const rawProjectName = typeof options.prjName === 'string' ? options.prjName : null;
+  const projectAdjustSuffix = rawProjectName?.match(/^(?<projectName>.+)--adjust$/);
+
+  return {
+    deployRequested: Boolean(options.deploy),
+    adjustRequested: Boolean(options.adjust) || projectAdjustSuffix !== null,
+    provider: typeof options.provider === 'string' ? options.provider : process.env.INFRA_AGENT_PROVIDER ?? 'openai',
+    prjName: projectAdjustSuffix?.groups?.projectName ?? rawProjectName,
+  };
 }
 
 function enforcePlannedProjectName(

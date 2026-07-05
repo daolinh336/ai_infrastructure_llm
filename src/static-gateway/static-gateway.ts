@@ -475,6 +475,12 @@ function normalizeImageReference(image: string | null): {
   }
 
   const parsed = splitImageReference(image);
+  const rolePlaceholder = normalizeRolePlaceholderImage(parsed);
+
+  if (rolePlaceholder !== null) {
+    return rolePlaceholder;
+  }
+
   const normalizedBase = normalizeImageBase(parsed.base);
 
   if (normalizedBase === parsed.base) {
@@ -488,6 +494,29 @@ function normalizeImageReference(image: string | null): {
     value: `${parsed.prefix}${normalizedBase}${parsed.suffix}`,
     correction: `${parsed.base}->${normalizedBase}`,
   };
+}
+
+function normalizeRolePlaceholderImage(parsed: ReturnType<typeof splitImageReference>): {
+  value: string | null;
+  correction: string | null;
+} | null {
+  if (parsed.prefix !== '/' || parsed.suffix !== '') {
+    return null;
+  }
+
+  if (parsed.base === 'backend') {
+    return { value: null, correction: '/backend->null' };
+  }
+
+  if (parsed.base === 'database' || parsed.base === 'db') {
+    return { value: null, correction: `/${parsed.base}->null` };
+  }
+
+  if (parsed.base === 'web' || parsed.base === 'website') {
+    return { value: 'nginx', correction: `/${parsed.base}->nginx` };
+  }
+
+  return null;
 }
 
 function normalizeResourceNameAlias(name: string | null): {
@@ -754,6 +783,10 @@ function inferDraftTopology(services: DraftServiceQuery[]): {
 
   for (const service of services) {
     if (service.image === null) {
+      const role = inferRoleFromServiceName(service.name);
+      if (role === 'reverse-proxy') hasReverseProxy = true;
+      if (role === 'backend') hasBackend = true;
+      if (role === 'database') hasDatabase = true;
       continue;
     }
 
@@ -777,6 +810,24 @@ function inferDraftTopology(services: DraftServiceQuery[]): {
     hasBackend,
     hasDatabase,
   };
+}
+
+function inferRoleFromServiceName(name: string | null): 'reverse-proxy' | 'backend' | 'database' | null {
+  const normalizedName = name?.toLowerCase() ?? '';
+
+  if (/\b(web|website|nginx|ngix|proxy|reverse-proxy|frontend)\b/.test(normalizedName)) {
+    return 'reverse-proxy';
+  }
+
+  if (/\b(db|database|postgres|postgresql|postresql|mysql|mariadb|mongo|redis)\b/.test(normalizedName)) {
+    return 'database';
+  }
+
+  if (/\b(backend|api|node|nodejs|server)\b/.test(normalizedName)) {
+    return 'backend';
+  }
+
+  return null;
 }
 
 function isReverseProxyImageBase(imageBase: string): boolean {
