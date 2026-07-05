@@ -5,6 +5,7 @@ const infrastructureIntentValues = ['create', 'update', 'status', 'destroy', 'dr
 
 const nullableStringSchema = {
   type: 'string',
+  minLength: 1,
   nullable: true,
 };
 
@@ -137,72 +138,6 @@ export const reactReasoningOutputJsonSchema = {
     },
   },
   required: ['summary', 'nextAction', 'rationale', 'safetyNotes'],
-} satisfies JsonSchema;
-
-export const semanticInfrastructureIntentJsonSchema = {
-  type: 'object',
-  properties: {
-    goal: { type: 'string', minLength: 1 },
-    projectHint: nullableStringSchema,
-    services: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          id: { type: 'string', minLength: 1 },
-          role: { type: 'string', enum: ['reverse-proxy', 'backend', 'database'] },
-          technology: nullableStringSchema,
-          imageHint: nullableStringSchema,
-          replicas: nullableIntegerSchema,
-          ports: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                host: nullableIntegerSchema,
-                container: nullableIntegerSchema,
-              },
-              required: ['host', 'container'],
-            },
-          },
-          envHints: {
-            type: 'array',
-            items: {
-              type: 'object',
-              properties: {
-                key: { type: 'string', minLength: 1 },
-                value: { type: 'string', minLength: 1 },
-              },
-              required: ['key', 'value'],
-            },
-          },
-          volumeHints: { type: 'array', items: { type: 'string', minLength: 1 } },
-          dependsOn: { type: 'array', items: { type: 'string', minLength: 1 } },
-          confidence: { type: 'number', minimum: 0, maximum: 1 },
-          ambiguities: { type: 'array', items: { type: 'string', minLength: 1 } },
-        },
-        required: ['id', 'role', 'technology', 'imageHint', 'replicas', 'ports', 'envHints', 'volumeHints', 'dependsOn', 'confidence', 'ambiguities'],
-      },
-    },
-    relationships: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          from: { type: 'string', minLength: 1 },
-          to: { type: 'string', minLength: 1 },
-          type: { type: 'string', enum: ['depends-on', 'routes-to', 'connects-to'] },
-        },
-        required: ['from', 'to', 'type'],
-      },
-    },
-    constraints: { type: 'array', items: { type: 'string', minLength: 1 } },
-    assumptions: { type: 'array', items: { type: 'string', minLength: 1 } },
-    ambiguities: { type: 'array', items: { type: 'string', minLength: 1 } },
-    requiresUserInput: { type: 'boolean' },
-    confidence: { type: 'number', minimum: 0, maximum: 1 },
-  },
-  required: ['goal', 'projectHint', 'services', 'relationships', 'constraints', 'assumptions', 'ambiguities', 'requiresUserInput', 'confidence'],
 } satisfies JsonSchema;
 
 const serviceSelectorJsonSchema = {

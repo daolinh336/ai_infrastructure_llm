@@ -14,7 +14,7 @@ import { isProtectedDockerNetwork } from '../execution/protected-docker-resource
 import { toReplicaContainerNames } from '../execution/container-names.js';
 import { normalizeProjectName } from '../domain/project-identity.js';
 import { clearManagedProjectState, clearManagedStateAfterDestroyAll, listProjectStates, loadProjectState, loadState, saveVerifiedRuntimeSnapshot } from '../state/sqlite-state-store.js';
-import { StatusService } from '../status/status-service.js';
+import { StatusService, formatStatusSnapshots } from '../status/status-service.js';
 import { registerPlanCommand } from './plan-command.js';
 import type { DriftReport, RepairPlan, RuntimeActualState, VerifiedRuntimeSnapshot } from '../domain/types.js';
 import {
@@ -249,12 +249,10 @@ program
     const engine = new ExecutionEngine({
       dockerPullRetry: loadDockerPullRetryPolicyFromEnv(),
     });
-    const status = await new StatusService().showStatus(requestedProjectName);
     reportProgress({
       phase: 'execution',
       message: 'observe... status snapshot loaded.',
     });
-    console.log(status);
     if (options.repair && !options.drift) {
       console.log(chalk.yellow('Option --repair requires --drift. Example: aiagent status --drift --repair'));
       process.exitCode = 1;
@@ -280,7 +278,16 @@ program
         try {
           await mcpClient.initialize();
           const { drift, actual } = await engine.detectRuntimeDrift(projectState.current, mcpClient);
+          const renderedState = {
+            ...projectState,
+            current: {
+              ...projectState.current,
+              actual,
+              driftReport: drift,
+            },
+          };
           const driftReportPath = await writeProjectDriftReport(project, projectState.current, drift, actual);
+          console.log(formatStatusSnapshots([renderedState]));
           console.log(chalk.cyan('Live drift for project "' + project + '":'));
           console.log('- ' + drift.summary);
           console.log('- Report file: ' + driftReportPath);
@@ -295,7 +302,10 @@ program
           await mcpClient.shutdown();
         }
       }
+      return;
     }
+    const status = await new StatusService().showStatus(requestedProjectName);
+    console.log(status);
   });
 
 program

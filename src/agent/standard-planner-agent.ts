@@ -134,7 +134,7 @@ export class StandardPlannerAgent implements PlannerAgent {
         )) {
           assumptions.push(
             feedbackIntent !== null
-              ? 'Revision patch source: semantic feedback intent fallback replaced empty/unavailable LLM patch plan.'
+              ? 'Revision patch source: structured feedback intent fallback replaced empty/unavailable LLM patch plan.'
               : 'Revision patch source: deterministic fallback replaced empty/unavailable LLM patch plan.',
           );
           patchPlan = deterministicPatchPlan;
@@ -293,7 +293,7 @@ export class StandardPlannerAgent implements PlannerAgent {
           sourceOfTruth: 'Return patches for InfrastructureSpec only. Compose YAML is rendered later.',
           issueGrounding: isVerifierRemediation
             ? 'Start from verifierObservation.affectedResources. For every patch, include resolvesIssueCodes, affectedServiceNames, and resolutionReason showing which verifier issue and affected entity the patch resolves.'
-            : 'Planner/user revision mode: do not use verifier issue codes as action names. Convert semantic user intent into patch op values such as set-service-replicas, rename-service, replace-service-port.',
+            : 'Planner/user revision mode: do not use verifier issue codes as action names. Convert user intent into patch op values such as set-service-replicas, rename-service, replace-service-port.',
           targetResolution: 'Prefer selectors by exact name, nameLike, kind, imageFamily, exposesHostPort, dependsOn, dependentOf instead of guessing a concrete name when the user uses an alias.',
           portInference: 'When the user gives host:container, use it exactly. When the user gives one port and the target service already has exactly one mapping, preserve the existing container port unless the user explicitly says both sides should change.',
           schemaNormalization: 'Convert natural-language feedback to SpecPatch objects only when the intent, target, and causal link to the observation are clear. Otherwise return requiresUserInput=true with a specific ambiguity.',
@@ -885,11 +885,11 @@ function selectRevisionPatchPlanMode(
   _findings: VerificationFinding[],
 ): RevisionPatchPlanMode {
 
-  const semanticFeedbackIntent = feedbackIntent !== null
+  const structuredFeedbackIntent = feedbackIntent !== null
     && feedbackIntent.intent !== 'unknown'
     && feedbackIntent.intent !== 'retry-as-is'
     && feedbackIntent.intent !== 'cancel';
-  if (semanticFeedbackIntent) return 'planner-revision';
+  if (structuredFeedbackIntent) return 'planner-revision';
 
   if (request.revisionObservation.userFeedback !== null) return 'planner-revision';
   return 'planner-revision';

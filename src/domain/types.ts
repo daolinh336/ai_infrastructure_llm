@@ -64,38 +64,6 @@ export interface ValidatedQuery {
   clarificationQuestion: string | null;
 }
 
-export interface SemanticIntentService {
-  id: string;
-  role: 'reverse-proxy' | 'backend' | 'database';
-  technology: string | null;
-  imageHint: string | null;
-  replicas: number | null;
-  ports: Array<{ host: number | null; container: number | null }>;
-  envHints: Array<{ key: string; value: string }>;
-  volumeHints: string[];
-  dependsOn: string[];
-  confidence: number;
-  ambiguities: string[];
-}
-
-export interface SemanticIntentRelationship {
-  from: string;
-  to: string;
-  type: 'depends-on' | 'routes-to' | 'connects-to';
-}
-
-export interface SemanticInfrastructureIntent {
-  goal: string;
-  projectHint: string | null;
-  services: SemanticIntentService[];
-  relationships: SemanticIntentRelationship[];
-  constraints: string[];
-  assumptions: string[];
-  ambiguities: string[];
-  requiresUserInput: boolean;
-  confidence: number;
-}
-
 export interface RequestMetadata {
   raw: string;
   normalizedPrompt: string;

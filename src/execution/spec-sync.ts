@@ -39,6 +39,20 @@ function stripComposeReplicaSuffix(name: string): string {
   return name.replace(/[-_][1-9][0-9]*$/, '');
 }
 
+function parseComposeReplicaName(
+  name: string,
+  projectName: string,
+  knownServiceNames: ReadonlySet<string>,
+): { baseName: string; ordinal: number | null } {
+  const withoutProject = stripProjectPrefix(name, projectName);
+  if (knownServiceNames.has(withoutProject)) {
+    return { baseName: sanitizeIdentifier(withoutProject), ordinal: null };
+  }
+  const match = withoutProject.match(/^(.*)[-_]([1-9][0-9]*)$/);
+  if (!match) return { baseName: sanitizeIdentifier(withoutProject), ordinal: null };
+  return { baseName: sanitizeIdentifier(match[1] ?? withoutProject), ordinal: Number(match[2]) };
+}
+
 function normalizeRuntimeResourceName(name: string, projectName: string): string {
   return sanitizeIdentifier(stripProjectPrefix(name, projectName));
 }
@@ -58,9 +72,11 @@ function belongsToProjectResource(
 function serviceFromContainer(
   container: RuntimeContainerObservation,
   projectName: string,
+  knownServiceNames: ReadonlySet<string>,
 ): InfrastructureService | null {
   const rawName = container.name;
-  const serviceName = stripComposeReplicaSuffix(stripProjectPrefix(rawName, projectName));
+  const withoutProject = stripProjectPrefix(rawName, projectName);
+  const serviceName = knownServiceNames.has(withoutProject) ? withoutProject : stripComposeReplicaSuffix(withoutProject);
   const name = sanitizeIdentifier(serviceName);
   const image = container.image;
   if (!image) return null;
@@ -103,10 +119,20 @@ export function deriveSpecFromRuntime(
   const sourceVolumeNames = new Set(sourceSpec.volumes);
   const services: InfrastructureService[] = [];
   const seen = new Set<string>();
+  const observedReplicaOrdinals = new Map<string, Set<number>>();
 
   for (const container of actual.containers) {
     if (!belongsToProjectResource(container.name, projectName, sourceServiceNames)) continue;
-    const derived = serviceFromContainer(container, projectName);
+    const parsed = parseComposeReplicaName(container.name, projectName, sourceServiceNames);
+    if (parsed.ordinal === null) continue;
+    const existing = observedReplicaOrdinals.get(parsed.baseName) ?? new Set<number>();
+    existing.add(parsed.ordinal);
+    observedReplicaOrdinals.set(parsed.baseName, existing);
+  }
+
+  for (const container of actual.containers) {
+    if (!belongsToProjectResource(container.name, projectName, sourceServiceNames)) continue;
+    const derived = serviceFromContainer(container, projectName, sourceServiceNames);
     if (!derived) continue;
     if (seen.has(derived.name)) continue;
     seen.add(derived.name);
@@ -117,6 +143,12 @@ export function deriveSpecFromRuntime(
         ...existing,
         image: container.image ?? existing.image,
       };
+      const ordinals = observedReplicaOrdinals.get(derived.name);
+      if (ordinals && ordinals.size > 1) {
+        merged.replicas = ordinals.size;
+      } else {
+        delete merged.replicas;
+      }
       const syncedEnvironment = syncManagedEnvironment(existing.environment, container.environment);
       if (syncedEnvironment) {
         merged.environment = syncedEnvironment;

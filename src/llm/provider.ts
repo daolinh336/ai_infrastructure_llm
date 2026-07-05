@@ -8,7 +8,6 @@ import type {
   LlmPurpose,
   ProviderName,
   ReActReasoningOutput,
-  SemanticInfrastructureIntent,
   SpecPatchPlan,
 } from '../domain/types.js';
 import {
@@ -171,12 +170,6 @@ export class TestLlmProvider implements LlmProvider {
     if (input.schemaName === 'react_reasoning_output') {
       return {
         text: JSON.stringify(createReActReasoningForTest()),
-      };
-    }
-
-    if (input.schemaName === 'semantic_infrastructure_intent') {
-      return {
-        text: JSON.stringify(createSemanticInfrastructureIntentForTest(input.user)),
       };
     }
 
@@ -732,68 +725,6 @@ function createReActReasoningForTest(): ReActReasoningOutput {
       'Do not call Docker, MCP, or side-effecting tools during Phase 4 planning.',
     ],
   };
-}
-
-function createSemanticInfrastructureIntentForTest(rawInput: string): SemanticInfrastructureIntent {
-  const parsedInput = parseParserInput(rawInput);
-  const raw = parsedInput.raw;
-  const services = extractServices(raw).map((service, index) => {
-    const role = inferSemanticRole(service.image ?? service.name ?? '');
-    return {
-    id: service.name && service.name !== service.image ? service.name : defaultSemanticServiceId(role, index),
-    role,
-    technology: service.image,
-    imageHint: service.image,
-    replicas: service.replicas,
-    ports: service.port === null ? [] : [{ host: service.port, container: service.port }],
-    envHints: [],
-    volumeHints: [...service.requestedMounts],
-    dependsOn: [],
-    confidence: 0.9,
-    ambiguities: [],
-    };
-  });
-
-  return {
-    goal: raw,
-    projectHint: null,
-    services,
-    relationships: inferSemanticRelationships(services),
-    constraints: [],
-    assumptions: ['Test provider semantic intent mirrors deterministic parser hints.'],
-    ambiguities: [],
-    requiresUserInput: false,
-    confidence: services.length > 0 ? 0.9 : 0.5,
-  };
-}
-
-function defaultSemanticServiceId(
-  role: SemanticInfrastructureIntent['services'][number]['role'],
-  index: number,
-): string {
-  if (role === 'reverse-proxy') return 'web';
-  if (role === 'backend') return 'backend';
-  if (role === 'database') return 'postgres';
-  return `service-${index + 1}`;
-}
-
-function inferSemanticRole(value: string): SemanticInfrastructureIntent['services'][number]['role'] {
-  const normalized = value.toLowerCase();
-  if (/nginx|httpd|traefik|proxy|web/.test(normalized)) return 'reverse-proxy';
-  if (/postgres|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka|db|database/.test(normalized)) return 'database';
-  return 'backend';
-}
-
-function inferSemanticRelationships(
-  services: SemanticInfrastructureIntent['services'],
-): SemanticInfrastructureIntent['relationships'] {
-  const reverseProxy = services.find((service) => service.role === 'reverse-proxy');
-  const backend = services.find((service) => service.role === 'backend');
-  const database = services.find((service) => service.role === 'database');
-  return [
-    ...(reverseProxy && backend ? [{ from: reverseProxy.id, to: backend.id, type: 'routes-to' as const }] : []),
-    ...(backend && database ? [{ from: backend.id, to: database.id, type: 'depends-on' as const }] : []),
-  ];
 }
 
 function createSpecPatchPlanForTest(_rawInput: string): SpecPatchPlan {

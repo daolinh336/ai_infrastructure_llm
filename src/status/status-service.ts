@@ -38,15 +38,19 @@ export class StatusService {
         : 'No verified infrastructure state found yet.';
     }
 
-    return snapshots
-      .map((snapshot, index) => [
-        'Project ' + String(index + 1) + '/' + String(snapshots.length) + ': ' + snapshot.current!.desired.projectName,
-        'State schema version: ' + String(snapshot.schemaVersion),
-        formatCurrentState(snapshot),
-        'History records: ' + String(snapshot.history.length),
-      ].join('\n'))
-      .join('\n\n');
+    return formatStatusSnapshots(snapshots);
   }
+}
+
+export function formatStatusSnapshots(snapshots: InfrastructureStateSnapshot[]): string {
+  return snapshots
+    .map((snapshot, index) => [
+      'Project ' + String(index + 1) + '/' + String(snapshots.length) + ': ' + snapshot.current!.desired.projectName,
+      'State schema version: ' + String(snapshot.schemaVersion),
+      formatCurrentState(snapshot),
+      'History records: ' + String(snapshot.history.length),
+    ].join('\n'))
+    .join('\n\n');
 }
 
 function isRunningStatus(status: string | null): boolean {

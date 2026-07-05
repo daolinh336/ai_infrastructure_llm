@@ -5,17 +5,16 @@ It is not the user-facing product surface and is not published from this reposit
 
 ## Role in this repo
 
-- Root CLI builds it with `npm run build:supernova-mcp`.
+- The root CLI builds it with `npm run build:supernova-mcp`.
 - `DockerMcpGateway` starts `node packages/docker-mcp-server-supernova/dist/index.js` by default.
 - Runtime mutations still pass through the root project's approval gate, route table, and policy checks.
-- Tests for this package stay here to verify the vendored server still builds and exposes the tool behavior expected by the root gateway.
+- This package is treated as a runtime plugin implementation, not as an independent test target in this repository.
 
 ## Local commands
 
 ```bash
 npm --prefix packages/docker-mcp-server-supernova install
 npm --prefix packages/docker-mcp-server-supernova run build
-npm --prefix packages/docker-mcp-server-supernova test
 ```
 
 ## Boundary

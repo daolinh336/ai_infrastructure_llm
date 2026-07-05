@@ -6,10 +6,9 @@ import {
   validateInfrastructureSpec,
   validatePlanningUncertainty,
   validateReactReasoningOutput,
-  validateSemanticInfrastructureIntent,
   validateValidatedQuery,
 } from '../domain/schemas.js';
-import { reactReasoningOutputJsonSchema, semanticInfrastructureIntentJsonSchema } from '../domain/structured-output-schemas.js';
+import { reactReasoningOutputJsonSchema } from '../domain/structured-output-schemas.js';
 import { expandStatefulDatabaseReplicas } from '../domain/stateful-database-volumes.js';
 import { findServiceDependencyCycle, inferMissingServiceDependencies } from '../domain/topology-graph.js';
 import {
@@ -39,7 +38,6 @@ import type {
   ProgressReporter,
   ReActStep,
   ReActReasoningOutput,
-  SemanticInfrastructureIntent,
   ValidatedQuery,
   VerificationReport,
   GuardTelemetry,
@@ -59,7 +57,6 @@ import {
 import type { PlannerAgent, VerifierAgent } from './agent-interfaces.js';
 import { StandardPlannerAgent } from './standard-planner-agent.js';
 import { StandardVerifierAgent } from './standard-verifier-agent.js';
-import { mapSemanticIntentToValidatedQuery } from './semantic-intent-mapper.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 import { createVerifierRuntimeReader, type PlannerRuntimeReader } from '../execution/runtime-environment-reader.js';
 import {
@@ -215,65 +212,6 @@ export class ReActAgent {
     return this.planner.reviseFromFeedback(request, runtimeReader);
   }
 
-  private async tryApplySemanticIntent(
-    query: ValidatedQuery,
-    trace: ReActStep[],
-    observations: AgentObservation[],
-  ): Promise<ValidatedQuery> {
-    try {
-      const completion = await this.provider.completeStructured({
-        system: [
-          'You are a semantic infrastructure intent reader.',
-          'Return structured JSON only. Summarize the user goal into service roles, technologies, replicas, ports, and relationships.',
-          'Do not choose runtime operations, do not call tools, and do not bypass trusted image policy; deterministic code maps technologies to images later.',
-        ].join(' '),
-        user: JSON.stringify({ raw: query.raw, normalizedPrompt: query.normalizedPrompt, intent: query.intent }),
-        purpose: 'react',
-        schemaName: 'semantic_infrastructure_intent',
-        schema: semanticInfrastructureIntentJsonSchema,
-      });
-      const semanticIntent = validateSemanticInfrastructureIntent(parseJsonResponse(completion.text));
-
-      if (query.draft.services.length > 0) {
-        recordStep(trace, observations, {
-          phase: 'observe',
-          message: 'Semantic intent was observed but not applied because the existing DraftQuery already contains service hints.',
-          toolName: 'llm_semantic_intent',
-        }, this.reportProgress);
-        return query;
-      }
-
-      const mapped = mapSemanticIntentToValidatedQuery(query, semanticIntent);
-
-      if (mapped.query === null) {
-        recordStep(trace, observations, {
-          phase: 'observe',
-          message: `Semantic intent was not applied. ${mapped.diagnostics.join(' ')}`,
-          toolName: 'llm_semantic_intent',
-        }, this.reportProgress);
-        return query;
-      }
-
-      recordStep(trace, observations, {
-        phase: 'observe',
-        message: formatSemanticIntentObservation(semanticIntent, mapped.diagnostics),
-        toolName: 'llm_semantic_intent',
-      }, this.reportProgress);
-      return mapped.query;
-    } catch (error) {
-      recordStep(trace, observations, {
-        phase: 'observe',
-        message: [
-          'Structured semantic intent output was invalid.',
-          getErrorMessage(error),
-          'Continuing with the existing deterministic parser output.',
-        ].join(' '),
-        toolName: 'llm_semantic_intent',
-      }, this.reportProgress);
-      return query;
-    }
-  }
-
   private async loadReasoningStateMemory(
     trace: ReActStep[],
     observations: AgentObservation[],
@@ -383,7 +321,6 @@ export class ReActAgent {
     let validatedQuery = validateValidatedQuery(query);
     const observations: AgentObservation[] = [];
     const trace: ReActStep[] = [];
-    validatedQuery = await this.tryApplySemanticIntent(validatedQuery, trace, observations);
 
     recordStep(
       trace,
@@ -409,7 +346,7 @@ export class ReActAgent {
       return imageResolution.result;
     }
 
-    validatedQuery = applyExplicitPromptImageHints(imageResolution.query);
+    validatedQuery = applyExplicitPromptImageReferences(imageResolution.query);
 
     const imageSelectionClarification = buildImageSelectionClarification(
       validatedQuery,
@@ -945,7 +882,7 @@ function buildReasoningPromptInput(query: ValidatedQuery): ReasoningPromptInput 
   };
 }
 
-function applyExplicitPromptImageHints(query: ValidatedQuery): ValidatedQuery {
+function applyExplicitPromptImageReferences(query: ValidatedQuery): ValidatedQuery {
   if (query.intent !== 'create' || !query.draft.services.some((service) => service.image === null)) {
     return query;
   }
@@ -1045,19 +982,6 @@ function formatReasoningObservation(reasoning: ReActReasoningOutput): string {
     'This output is advisory only; internal deterministic tools still build, validate, and render.',
     safetyNotes,
   ].join(' ');
-}
-
-function formatSemanticIntentObservation(
-  intent: SemanticInfrastructureIntent,
-  diagnostics: string[],
-): string {
-  return [
-    `Structured semantic intent accepted: ${intent.goal}.`,
-    `Services: ${intent.services.map((service) => `${service.id}:${service.role}:${service.technology ?? service.imageHint ?? 'unknown'}`).join(', ') || 'none'}.`,
-    `Relationships: ${intent.relationships.map((relationship) => `${relationship.from}->${relationship.to}:${relationship.type}`).join(', ') || 'none'}.`,
-    diagnostics.length ? `Diagnostics: ${diagnostics.join(' ')}` : '',
-    'This semantic output is advisory; deterministic mapping, validation, and policy remain authoritative.',
-  ].filter(Boolean).join(' ');
 }
 
 function buildImageSelectionClarification(

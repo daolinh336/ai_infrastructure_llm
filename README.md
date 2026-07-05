@@ -1,62 +1,83 @@
 # Infra ReAct Agent
 
-`infra-react-agent` là một CLI quản lý và vận hành hạ tầng bằng ngôn ngữ tự nhiên. Người dùng mô tả mục tiêu hạ tầng bằng prompt, hệ thống dùng AI Agent kiểu ReAct để lập kế hoạch, validate, preview, xin phê duyệt, triển khai qua runtime plugin, quan sát kết quả và lưu trạng thái verified.
+`infra-react-agent` is a natural-language infrastructure management CLI built around a ReAct-style AI Agent. A user describes the target infrastructure in plain language, and the system validates the request, generates a plan, previews the result, asks for approval, executes through a runtime plugin, observes the runtime state, and stores verified state in SQLite.
 
-> Định hướng dài hạn: AI Agent là lõi điều phối. Docker/Docker Compose là plugin minh họa đầu tiên; Kubernetes, AWS, GCP, on-prem hoặc runtime như JAR runner có thể được tích hợp bằng MCP server hoặc runtime adapter tương ứng.
+The current mini-project proves the architecture with Docker and Docker Compose, but the long-term direction is broader: the AI Agent is the core, while Docker, Kubernetes, AWS, GCP, on-prem systems, or process-based runtimes such as JAR runners are plugin-style capability layers that can be integrated through MCP servers or runtime adapters.
 
-## 1. Giới thiệu dự án
+## Mini-Project Contributions
 
-### 1.1 Dự án giải quyết vấn đề gì?
+This mini-project contributes three concrete pieces, all backed by code rather than only diagrams:
 
-Trong vận hành hạ tầng, người dùng thường phải biết nhiều công cụ khác nhau: Docker, Docker Compose, Kubernetes, cloud CLI/API, scripts on-prem, process managers, hoặc lệnh chạy ứng dụng như `java -jar`. Dự án này hướng tới việc đưa một lớp AI Agent đứng giữa người dùng và các công cụ đó.
+1. **Guarded AI Agent architecture**: the implementation separates natural-language interpretation, domain modeling, validation, policy, approval, and runtime execution. The LLM helps interpret intent and propose structured plans, but deterministic TypeScript/Zod code decides what can become an `InfrastructureSpec`, what needs approval, and what may touch Docker.
+2. **`InfrastructureSpec` as desired state**: `InfrastructureSpec` is the central model for target infrastructure. Docker Compose YAML is rendered from that model as an artifact, not treated as the source of truth. This keeps the design open to future target compilers such as Kubernetes manifests, cloud resources, or process-based runtime specs.
+3. **Safe Docker lifecycle flow**: Docker support is organized as a guarded runtime path: dry-run preview, preflight, human approval, Docker MCP gateway, SQLite verified snapshots, runtime observation, verification, drift detection, and repair/destroy workflows.
 
-Thay vì yêu cầu người dùng viết ngay YAML hoặc chạy Docker/K8s/cloud commands thủ công, hệ thống cho phép nhập yêu cầu dạng tự nhiên:
+The current implementation is Docker-first, but not Docker-locked. Existing extension points are visible in the separation between `src/domain/`, `src/compose/`, `src/execution/`, `src/state/`, and the vendored Docker MCP server package.
+
+### Contribution-to-code evidence
+
+| Contribution | Code evidence | What it proves |
+| --- | --- | --- |
+| Natural-language boundary | `src/static-gateway/static-gateway.ts`, `src/agent/` | prompts are classified, parsed, planned, revised, and observed before execution |
+| Domain model boundary | `src/domain/types.ts`, `src/domain/schemas.ts` | `InfrastructureSpec`, plans, previews, approvals, actual state, and drift reports are typed and validated |
+| Compose as artifact | `src/compose/render-compose.ts`, `src/execution/execution-engine.ts` | Compose YAML is generated from validated desired state during dry-run/deploy preparation |
+| Policy and approval | `src/execution/phase8-approval.ts`, `src/execution/tool-policy.ts`, `src/execution/mcp-routing-table.ts` | preflight, risk classification, approval requests, and MCP route metadata are explicit |
+| Runtime adapter boundary | `src/execution/docker-mcp-gateway.ts`, `src/execution/mcp-connection-plug.ts` | Docker mutation goes through a gateway with capability preflight and mutation gating |
+| State and drift | `src/state/sqlite-state-store.ts`, `src/status/status-service.ts`, `src/execution/drift-detector.ts` | desired/actual snapshots are persisted and later compared against observed runtime state |
+
+## 1. Project Overview
+
+### What this project does
+
+This project turns natural-language infrastructure requests into a controlled infrastructure lifecycle.
+
+Instead of requiring a user to manually write Compose files or call Docker commands directly, the CLI can take a request such as:
 
 ```bash
 npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres" --prjName web-stack --dry-run
 ```
 
-Hệ thống sẽ:
+From there, the system:
 
-1. Phân loại ý định hạ tầng.
-2. Parse yêu cầu thành cấu trúc trung gian.
-3. Lập kế hoạch bằng ReAct Agent.
-4. Validate domain object bằng schema.
-5. Sinh Docker Compose preview.
-6. Chạy preflight và policy checks.
-7. Hỏi người dùng phê duyệt trước mutation.
-8. Deploy qua Docker MCP nếu được duyệt.
-9. Observe Docker runtime sau deploy.
-10. Verify desired state với actual state.
-11. Lưu snapshot vào SQLite để status, drift, repair, destroy.
+1. classifies the infrastructure intent,
+2. parses the request into structured input,
+3. plans with a ReAct-style Agent,
+4. validates the domain objects,
+5. renders a preview and Docker Compose artifact,
+6. runs preflight and policy checks,
+7. asks for approval before runtime mutation,
+8. deploys through the Docker MCP runtime plugin,
+9. observes the actual runtime state,
+10. verifies desired state against actual state,
+11. stores verified snapshots in SQLite for later status, drift, repair, and destroy flows.
 
-### 1.2 Phạm vi hiện tại
+### Current scope
 
-Trong mini-project hiện tại, runtime được hiện thực là Docker local:
+The current implementation focuses on Docker as the first runtime target:
 
-- Docker Compose YAML là artifact preview/deploy support.
-- Docker MCP Gateway là runtime boundary.
-- SQLite lưu desired/actual snapshots.
-- CLI hỗ trợ vòng đời: plan, deploy, observe, status, drift, repair, destroy.
+- Docker Compose YAML is used as a preview and deployment-support artifact.
+- Docker MCP is the runtime boundary.
+- SQLite stores desired and actual state snapshots.
+- The CLI supports plan, deploy, observe, status, drift detection, repair, and destroy flows.
 
-Docker **không phải giới hạn đề tài**. Docker chỉ là runtime plugin đầu tiên để chứng minh kiến trúc. Khi cần Kubernetes, cloud hoặc on-prem, hướng đi là thêm MCP server/adapter mới và giữ lại lõi Agent + validation + policy + state.
+Docker is not the architectural limit of the project. It is the first runtime plugin used to demonstrate the viability of the larger Agent-driven architecture.
 
-### 1.3 Các use case chính
+### Main use cases
 
-| Use case | Command chính | Ý nghĩa |
+| Use case | Primary command | Result |
 | --- | --- | --- |
-| Preview hạ tầng mới | `plan --dry-run --prjName` | Lập kế hoạch và xem compose preview, không mutate Docker. |
-| Deploy hạ tầng mới | `plan --deploy --prjName` | Preview, xin approval, deploy qua Docker MCP, observe, save SQLite. |
-| Điều chỉnh replica | `plan --adjust --prjName` | Adjust project đã verified; hiện support replica backend/database. |
-| Kiểm tra môi trường Docker | `doctor --docker` | Read-only ping Docker Engine API. |
-| Quan sát Docker runtime | `observe` | List containers/networks/volumes/images qua MCP. |
-| Xem saved status | `status` | Đọc SQLite verified snapshots. |
-| Detect drift | `status --drift` | So sánh SQLite desired state với Docker actual state. |
-| Repair drift | `status --drift --repair` hoặc `repair` | Preview repair, hỏi yes/no/sync, repair hoặc sync state. |
-| Xóa một project | `destroy -p <name>` | Xóa resources managed của project sau approval. |
-| Xóa toàn bộ managed infra | `destroy-all` | Dọn toàn bộ resources do tool quản lý sau strict verification. |
+| Preview a new stack | `plan --dry-run --prjName` | Generates a plan and Compose preview without mutating Docker |
+| Deploy a new stack | `plan --deploy --prjName` | Previews, asks for approval, deploys through Docker MCP, saves verified state |
+| Adjust replicas | `plan --adjust --prjName` | Adjusts an existing verified project; currently limited to backend/database replica changes |
+| Check Docker setup | `doctor --docker` | Runs a read-only Docker Engine API check |
+| Observe live Docker state | `observe` | Lists containers, networks, volumes, and images through MCP |
+| View saved infrastructure state | `status` | Reads verified snapshots from SQLite |
+| Detect drift | `status --drift` | Compares saved desired state against live Docker runtime state |
+| Repair drift | `status --drift --repair` or `repair` | Builds a repair plan, asks for approval, repairs or syncs |
+| Destroy one project | `destroy -p <name>` | Removes managed resources for a single verified project |
+| Destroy all managed infrastructure | `destroy-all` | Removes every managed resource after strict confirmation |
 
-### 1.4 CLI hiện có
+### CLI commands
 
 ```bash
 Usage: infra-react-agent [options] [command]
@@ -76,6 +97,8 @@ Commands:
   help [command]                           display help for command
 ```
 
+### Key command options
+
 #### `plan [options] <prompt>`
 
 ```bash
@@ -84,14 +107,11 @@ npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --deploy
 npm run dev -- plan "Scale backend to 3 replicas" --prjName web-stack --adjust
 ```
 
-Flags:
-
-- `--dry-run`: render output without writing state or deploying Docker. Default: `true`.
-- `--deploy`: after approval, write compose artifact and deploy via Docker MCP. Default: `false`.
-- `--prjName <name>`: unique project name for create/adjust routing. Required by current implementation.
-- `--adjust`: adjust an existing deployed project; asks yes/no/other and deploys on approval. Default: `false`.
-- `--provider <provider>`: LLM provider, `openai` or `gemini`. Default: `openai` or `INFRA_AGENT_PROVIDER`.
-- `-h, --help`: show command help.
+- `--dry-run`: renders outputs without writing verified state or deploying Docker. Default: `true`.
+- `--deploy`: writes the Compose artifact and deploys through Docker MCP after approval. Default: `false`.
+- `--prjName <name>`: unique project name used for create and adjust routing. Required by the current implementation.
+- `--adjust`: adjusts an existing verified deployment; currently limited to backend/database replica changes. Default: `false`.
+- `--provider <provider>`: `openai` or `gemini`. Default: `openai` or `INFRA_AGENT_PROVIDER`.
 
 #### `doctor [options]`
 
@@ -99,10 +119,7 @@ Flags:
 npm run dev -- doctor --docker
 ```
 
-Flags:
-
-- `--docker`: read-only Docker Engine API check.
-- `-h, --help`: show command help.
+- `--docker`: performs a read-only Docker Engine API reachability check.
 
 #### `observe`
 
@@ -110,7 +127,7 @@ Flags:
 npm run dev -- observe
 ```
 
-Read-only MCP observation of Docker containers, networks, volumes and images.
+Lists the current Docker runtime state through MCP.
 
 #### `status [options]`
 
@@ -121,12 +138,9 @@ npm run dev -- status --prjName web-stack --drift
 npm run dev -- status --prjName web-stack --drift --repair
 ```
 
-Flags:
-
-- `--drift`: also detect live drift against Docker runtime via MCP.
-- `--repair`: after drift detection, preview repair and ask yes/no/sync. Requires `--drift`.
-- `--prjName <name>`: show status/drift for one verified project.
-- `-h, --help`: show command help.
+- `--drift`: compares live Docker runtime state with the saved desired state.
+- `--repair`: after drift detection, previews repair and asks for `yes`, `no`, or `sync`. Requires `--drift`.
+- `--prjName <name>`: targets one verified project.
 
 #### `destroy [options]`
 
@@ -136,12 +150,9 @@ npm run dev -- destroy --project web-stack --remove-volumes
 npm run dev -- destroy -p web-stack --remove-volumes --yes
 ```
 
-Flags:
-
-- `-p, --project <name>`: project name override. Defaults to current verified state.
-- `--remove-volumes`: also remove project volumes. Default: `false`.
-- `--yes`: skip interactive approval. Default: `false`.
-- `-h, --help`: show command help.
+- `-p, --project <name>`: project name override.
+- `--remove-volumes`: also removes project volumes.
+- `--yes`: skips interactive approval.
 
 #### `destroy-all|destroy-all-infra [options]`
 
@@ -151,11 +162,8 @@ npm run dev -- destroy-all --remove-volumes
 npm run dev -- destroy-all-infra --remove-volumes --yes
 ```
 
-Flags:
-
-- `--remove-volumes`: also remove volumes referenced by saved tool state. Default: `false`.
-- `--yes`: skip strict verification phrase. Default: `false`.
-- `-h, --help`: show command help.
+- `--remove-volumes`: also removes volumes referenced by managed state.
+- `--yes`: skips the strict verification phrase.
 
 #### `repair`
 
@@ -163,11 +171,11 @@ Flags:
 npm run dev -- repair
 ```
 
-Detects drift for the current verified snapshot, previews a repair plan, asks for yes/no/sync, then applies approved repair through MCP.
+Detects drift for the current verified snapshot, previews a repair plan, asks for `yes`, `no`, or `sync`, and applies the selected path.
 
-## 2. Kiến trúc chính
+## 2. Core Architecture
 
-### 2.1 Sơ đồ lớp tổng quát
+### High-level architecture
 
 ```text
 User Prompt / CLI Command
@@ -185,16 +193,45 @@ User Prompt / CLI Command
   -> Status / Drift / Repair / Destroy
 ```
 
-### 2.2 Lõi Agent và runtime plugin
+### Core architectural idea
 
-Dự án tách rõ hai phần:
+The architecture is intentionally split into two major concerns:
 
-- **AI Agent core**: hiểu yêu cầu, lập kế hoạch, validate, preview, approval, state, observation.
-- **Runtime plugin**: công cụ triển khai cụ thể như Docker MCP, K8s MCP, AWS/GCP MCP, on-prem adapter, JAR runner.
+- **AI Agent core**: intent understanding, planning, validation, preview, approval, observation, and state management.
+- **Runtime plugin layer**: Docker today, potentially Kubernetes, cloud providers, on-prem adapters, or process runners in the future.
 
-Hiện tại repo đã hiện thực Docker plugin. Kiến trúc vẫn hướng tới mở rộng bằng cách thêm plugin mới thay vì viết lại Agent.
+This keeps the Agent from directly becoming a raw infrastructure shell. Runtime actions remain typed, validated, observable, and policy-controlled.
 
-### 2.3 Luồng dữ liệu `plan --dry-run`
+### Main modules
+
+| Module | Responsibility |
+| --- | --- |
+| `src/cli/main.ts` | Root CLI commands: doctor, observe, status, destroy, destroy-all, repair |
+| `src/cli/plan-command.ts` | Natural-language planning, dry-run, deploy, and adjust flow |
+| `src/static-gateway/static-gateway.ts` | Pre-ReAct validation, structured query parsing, safety checks |
+| `src/agent/` | ReAct orchestration, internal tools, planner/verifier flow, loop guards |
+| `src/domain/` | Types, Zod schemas, structured output schemas, topology and identity helpers |
+| `src/compose/` | Docker Compose rendering and secret handling |
+| `src/execution/` | Execution engine, Docker MCP gateway, routing, policy, drift, repair, destroy |
+| `src/state/sqlite-state-store.ts` | SQLite persistence for desired/actual verified snapshots and history |
+| `src/status/status-service.ts` | Status rendering and desired-vs-actual reporting |
+| `src/llm/provider.ts` | OpenAI/Gemini provider abstraction |
+| `packages/docker-mcp-server-supernova/` | Vendored Docker MCP plugin currently used by the runtime gateway |
+
+### Important data models
+
+- `InfrastructureSpec`: canonical desired-state model.
+- `InfrastructureService`: service-level desired state including image, replicas, ports, environment, dependencies, and volumes.
+- `ExecutionPlan`: plan summary, assumptions, and steps.
+- `DetailedDryRunPreview`: preview shown to the user before runtime mutation.
+- `RuntimeActualState`: normalized observed runtime state.
+- `VerifiedRuntimeSnapshot`: desired state, actual state, verification result, and artifact record saved in SQLite.
+- `DriftReport`: desired-vs-actual comparison.
+- `RepairPlan`: supported repair actions derived from drift findings.
+
+### Main data flows
+
+#### Dry-run flow
 
 ```text
 Prompt
@@ -212,18 +249,18 @@ Prompt
   -> stop without Docker mutation
 ```
 
-### 2.4 Luồng dữ liệu `plan --deploy`
+#### Deploy flow
 
 ```text
 Prompt
-  -> dry-run/preview path
+  -> dry-run preview path
   -> runPhase8Preflight()
   -> buildApprovalRequest()
-  -> requestCliApproval(): yes/no/other
+  -> requestCliApproval(): yes / no / other
      -> no: stop
      -> other: reviseFromFeedback(), regenerate preview
      -> yes: write compose artifact
-             init DockerMcpGateway
+             initialize DockerMcpGateway
              enable mutation gate
              deploy resources by dependency order
              observe actual runtime
@@ -231,169 +268,102 @@ Prompt
              saveVerifiedRuntimeSnapshot()
 ```
 
-### 2.5 Luồng dữ liệu `status --drift --repair`
+#### Drift and repair flow
 
 ```text
-SQLite verified snapshot
+Verified SQLite snapshot
   -> observe actual Docker runtime via MCP
   -> buildDriftReport()
   -> buildRepairPlan()
-  -> ask yes/no/sync
-     -> yes: repairWithDocker(), observe, verify, save snapshot
-     -> sync: deriveSpecFromRuntime(), save desired state from runtime
-     -> no: no mutation, no state change
+  -> ask yes / no / sync
+     -> yes: repair runtime, observe, verify, save snapshot
+     -> sync: derive desired state from runtime, verify, save snapshot
+     -> no: stop without mutation
 ```
 
-### 2.6 Luồng dữ liệu `destroy`
+#### Destroy flow
 
 ```text
-SQLite verified project snapshot
-  -> compute managed resources
-  -> preview destroy targets
-  -> approval prompt
+Verified project snapshot
+  -> build destroy preview
+  -> ask for approval
   -> destroyWithDocker()
   -> post-destroy verification
-  -> clearManagedProjectState()
+  -> clear managed project state
 ```
 
-### 2.7 Các module chính
+### Runtime safety
 
-| Module | Vai trò |
-| --- | --- |
-| `src/cli/main.ts` | CLI commands: doctor, observe, status, destroy, destroy-all, repair. |
-| `src/cli/plan-command.ts` | Natural-language plan, dry-run, deploy, adjust flow. |
-| `src/static-gateway/static-gateway.ts` | Pre-ReAct validation and structured query gate. |
-| `src/agent/` | ReAct orchestration, internal tools, loop guards, planner/verifier. |
-| `src/domain/` | Types, Zod schemas, structured output schemas, trusted images, topology. |
-| `src/compose/` | Docker Compose rendering and secret handling. |
-| `src/execution/` | Execution engine, MCP gateway, routing, policy, drift, repair, destroy. |
-| `src/state/sqlite-state-store.ts` | SQLite persistence for verified snapshots and history. |
-| `src/status/status-service.ts` | Status rendering over saved state and runtime comparison. |
-| `src/llm/provider.ts` | OpenAI/Gemini provider abstraction. |
-| `packages/docker-mcp-server-supernova/` | Vendored Docker MCP server used by default runtime profile. |
-| `tests/` | Unit, integration, e2e and chaos tests. |
+Runtime safety is implemented in code, not only in documentation:
 
-### 2.8 Domain model quan trọng
-
-- `InfrastructureSpec`: canonical desired-state model.
-- `InfrastructureService`: service definition with kind, image, replicas, ports, env, dependencies and volumes.
-- `ExecutionPlan`: agent-produced summary, assumptions and steps.
-- `DetailedDryRunPreview`: user-facing preview before mutation.
-- `RuntimeActualState`: observed runtime evidence.
-- `VerifiedRuntimeSnapshot`: saved desired + actual + verification snapshot.
-- `DriftReport`: desired-vs-actual comparison.
-- `RepairPlan`: supported repair actions for drift.
-
-### 2.9 State model
-
-SQLite database:
-
-```text
-state/infra-state.sqlite
-```
-
-Main tables:
-
-- `state_snapshots`: singleton current snapshot.
-- `project_state_snapshots`: per-project current snapshots.
-- `state_operations`: operation history.
-
-### 2.10 Runtime safety
-
-Runtime safety is enforced in code:
-
-- Static Gateway rejects non-infrastructure or unsafe prompts before ReAct planning.
-- Zod validates domain objects before execution/state persistence.
-- Dry-run is default and performs no Docker mutation.
-- Mutating/destructive MCP routes require approval.
-- `DockerMcpGateway` blocks mutations unless its mutation gate is enabled.
-- Route metadata in `src/execution/mcp-routing-table.ts` classifies read/mutate/destructive actions.
-- Deploy uses dependency-aware ordering and cleanup/rollback logic.
+- Static validation rejects non-infrastructure and unsafe prompts before ReAct planning starts.
+- Domain objects are validated with Zod before they become plans, state records, or runtime requests.
+- Dry-run is the default path and performs no Docker mutation.
+- Runtime mutation only happens after preflight and explicit approval.
+- `DockerMcpGateway` blocks mutating and destructive routes unless the mutation gate is enabled.
+- MCP routes are declared with category, destructive status, and risk metadata.
 - Observation and verification run after runtime actions.
+- SQLite persists desired and actual evidence for later drift and repair workflows.
 
-### 2.11 Docker MCP runtime
+### Runtime plugin model
 
-Default runtime profile:
-
-```text
-supernova-local
-```
-
-Runtime path:
+The current runtime plugin is Docker:
 
 ```text
 CLI -> ExecutionEngine -> DockerMcpGateway -> Supernova MCP stdio server -> Dockerode -> Docker Engine API
 ```
 
-Default command:
+The same model can be reused for future targets:
 
-```bash
-node packages/docker-mcp-server-supernova/dist/index.js
-```
+- Kubernetes MCP plugin
+- AWS MCP plugin
+- GCP MCP plugin
+- on-prem runtime adapter
+- process or JAR runner plugin
 
-Can be overridden with:
+The key rule is unchanged: the Agent stays generic, while runtime-specific capabilities are pushed behind typed plugins.
 
-```bash
-INFRA_DOCKER_MCP_PROFILE=official
-INFRA_DOCKER_MCP_COMMAND=...
-INFRA_DOCKER_MCP_ARGS=...
-```
+## 3. Prerequisites and Installation
 
-### 2.12 Mở rộng sang runtime khác
-
-To add a new runtime such as Kubernetes, AWS, GCP, on-prem or JAR runner:
-
-1. Define a narrow capability contract.
-2. Build an MCP server or runtime adapter.
-3. Add input/output schemas.
-4. Add route metadata: read/mutate/destructive, risk, approvalRequired.
-5. Add renderer/preview format if needed.
-6. Add observation parser.
-7. Add verifier/drift integration.
-8. Add state persistence compatibility.
-9. Add tests and docs.
-
-## 3. Prerequisites và cài đặt
-
-### 3.1 Prerequisites
+### Prerequisites
 
 Required:
 
 - Node.js `>=20`
 - npm
-- Docker Desktop or Docker Engine reachable from the machine
-- PowerShell, bash, or any shell capable of running npm scripts
+- Docker Desktop or a reachable Docker Engine
+- a shell that can run npm scripts
 
-Required for LLM runtime:
+Required for LLM-backed runs:
 
-- OpenAI-compatible API key, or
-- Gemini API key
+- an OpenAI-compatible API key, or
+- a Gemini API key
 
-Required for real Docker deploy/e2e:
+Required for real Docker deployment flows:
 
 - Docker daemon running
-- Supernova Docker MCP server built
+- the Docker MCP runtime plugin built
 
 Optional:
 
-- `OPENAI_BASE_URL` if using an OpenAI-compatible gateway
+- `OPENAI_BASE_URL` for an OpenAI-compatible endpoint
 - Docker Desktop MCP Gateway if using the `official` profile
 
-### 3.2 Install dependencies
+### Install dependencies
 
 ```bash
 npm install
 ```
 
-If working directly on the vendored Docker MCP package:
+If you are working directly on the vendored Docker MCP plugin package:
 
 ```bash
 npm --prefix packages/docker-mcp-server-supernova install
 ```
 
-### 3.3 Configure environment
+### Configure environment
 
-Create or update `.env` in the repository root.
+Create or update a `.env` file in the repository root.
 
 OpenAI-compatible example:
 
@@ -427,7 +397,7 @@ INFRA_DOCKER_PULL_RETRY_MAX_DELAY_MS=5000
 INFRA_DOCKER_PULL_RETRY_BACKOFF_FACTOR=2
 ```
 
-Runtime and guard limits:
+Loop and resource limits:
 
 ```bash
 INFRA_AGENT_MAX_REACT_ITERATIONS=14
@@ -445,51 +415,44 @@ INFRA_MAX_CPU=4
 INFRA_MAX_MEMORY_GB=8
 ```
 
-### 3.4 Build and validate
+### Build the project
 
 ```bash
 npm run build
 npm run typecheck
 npm run lint
-npm test
 ```
 
-### 3.5 Build Docker MCP runtime
+### Build the Docker MCP runtime plugin
 
 ```bash
 npm run build:supernova-mcp
 ```
 
-Optional package-level tests:
-
-```bash
-npm run test:supernova-mcp
-```
-
-### 3.6 Check Docker setup
+### Validate Docker connectivity
 
 ```bash
 npm run dev -- doctor --docker
 ```
 
-### 3.7 Run a safe dry-run
+### Run a safe dry-run
 
 ```bash
 npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --dry-run
 ```
 
-This should print:
+Expected output includes:
 
 - static validation metrics,
-- agent summary,
+- planning summary,
 - assumptions,
 - plan steps,
 - detailed dry-run preview,
 - generated `docker-compose.yaml` preview,
 - state database path,
-- dry-run notice.
+- explicit dry-run notice.
 
-### 3.8 Deploy after approval
+### Deploy after approval
 
 ```bash
 npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --deploy
@@ -497,13 +460,13 @@ npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --deploy
 
 Expected behavior:
 
-1. CLI prints dry-run and compose preview.
-2. CLI prints preflight report.
-3. CLI asks for approval.
-4. If user chooses `y`, it writes compose artifact and deploys through Docker MCP.
-5. CLI observes runtime and saves verified state.
+1. the CLI prints preview output,
+2. the CLI prints preflight output,
+3. the CLI asks for approval,
+4. if the user approves, it writes the artifact and deploys through Docker MCP,
+5. it observes runtime state and saves a verified SQLite snapshot.
 
-### 3.9 Observe and status
+### Observe and inspect saved state
 
 ```bash
 npm run dev -- observe
@@ -511,19 +474,19 @@ npm run dev -- status --prjName nginx-demo
 npm run dev -- status --prjName nginx-demo --drift
 ```
 
-### 3.10 Repair drift
+### Repair drift
 
 ```bash
 npm run dev -- status --prjName nginx-demo --drift --repair
 ```
 
-Choose:
+Repair choices:
 
-- `y` / `yes`: repair runtime to match SQLite desired state.
-- `n` / `no`: do nothing.
-- `s` / `sync`: update SQLite desired state from current runtime.
+- `yes`: repair runtime to match the saved desired state,
+- `no`: do nothing,
+- `sync`: update the saved desired state from the current runtime state.
 
-### 3.11 Destroy resources
+### Destroy resources
 
 Destroy one project:
 
@@ -537,45 +500,23 @@ Destroy all managed resources:
 npm run dev -- destroy-all --remove-volumes
 ```
 
-### 3.12 Run built CLI
-
-Build first:
+### Run the built CLI
 
 ```bash
 npm run build
-```
-
-Then:
-
-```bash
 npm run start -- plan "Create nginx on port 8080" --prjName nginx-demo --dry-run
 ```
 
-Installed binary names after build/package usage:
+Installed binary names:
 
 ```bash
 aiagent --help
 infra-react-agent --help
 ```
 
-### 3.13 Useful test commands
+## 4. Additional Documentation
 
-```bash
-npm run test:e2e:docker-mcp
-npm run test:e2e:docker-mcp:all-tools
-npm run test:chaos
-npm run test:pipeline
-```
-
-Notes:
-
-- `test:e2e:docker-mcp` requires Docker and built Supernova MCP server.
-- `test:chaos` runs real Docker lifecycle scenarios.
-- `test:e2e:docker-mcp:all-tools` is a broader diagnostic and may be more environment-sensitive.
-
-## 4. Additional documentation
-
-- `docs/project-onboarding-vi.md`: detailed onboarding and use-case guide for new contributors.
-- `docs/tool-system-policy.vi.md`: internal tool and runtime policy notes.
-- `docs/testing/three-tier-chaos-matrix.md`: real Docker chaos matrix and lifecycle scenarios.
-- `packages/docker-mcp-server-supernova/README.md`: notes for the vendored Docker MCP package.
+- `docs/project-onboarding-vi.md`: detailed contributor onboarding and use-case guide.
+- `docs/tool-system-policy.vi.md`: runtime tool and policy notes.
+- `docs/testing/three-tier-chaos-matrix.md`: real Docker lifecycle and chaos scenarios.
+- `packages/docker-mcp-server-supernova/README.md`: notes for the vendored Docker MCP plugin package.
