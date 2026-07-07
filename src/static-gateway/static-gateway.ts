@@ -4,7 +4,6 @@ import type {
   IntentClassification,
   ProgressReporter,
   StaticGatewayMetrics,
-  StaticResourceEstimate,
   ValidatedQuery,
 } from '../domain/types.js';
 import {
@@ -16,45 +15,29 @@ import {
   draftQueryJsonSchema,
   intentClassificationJsonSchema,
 } from '../domain/structured-output-schemas.js';
-import {
-  canonicalizeImageBase,
-  isSupportedImageReference,
-} from '../domain/supported-images.js';
-import { loadStaticResourceLimitConfig } from '../config/runtime-limits.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import type { LlmProvider } from '../llm/provider.js';
 
 const INTENT_CLASSIFIER_SYSTEM_PROMPT = [
   'INTENT_CLASSIFIER_V1',
-  'Decide whether the full user request is related to infrastructure management before any infrastructure planning starts.',
+  'Decide whether the full user request is a create-infrastructure request before any infrastructure planning starts.',
   'Return accepted=true only when the request asks to create new infrastructure, services, containers, databases, networks, or app stacks.',
-  'Return accepted=false for update, status, destroy, delete, remove, drift, deploy-only, or repair requests because plan static validation currently supports create intent only.',
-  'Accept create infrastructure requests even when details are missing, because the structured parser and later validators can ask for clarification.',
-  'Return accepted=false when the request is not a create infrastructure management request or no create action can be inferred.',
+  'Return accepted=false for every non-create request, including update, status, destroy, delete, remove, drift, deploy-only, repair, general knowledge, or out-of-domain requests.',
   'When accepted=true, intent must be create. When accepted=false, intent must be null.',
-  'Return only JSON with shape: {"accepted":true|false,"intent":"create|update|status|destroy|drift|null","reason":"..."}',
+  'Return only JSON with shape: {"accepted":true|false,"intent":"create|null","reason":"..."}',
 ].join('\n');
 
 const STRUCTURED_QUERY_PARSER_SYSTEM_PROMPT = [
   'STRUCTURED_QUERY_PARSER_V1',
-  'Extract only explicit infrastructure parameters from the user request.',
+  'Extract only explicit infrastructure parameters from an already accepted create request.',
   'Return only JSON that matches the DraftQuery schema.',
-  'Use null for missing fields. Do not validate ports, replicas, images, names, security, or resource limits.',
+  'Use null for missing fields. Do not validate ports, replicas, images, names, security, resource limits, or topology.',
   'Do not create an execution plan.',
 ].join('\n');
-
-const DOCKER_RESOURCE_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export type StaticGatewayResult =
   | {
       status: 'validated';
-      validatedQuery: ValidatedQuery;
-      issues: string[];
-      metrics: StaticGatewayMetrics;
-    }
-  | {
-      status: 'clarification';
-      question: string;
       validatedQuery: ValidatedQuery;
       issues: string[];
       metrics: StaticGatewayMetrics;
@@ -66,17 +49,6 @@ export type StaticGatewayResult =
       metrics: StaticGatewayMetrics;
     };
 
-interface StaticValidationOutcome {
-  issues: string[];
-  riskFlags: string[];
-  securityFindings: string[];
-  resourceEstimate: StaticResourceEstimate;
-  clarificationQuestion: string | null;
-  blockedBySecurity: boolean;
-  blockedByResourceLimit: boolean;
-  blockedByImageWhitelist: boolean;
-}
-
 export class StaticGateway {
   constructor(
     private readonly auxiliaryProvider: LlmProvider,
@@ -87,7 +59,7 @@ export class StaticGateway {
     const metrics = createMetrics();
     this.reportProgress({
       phase: 'gate',
-      message: 'thinking... normalize raw prompt before pre-ReAct validation.',
+      message: 'thinking... normalize raw prompt before create-intent gate.',
     });
     const normalizedPrompt = rawPrompt.trim();
 
@@ -124,11 +96,11 @@ export class StaticGateway {
       };
     }
 
-    if (!classification.accepted || classification.intent === null) {
+    if (!classification.accepted) {
       metrics.intentRejected = 1;
       this.reportProgress({
         phase: 'gate',
-        message: `observe... request rejected by binary intent gate: ${classification.reason}`,
+        message: `observe... request rejected by create-intent gate: ${classification.reason}`,
         toolName: 'intent_classifier',
       });
       return {
@@ -139,12 +111,31 @@ export class StaticGateway {
       };
     }
 
-    if (classification.intent !== 'create') {
-      const issue = `Only create intent is currently supported by plan static validation; got "${classification.intent}".`;
+    const explicitNonCreateIntent = detectExplicitNonCreateIntent(normalizedPrompt);
+    if (explicitNonCreateIntent !== null) {
+      const issue = `Only create intent is currently accepted by static validation; detected ${explicitNonCreateIntent} intent.`;
       metrics.intentRejected = 1;
       this.reportProgress({
         phase: 'gate',
-        message: `observe... request rejected by create-only intent gate: ${issue}`,
+        message: `observe... request rejected by deterministic create-intent gate: ${issue}`,
+        toolName: 'intent_classifier',
+      });
+      return {
+        status: 'rejected',
+        reason: issue,
+        issues: [issue],
+        metrics,
+      };
+    }
+
+    if (classification.intent !== 'create') {
+      const issue = classification.intent === null
+        ? 'Only create intent is currently accepted by static validation.'
+        : `Only create intent is currently accepted by static validation; got "${classification.intent}".`;
+      metrics.intentRejected = 1;
+      this.reportProgress({
+        phase: 'gate',
+        message: `observe... request rejected by create-intent gate: ${issue}`,
         toolName: 'intent_classifier',
       });
       return {
@@ -175,11 +166,11 @@ export class StaticGateway {
     }
 
     if (draft.intent !== 'create') {
-      const issue = `Only create intent is currently supported by plan static validation; got "${draft.intent}".`;
+      const issue = `Only create intent is currently accepted by static validation; got "${draft.intent}".`;
       metrics.intentRejected = 1;
       this.reportProgress({
         phase: 'gate',
-        message: `observe... request rejected by create-only draft gate: ${issue}`,
+        message: `observe... request rejected by create-intent draft gate: ${issue}`,
         toolName: 'structured_parser',
       });
       return {
@@ -190,87 +181,24 @@ export class StaticGateway {
       };
     }
 
-    metrics.intentAccepted = 1;
-    this.reportProgress({
-      phase: 'gate',
-      message: `observe... intent accepted as "${draft.intent}".`,
-      toolName: 'intent_classifier',
-    });
-
-    const normalization = normalizeDraftQueryImageAliases(draft);
-    draft = normalization.draft;
-    if (normalization.corrections.length) {
-      this.reportProgress({
-        phase: 'gate',
-        message: `observe... normalized image alias(es): ${normalization.corrections.join(', ')}.`,
-        toolName: 'structured_parser',
-      });
-    }
-
-    this.reportProgress({
-      phase: 'gate',
-      message: `observe... DraftQuery parsed with ${draft.services.length} service hint(s).`,
-      toolName: 'structured_parser',
-    });
-    this.reportProgress({
-      phase: 'gate',
-      message: 'acting... run deterministic static safety and schema rules.',
-      toolName: 'static_validator',
-    });
-
-    const outcome = validateStaticRules(draft);
-    metrics.securityBlocked = outcome.blockedBySecurity ? 1 : 0;
-    metrics.resourceLimitBlocked = outcome.blockedByResourceLimit ? 1 : 0;
-    metrics.imageWhitelistBlocked = outcome.blockedByImageWhitelist ? 1 : 0;
-
-    if (outcome.issues.length) {
-      metrics.schemaValidationFailed = 1;
-      this.reportProgress({
-        phase: 'gate',
-        message: `observe... static validation failed with ${outcome.issues.length} issue(s).`,
-        toolName: 'static_validator',
-      });
-      return {
-        status: 'rejected',
-        reason: 'Static validation failed.',
-        issues: outcome.issues,
-        metrics,
-      };
-    }
-
     const validatedQuery = validateValidatedQuery({
       raw: draft.raw,
       normalizedPrompt: draft.normalizedPrompt,
-      intent: draft.intent,
+      intent: 'create',
       draft,
-      riskFlags: outcome.riskFlags,
-      securityFindings: outcome.securityFindings,
-      resourceEstimate: outcome.resourceEstimate,
-      clarificationRequired: outcome.clarificationQuestion !== null,
-      clarificationQuestion: outcome.clarificationQuestion,
+      riskFlags: [],
+      securityFindings: [],
+      resourceEstimate: estimateResources(draft.services),
+      clarificationRequired: false,
+      clarificationQuestion: null,
     });
 
-    if (outcome.clarificationQuestion !== null) {
-      metrics.clarificationRequired = 1;
-      this.reportProgress({
-        phase: 'gate',
-        message: 'observe... clarification is required before ReAct can start.',
-        toolName: 'static_validator',
-      });
-      return {
-        status: 'clarification',
-        question: outcome.clarificationQuestion,
-        validatedQuery,
-        issues: [],
-        metrics,
-      };
-    }
-
+    metrics.intentAccepted = 1;
     metrics.schemaValidationPassed = 1;
     this.reportProgress({
       phase: 'gate',
-      message: 'observe... ValidatedQuery ready; ReAct Agent may start.',
-      toolName: 'static_validator',
+      message: 'observe... create intent accepted; ReAct Agent may start.',
+      toolName: 'intent_classifier',
     });
 
     return {
@@ -284,7 +212,7 @@ export class StaticGateway {
   private async classifyIntent(prompt: string): Promise<IntentClassification> {
     this.reportProgress({
       phase: 'gate',
-      message: 'thinking... send full prompt to provider intent gate.',
+      message: 'thinking... send full prompt to provider create-intent gate.',
       toolName: 'intent_classifier',
     });
 
@@ -305,7 +233,7 @@ export class StaticGateway {
   ): Promise<DraftQuery> {
     this.reportProgress({
       phase: 'gate',
-      message: 'thinking... parse prompt with provider structured parser.',
+      message: 'thinking... parse accepted create request for ReAct input.',
       toolName: 'structured_parser',
     });
 
@@ -357,7 +285,8 @@ function normalizeDraftQueryCandidate(
       isStaticIntent(value.intent) || value.intent === null
         ? value.intent
         : classification.intent,
-    services: servicesCandidate.map((service) => normalizeDraftServiceCandidate(service, prompt)),
+    projectName: getNullableString(value.projectName),
+    services: servicesCandidate.map((service) => normalizeDraftServiceCandidate(service)),
     destructive:
       typeof value.destructive === 'boolean' ? value.destructive : false,
     missingInformation: Array.isArray(value.missingInformation)
@@ -368,22 +297,16 @@ function normalizeDraftQueryCandidate(
   };
 }
 
-function normalizeDraftServiceCandidate(value: unknown, prompt: string): DraftServiceQuery {
+function normalizeDraftServiceCandidate(value: unknown): DraftServiceQuery {
   const record = isRecord(value) ? value : {};
-  const image = getNullableString(record.image ?? record.technology);
-  const portCandidate = getNullableInteger(record.port ?? getFirstPortCandidate(record.ports));
-  const port = normalizeDraftPortCandidate(portCandidate, prompt);
 
   return {
-    name: getNullableString(record.name),
-    image,
-    port,
+    name: getNullableString(record.name ?? record.role),
+    image: getNullableString(record.image ?? record.technology),
+    port: getNullableInteger(record.port ?? getFirstPortCandidate(record.ports)),
     replicas: getNullableInteger(record.replicas),
-    requestedMounts: Array.isArray(record.requestedMounts)
-      ? record.requestedMounts.filter(
-          (item): item is string => typeof item === 'string' && item.trim() !== '',
-        )
-      : [],
+    dependsOn: getStringArray(record.dependsOn),
+    requestedMounts: getStringArray(record.requestedMounts),
     privileged: getNullableBoolean(record.privileged),
     networkMode: getNullableString(record.networkMode),
     pidMode: getNullableString(record.pidMode),
@@ -393,26 +316,24 @@ function normalizeDraftServiceCandidate(value: unknown, prompt: string): DraftSe
   };
 }
 
-function normalizeDraftPortCandidate(port: number | null, prompt: string): number | null {
-  if (!promptMentionsPort(prompt) || port === null) {
-    return null;
-  }
+function estimateResources(services: DraftServiceQuery[]): {
+  totalContainers: number;
+  maxCpu: number | null;
+  maxMemoryGb: number | null;
+} {
+  const totalContainers = services.reduce((total, service) => total + (service.replicas ?? 1), 0);
+  const cpus = services
+    .map((service) => service.cpu)
+    .filter((cpu): cpu is number => cpu !== null);
+  const memories = services
+    .map((service) => service.memoryGb)
+    .filter((memoryGb): memoryGb is number => memoryGb !== null);
 
-  if (port >= 1 && port <= 65535) {
-    return port;
-  }
-
-  return extractExplicitPromptPorts(prompt).includes(port) ? port : null;
-}
-
-function promptMentionsPort(prompt: string): boolean {
-  return /\b(?:port|ports|expose|publish|published)\b|c[oôổ]ng/i.test(prompt);
-}
-
-function extractExplicitPromptPorts(prompt: string): number[] {
-  return [...prompt.matchAll(/(?:\b(?:port|ports|expose|publish|published)\b|c\S*ng)\s*(?:l\S*|=|:|sang|to)?\s*(-?\d+)/gi)]
-    .map((match) => Number(match[1]))
-    .filter((port) => Number.isInteger(port));
+  return {
+    totalContainers,
+    maxCpu: cpus.length ? Math.max(...cpus) : null,
+    maxMemoryGb: memories.length ? Math.max(...memories) : null,
+  };
 }
 
 function getFirstPortCandidate(value: unknown): unknown {
@@ -420,9 +341,7 @@ function getFirstPortCandidate(value: unknown): unknown {
     return null;
   }
 
-  return value.find(
-    (item) => typeof item === 'number' || typeof item === 'string',
-  );
+  return value.find((item) => typeof item === 'number' || typeof item === 'string') ?? null;
 }
 
 function getNullableString(value: unknown): string | null {
@@ -449,6 +368,12 @@ function getNullableBoolean(value: unknown): boolean | null {
   return typeof value === 'boolean' ? value : null;
 }
 
+function getStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string' && item.trim() !== '')
+    : [];
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -463,451 +388,25 @@ function isStaticIntent(value: unknown): value is IntentClassification['intent']
   );
 }
 
-function normalizeDraftQueryImageAliases(draft: DraftQuery): {
-  draft: DraftQuery;
-  corrections: string[];
-} {
-  const corrections: string[] = [];
-  const services = draft.services.map((service) => {
-    const normalizedImage = normalizeImageReference(service.image);
-    const normalizedName = normalizeResourceNameAlias(service.name);
-
-    if (normalizedImage.correction !== null) {
-      corrections.push(normalizedImage.correction);
-    }
-
-    if (normalizedName.correction !== null) {
-      corrections.push(normalizedName.correction);
-    }
-
-    return {
-      ...service,
-      image: normalizedImage.value,
-      name: normalizedName.value,
-    };
-  });
-
-  return {
-    draft: {
-      ...draft,
-      services,
-    },
-    corrections,
-  };
-}
-
-function normalizeImageReference(image: string | null): {
-  value: string | null;
-  correction: string | null;
-} {
-  if (image === null) {
-    return {
-      value: null,
-      correction: null,
-    };
+function detectExplicitNonCreateIntent(prompt: string): string | null {
+  if (/^\s*(?:please\s+)?(?:delete|destroy|remove)\b|^\s*(?:vui long\s+)?(?:x[oó]a|xoá|xóa)\b/i.test(prompt)) {
+    return 'destroy';
   }
 
-  const parsed = splitImageReference(image);
-  const rolePlaceholder = normalizeRolePlaceholderImage(parsed);
-
-  if (rolePlaceholder !== null) {
-    return rolePlaceholder;
+  if (/^\s*(?:please\s+)?(?:update|change|modify|edit|adjust|scale|resize)\b|^\s*(?:vui long\s+)?(?:cap nhat|cập nhật|doi|đổi|sua|sửa)\b/i.test(prompt)) {
+    return 'update';
   }
 
-  const normalizedBase = normalizeImageBase(parsed.base);
-
-  if (normalizedBase === parsed.base) {
-    return {
-      value: image,
-      correction: null,
-    };
+  if (/^\s*(?:please\s+)?(?:status|inspect|show|list)\b|^\s*(?:xem\s+)?(?:trang thai|trạng thái)\b/i.test(prompt)) {
+    return 'status';
   }
 
-  return {
-    value: `${parsed.prefix}${normalizedBase}${parsed.suffix}`,
-    correction: `${parsed.base}->${normalizedBase}`,
-  };
-}
-
-function normalizeRolePlaceholderImage(parsed: ReturnType<typeof splitImageReference>): {
-  value: string | null;
-  correction: string | null;
-} | null {
-  if (parsed.prefix !== '/' || parsed.suffix !== '') {
-    return null;
+  if (/^\s*(?:please\s+)?(?:check\s+)?drift\b/i.test(prompt)) {
+    return 'drift';
   }
 
-  if (parsed.base === 'backend') {
-    return { value: null, correction: '/backend->null' };
-  }
-
-  if (parsed.base === 'database' || parsed.base === 'db') {
-    return { value: null, correction: `/${parsed.base}->null` };
-  }
-
-  if (parsed.base === 'web' || parsed.base === 'website') {
-    return { value: 'nginx', correction: `/${parsed.base}->nginx` };
-  }
-
-  return null;
-}
-
-function normalizeResourceNameAlias(name: string | null): {
-  value: string | null;
-  correction: string | null;
-} {
-  if (name === null) {
-    return {
-      value: null,
-      correction: null,
-    };
-  }
-
-  const normalizedName = normalizeImageBase(name);
-
-  if (normalizedName === name) {
-    return {
-      value: name,
-      correction: null,
-    };
-  }
-
-  return {
-    value: normalizedName,
-    correction: `${name}->${normalizedName}`,
-  };
-}
-
-function splitImageReference(image: string): {
-  prefix: string;
-  base: string;
-  suffix: string;
-} {
-  const slashIndex = image.lastIndexOf('/');
-  const prefix = slashIndex >= 0 ? image.slice(0, slashIndex + 1) : '';
-  const baseAndSuffix = slashIndex >= 0 ? image.slice(slashIndex + 1) : image;
-  const tagIndex = baseAndSuffix.indexOf(':');
-
-  if (tagIndex < 0) {
-    return {
-      prefix,
-      base: baseAndSuffix.toLowerCase(),
-      suffix: '',
-    };
-  }
-
-  return {
-    prefix,
-    base: baseAndSuffix.slice(0, tagIndex).toLowerCase(),
-    suffix: baseAndSuffix.slice(tagIndex),
-  };
-}
-
-function normalizeImageBase(base: string): string {
-  return canonicalizeImageBase(base).value;
-}
-
-function validateStaticRules(draft: DraftQuery): StaticValidationOutcome {
-  const limits = loadStaticResourceLimitConfig();
-  const issues: string[] = [];
-  const riskFlags: string[] = [];
-  const securityFindings: string[] = [];
-  let blockedBySecurity = false;
-  let blockedByResourceLimit = false;
-  const blockedByImageWhitelist = false;
-
-  if (draft.destructive || draft.intent === 'destroy') {
-    riskFlags.push('destructive-intent');
-  }
-
-  const rawPrompt = draft.raw.toLowerCase();
-  const rawSecurityFindings = findDangerousPromptFragments(rawPrompt);
-  if (rawSecurityFindings.length) {
-    blockedBySecurity = true;
-    securityFindings.push(...rawSecurityFindings);
-    issues.push(...rawSecurityFindings);
-  }
-
-  for (const [index, service] of draft.services.entries()) {
-    const serviceLabel = `services.${index}`;
-
-    validateStaticService(service, serviceLabel, issues, securityFindings, limits, {
-      markUnresolvedImageReference: (image) => {
-        riskFlags.push(`${serviceLabel}.unresolved-image-reference:${image}`);
-      },
-      markSecurityBlocked: () => {
-        blockedBySecurity = true;
-      },
-      markResourceLimitBlocked: () => {
-        blockedByResourceLimit = true;
-      },
-    });
-  }
-
-  const resourceEstimate = estimateResources(draft.services);
-  const explicitContainerCount = extractExplicitContainerCount(draft.raw);
-
-  if (resourceEstimate.totalContainers > limits.maxTotalContainers) {
-    blockedByResourceLimit = true;
-    issues.push(
-      `Total requested containers must be <= ${limits.maxTotalContainers}; got ${resourceEstimate.totalContainers}.`,
-    );
-  }
-
-  if (explicitContainerCount !== null && explicitContainerCount > limits.maxTotalContainers) {
-    blockedByResourceLimit = true;
-    issues.push(
-      `Explicit container count must be <= ${limits.maxTotalContainers}; got ${explicitContainerCount}.`,
-    );
-  }
-
-  const clarificationQuestion = getClarificationQuestion(draft);
-
-  return {
-    issues,
-    riskFlags,
-    securityFindings,
-    resourceEstimate,
-    clarificationQuestion,
-    blockedBySecurity,
-    blockedByResourceLimit,
-    blockedByImageWhitelist,
-  };
-}
-
-function validateStaticService(
-  service: DraftServiceQuery,
-  serviceLabel: string,
-  issues: string[],
-  securityFindings: string[],
-  limits: ReturnType<typeof loadStaticResourceLimitConfig>,
-  markers: {
-    markUnresolvedImageReference(image: string): void;
-    markSecurityBlocked(): void;
-    markResourceLimitBlocked(): void;
-  },
-): void {
-  if (service.name !== null && !DOCKER_RESOURCE_NAME_PATTERN.test(service.name)) {
-    issues.push(
-      `${serviceLabel}.name must use only letters, numbers, underscores, or hyphens.`,
-    );
-  }
-
-  if (service.image !== null && !isSupportedImageReference(service.image)) {
-    markers.markUnresolvedImageReference(service.image);
-  }
-
-  if (service.port !== null && (service.port < 1 || service.port > 65535)) {
-    issues.push(`${serviceLabel}.port must be between 1 and 65535.`);
-  }
-
-  if (service.replicas !== null && service.replicas < 1) {
-    issues.push(`${serviceLabel}.replicas must be >= 1.`);
-  }
-
-  if (service.replicas !== null && service.replicas > limits.maxTotalContainers) {
-    markers.markResourceLimitBlocked();
-    issues.push(`${serviceLabel}.replicas must be <= ${limits.maxTotalContainers}.`);
-  }
-
-  if (
-    service.replicas !== null &&
-    service.image === null &&
-    service.replicas > limits.maxAbsurdReplicas
-  ) {
-    issues.push(`${serviceLabel}.replicas is too large to be a valid static request.`);
-  }
-
-  for (const mount of service.requestedMounts) {
-    const finding = getDangerousMountFinding(mount);
-    if (finding !== null) {
-      markers.markSecurityBlocked();
-      securityFindings.push(finding);
-      issues.push(finding);
-    }
-  }
-
-  if (service.privileged === true) {
-    markers.markSecurityBlocked();
-    const finding = `${serviceLabel}.privileged is blocked by static security policy.`;
-    securityFindings.push(finding);
-    issues.push(finding);
-  }
-
-  for (const [field, value] of [
-    ['networkMode', service.networkMode],
-    ['pidMode', service.pidMode],
-    ['ipcMode', service.ipcMode],
-  ] as const) {
-    if (value?.toLowerCase() === 'host') {
-      markers.markSecurityBlocked();
-      const finding = `${serviceLabel}.${field}=host is blocked by static security policy.`;
-      securityFindings.push(finding);
-      issues.push(finding);
-    }
-  }
-
-  if (service.cpu !== null && service.cpu > limits.maxCpu) {
-    markers.markResourceLimitBlocked();
-    issues.push(`${serviceLabel}.cpu must be <= ${limits.maxCpu}.`);
-  }
-
-  if (service.memoryGb !== null && service.memoryGb > limits.maxMemoryGb) {
-    markers.markResourceLimitBlocked();
-    issues.push(`${serviceLabel}.memoryGb must be <= ${limits.maxMemoryGb}.`);
-  }
-}
-
-function estimateResources(services: DraftServiceQuery[]): StaticResourceEstimate {
-  const totalContainers = services.reduce((total, service) => {
-    if (service.replicas === null) {
-      return total + 1;
-    }
-
-    return total + Math.max(service.replicas, 0);
-  }, 0);
-
-  const deployableServices = services.filter((service) => service.image !== null);
-
-  const cpus = deployableServices
-    .map((service) => service.cpu)
-    .filter((cpu): cpu is number => cpu !== null);
-  const memories = deployableServices
-    .map((service) => service.memoryGb)
-    .filter((memoryGb): memoryGb is number => memoryGb !== null);
-
-  return {
-    totalContainers,
-    maxCpu: cpus.length ? Math.max(...cpus) : null,
-    maxMemoryGb: memories.length ? Math.max(...memories) : null,
-  };
-}
-
-function extractExplicitContainerCount(prompt: string): number | null {
-  const counts = [...prompt.matchAll(/(-?\d+)\s*(?:c[aá]i\s+)?(?:container|containers)\b/gi)]
-    .map((match) => Number(match[1]))
-    .filter((value) => Number.isInteger(value));
-
-  return counts.length ? Math.max(...counts) : null;
-}
-
-function getClarificationQuestion(draft: DraftQuery): string | null {
-  const topology = inferDraftTopology(draft.services);
-
-  if (topology.hasReverseProxy && topology.hasDatabase && !topology.hasBackend) {
-    return 'Topology is unclear: you requested a reverse proxy and a database, but no backend app service. Do you want to add a backend service between them, or remove the reverse proxy?';
-  }
-
-  if (topology.hasReverseProxy && !topology.hasBackend && draft.services.length > 1) {
-    return 'Topology is incomplete: you requested a reverse proxy without a backend app service. Which backend should the proxy route traffic to?';
-  }
-
-  return null;
-}
-
-function inferDraftTopology(services: DraftServiceQuery[]): {
-  hasReverseProxy: boolean;
-  hasBackend: boolean;
-  hasDatabase: boolean;
-} {
-  let hasReverseProxy = false;
-  let hasBackend = false;
-  let hasDatabase = false;
-
-  for (const service of services) {
-    if (service.image === null) {
-      const role = inferRoleFromServiceName(service.name);
-      if (role === 'reverse-proxy') hasReverseProxy = true;
-      if (role === 'backend') hasBackend = true;
-      if (role === 'database') hasDatabase = true;
-      continue;
-    }
-
-    const imageBase = normalizeImageBase(splitImageReference(service.image).base);
-
-    if (isReverseProxyImageBase(imageBase)) {
-      hasReverseProxy = true;
-      continue;
-    }
-
-    if (isDatabaseImageBase(imageBase)) {
-      hasDatabase = true;
-      continue;
-    }
-
-    hasBackend = true;
-  }
-
-  return {
-    hasReverseProxy,
-    hasBackend,
-    hasDatabase,
-  };
-}
-
-function inferRoleFromServiceName(name: string | null): 'reverse-proxy' | 'backend' | 'database' | null {
-  const normalizedName = name?.toLowerCase() ?? '';
-
-  if (/\b(web|website|nginx|ngix|proxy|reverse-proxy|frontend)\b/.test(normalizedName)) {
-    return 'reverse-proxy';
-  }
-
-  if (/\b(db|database|postgres|postgresql|postresql|mysql|mariadb|mongo|redis)\b/.test(normalizedName)) {
-    return 'database';
-  }
-
-  if (/\b(backend|api|node|nodejs|server)\b/.test(normalizedName)) {
-    return 'backend';
-  }
-
-  return null;
-}
-
-function isReverseProxyImageBase(imageBase: string): boolean {
-  return ['nginx', 'httpd', 'traefik'].includes(imageBase);
-}
-
-function isDatabaseImageBase(imageBase: string): boolean {
-  return [
-    'postgres',
-    'mysql',
-    'mariadb',
-    'mongo',
-    'redis',
-    'rabbitmq',
-    'elasticsearch',
-    'kafka',
-  ].includes(imageBase);
-}
-
-function findDangerousPromptFragments(rawPrompt: string): string[] {
-  const findings: string[] = [];
-
-  for (const dangerousFragment of [
-    '/var/run/docker.sock',
-    'mount /etc',
-    'mount / ',
-    'mount /:',
-    'privileged: true',
-    'privileged true',
-  ]) {
-    if (rawPrompt.includes(dangerousFragment)) {
-      findings.push(`Dangerous request blocked: ${dangerousFragment}.`);
-    }
-  }
-
-  return findings;
-}
-
-function getDangerousMountFinding(mount: string): string | null {
-  const source = mount.split(':')[0]?.toLowerCase();
-
-  if (!source) {
-    return null;
-  }
-
-  if (source === '/var/run/docker.sock' || source === '/etc' || source === '/') {
-    return `Dangerous mount source blocked: ${source}.`;
+  if (/^\s*(?:please\s+)?(?:repair|sync|rollback)\b/i.test(prompt)) {
+    return 'repair';
   }
 
   return null;

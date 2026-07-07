@@ -260,7 +260,28 @@ export class ReActAgent {
     ];
     const trace: ReActStep[] = [];
 
-    const resolvedQuery = resolution.query;
+    let resolvedQuery = resolution.query;
+    const imageResolution = await this.resolveDraftImageReferences(
+      resolvedQuery,
+      trace,
+      observations,
+    );
+
+    if (imageResolution.status === 'clarification') {
+      const clarificationResult = imageResolution.result;
+      if (clarificationResult.status === 'clarification' && clarificationResult.clarificationContext) {
+        clarificationResult.clarificationContext.assumptions = mergeAssumptions(
+          [
+            ...validContext.assumptions,
+            `User resolved planning uncertainty ${validAnswer.uncertaintyId} before continuing image resolution.`,
+          ],
+          clarificationResult.clarificationContext.assumptions,
+        );
+      }
+      return clarificationResult;
+    }
+
+    resolvedQuery = applyExplicitPromptImageReferences(imageResolution.query);
     const nextImageSelectionClarification = buildImageSelectionClarification(
       resolvedQuery,
       null,
@@ -1202,7 +1223,10 @@ function buildUnsupportedImageClarification(
     targetService.name ??
     getImageReferenceBase(resolution.candidates[0] ?? resolution.raw) ??
     'service';
-  const suggestedImages = buildSuggestedImageReferences(resolution, inferUnsupportedImageRole(query, targetService, resolution.raw));
+  const suggestedImages = buildSuggestedImageReferences(
+    resolution,
+    inferUnsupportedImageRole(query, targetService, resolution.raw),
+  );
   const defaultImage = suggestedImages[0] ?? 'nginx:stable';
   const provisionalQuery = validateValidatedQuery({
     ...query,
@@ -1220,15 +1244,18 @@ function buildUnsupportedImageClarification(
     },
   });
   const provisionalSpec = buildSpecFromDraft(provisionalQuery);
-  const resolvedServiceName =
-    provisionalSpec.services.find((service) => service.image === defaultImage)?.name ?? serviceName;
+  const affectedServiceNames = findAffectedSpecServiceNamesForDraft(
+    provisionalSpec,
+    serviceName,
+    defaultImage,
+  );
   const uncertainty = validatePlanningUncertainty({
-    id: `unsupported-image:${resolvedServiceName}`,
+    id: `unsupported-image:${serviceName}`,
     severity: 'blocking',
     field: 'services[].image',
     message: `The requested image/runtime "${resolution.raw}" is not currently supported by the catalog. Choose one supported image to continue planning.`,
     reason: `${question} Custom images are not accepted here; if none fit, run plan again with a supported image/runtime from the whitelist.`,
-    affectedServices: [resolvedServiceName],
+    affectedServices: affectedServiceNames,
     choices: suggestedImages.map((image, index) => ({
       id: String(index + 1),
       label: image,
@@ -1236,7 +1263,7 @@ function buildUnsupportedImageClarification(
         index === 0
           ? 'Recommended closest supported image/runtime.'
           : 'Alternative supported image/runtime suggestion.',
-      value: `setServiceImage:${resolvedServiceName}:${image}`,
+      value: `setServiceImage:${serviceName}:${image}`,
     })),
     allowOther: false,
   });
@@ -1272,6 +1299,27 @@ function buildUnsupportedImageClarification(
   };
 }
 
+function findAffectedSpecServiceNamesForDraft(
+  spec: InfrastructureSpec,
+  draftServiceName: string,
+  image: string,
+): string[] {
+  const directMatch = spec.services.find((service) => service.name === draftServiceName);
+  if (directMatch) {
+    return [directMatch.name];
+  }
+
+  const imageMatches = spec.services
+    .filter((service) => service.image === image)
+    .map((service) => service.name)
+    .filter((name) => name === draftServiceName || name.startsWith(`${draftServiceName}-`));
+  if (imageMatches.length > 0) {
+    return imageMatches;
+  }
+
+  return [draftServiceName];
+}
+
 function buildSuggestedImageReferences(
   resolution: ImageReferenceResolution,
   preferredRole?: InfrastructureService['kind'],
@@ -1299,9 +1347,42 @@ function buildSuggestedImageReferences(
 }
 
 function getTrustedDefaultImagesForRole(role: InfrastructureService['kind']): string[] {
-  return TRUSTED_IMAGE_PROFILES
+  const roleImages = TRUSTED_IMAGE_PROFILES
     .filter((profile) => profile.role === role)
     .map((profile) => profile.image);
+
+  if (role === 'backend') {
+    return orderPreferredImages(roleImages, [
+      getDefaultImage('node'),
+      getDefaultImage('python'),
+      getDefaultImage('golang'),
+    ]);
+  }
+
+  if (role === 'database') {
+    return orderPreferredImages(roleImages, [
+      getDefaultImage('postgres'),
+      getDefaultImage('mysql'),
+      getDefaultImage('mariadb'),
+    ]);
+  }
+
+  if (role === 'reverse-proxy') {
+    return orderPreferredImages(roleImages, [
+      getDefaultImage('nginx'),
+      getDefaultImage('httpd'),
+      getDefaultImage('traefik'),
+    ]);
+  }
+
+  return roleImages;
+}
+
+function orderPreferredImages(images: string[], preferredImages: string[]): string[] {
+  return [
+    ...preferredImages.filter((image) => images.includes(image)),
+    ...images.filter((image) => !preferredImages.includes(image)),
+  ];
 }
 
 function inferUnsupportedImageRole(
@@ -1309,13 +1390,29 @@ function inferUnsupportedImageRole(
   service: DraftServiceQuery,
   rawImage: string,
 ): InfrastructureService['kind'] {
-  const text = [service.name ?? '', rawImage, query.normalizedPrompt].join(' ').toLowerCase();
+  const serviceText = service.name?.toLowerCase() ?? '';
+  const rawImageText = rawImage.toLowerCase();
+  const serviceSpecificText = [serviceText, rawImageText].join(' ');
 
-  if (/\b(db|database|postgres|postgresql|postresql|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka)\b/.test(text)) {
+  if (/\b(db|database|postgres|postgresql|postresql|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka)\b/.test(serviceSpecificText)) {
     return 'database';
   }
 
-  if (/\b(web|website|nginx|ngix|httpd|apache|traefik|caddy|haproxy|proxy|reverse[- ]?proxy|frontend)\b/.test(text)) {
+  if (/\b(web|website|nginx|ngix|httpd|apache|traefik|caddy|haproxy|proxy|reverse[- ]?proxy|frontend)\b/.test(serviceSpecificText)) {
+    return 'reverse-proxy';
+  }
+
+  if (/\b(backend|api|node|nodejs|server|app|service)\b/.test(serviceSpecificText)) {
+    return 'backend';
+  }
+
+  const prompt = query.normalizedPrompt.toLowerCase();
+
+  if (/\b(db|database|postgres|postgresql|postresql|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka)\b/.test(prompt)) {
+    return 'database';
+  }
+
+  if (/\b(web|website|nginx|ngix|httpd|apache|traefik|caddy|haproxy|proxy|reverse[- ]?proxy|frontend)\b/.test(prompt)) {
     return 'reverse-proxy';
   }
 

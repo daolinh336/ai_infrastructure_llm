@@ -282,16 +282,6 @@ export function registerPlanCommand(program: Command): void {
         return;
       }
 
-      if (gatewayResult.status === 'clarification') {
-        console.log(
-          chalk.yellow('Clarification required before ReAct starts.'),
-        );
-        console.log(gatewayResult.question);
-        console.log();
-        printStaticGatewayMetrics(gatewayResult.metrics);
-        return;
-      }
-
       console.log(chalk.green('ValidatedQuery ready. ReAct Agent may start.'));
       printStaticGatewayMetrics(gatewayResult.metrics);
       console.log();
