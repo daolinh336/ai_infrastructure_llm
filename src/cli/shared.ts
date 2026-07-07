@@ -75,18 +75,6 @@ export function printStaticGatewayMetrics(metrics: StaticGatewayMetrics): void {
   console.log(chalk.cyan('Static validation metrics:'));
   console.log(`- intentAccepted: ${metrics.intentAccepted}`);
   console.log(`- intentRejected: ${metrics.intentRejected}`);
-  console.log(`- clarificationRequired: ${metrics.clarificationRequired}`);
-  console.log(`- schemaValidationPassed: ${metrics.schemaValidationPassed}`);
-  console.log(`- schemaValidationFailed: ${metrics.schemaValidationFailed}`);
-  console.log(`- securityBlocked: ${metrics.securityBlocked}`);
-  console.log(`- resourceLimitBlocked: ${metrics.resourceLimitBlocked}`);
-  console.log(`- imageWhitelistBlocked: ${metrics.imageWhitelistBlocked}`);
-  console.log(
-    `- runtimeCallsDuringStaticValidation: ${metrics.runtimeCallsDuringStaticValidation}`,
-  );
-  console.log(
-    `- reactInvocationsAfterStaticValidationFailure: ${metrics.reactInvocationsAfterStaticValidationFailure}`,
-  );
 }
 
 export function printObservations(observations: Array<{ source: string; message: string }>): void {

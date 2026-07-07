@@ -31,6 +31,8 @@ import {
 import { runClosedLoopDeploy } from './deploy-loop.js';
 import { buildResourceRefs } from '../agent/standard-verifier-agent.js';
 import { createProvider } from '../llm/provider.js';
+import { finishOperationMetrics, startOperationMetrics } from '../metrics/metrics.js';
+import type { ActiveOperationMetrics } from '../metrics/types.js';
 import {
   getStateDatabasePath,
   discardManagedProjectState,
@@ -114,6 +116,7 @@ export function registerPlanCommand(program: Command): void {
         dryRun: applyRequested ? false : true,
         provider: normalizedOptions.provider,
       });
+      let operationMetrics: ActiveOperationMetrics | null = null;
       const requestedProjectName = normalizedOptions.prjName
         ? normalizeProjectName(normalizedOptions.prjName)
         : null;
@@ -189,6 +192,12 @@ export function registerPlanCommand(program: Command): void {
         process.exitCode = 1;
         return;
       }
+
+      operationMetrics = startOperationMetrics({
+        operationType: applyRequested ? 'deploy' : 'dry-run',
+        projectName: requestedProjectName,
+        provider: input.provider,
+      });
 
       if (adjustRequested && adjustCurrentSnapshot) {
         const driftGatePassed = await verifyNoRuntimeDriftBeforeAdjust(
@@ -521,6 +530,7 @@ export function registerPlanCommand(program: Command): void {
             console.log();
             console.log(chalk.red('ReAct Agent blocked after clarification.'));
             console.log(`- Reason: ${resumedResult.blockReason}`);
+            await finishPlanOperationMetrics(operationMetrics, resumedResult, false, resumedResult.blockReason);
             return;
           }
 
@@ -533,6 +543,7 @@ export function registerPlanCommand(program: Command): void {
             requestedProjectName,
           );
         } else {
+          await finishPlanOperationMetrics(operationMetrics, result, false, 'clarification required');
           return;
         }
       }
@@ -544,6 +555,7 @@ export function registerPlanCommand(program: Command): void {
         printGuardTelemetry(result.guardTelemetry);
         console.log();
         process.exitCode = 1;
+        await finishPlanOperationMetrics(operationMetrics, result, false, result.blockReason);
         return;
       }
 
@@ -634,6 +646,7 @@ export function registerPlanCommand(program: Command): void {
             ),
           );
           process.exitCode = 1;
+          await finishPlanOperationMetrics(operationMetrics, currentResult, false, 'deploy preflight failed');
           return;
         }
 
@@ -749,6 +762,7 @@ export function registerPlanCommand(program: Command): void {
             chalk.yellow('No Docker, MCP, or runtime mutation was performed.'),
           );
           console.log(chalk.yellow('No deployment state was saved.'));
+          await finishPlanOperationMetrics(operationMetrics, currentResult, true, 'approval rejected');
           return;
         }
 
@@ -939,6 +953,7 @@ export function registerPlanCommand(program: Command): void {
                 );
               }
               process.exitCode = 1;
+              await finishPlanOperationMetrics(operationMetrics, currentResult, false, 'closed-loop deploy failed');
               return;
             }
           } catch (error) {
@@ -979,6 +994,7 @@ export function registerPlanCommand(program: Command): void {
               );
             }
             process.exitCode = 1;
+            await finishPlanOperationMetrics(operationMetrics, currentResult, false, getErrorMessage(error));
             return;
           } finally {
             await mcpClient.shutdown();
@@ -989,6 +1005,7 @@ export function registerPlanCommand(program: Command): void {
         console.log(chalk.cyan('State database:'));
         console.log(getStateDatabasePath());
         console.log();
+        await finishPlanOperationMetrics(operationMetrics, currentResult, true, null);
         return;
       }
 
@@ -1001,6 +1018,7 @@ export function registerPlanCommand(program: Command): void {
           'Dry run only. No state saved and no Docker deployment executed.',
         ),
       );
+      await finishPlanOperationMetrics(operationMetrics, result, true, null);
     });
 }
 
@@ -1316,5 +1334,38 @@ function enforcePlannedProjectName(
       ...result.plan,
       spec: validateInfrastructureSpec({ ...result.plan.spec, projectName }),
     },
+  };
+}
+
+
+async function finishPlanOperationMetrics(
+  operationMetrics: ActiveOperationMetrics | null,
+  result: AgentRunResult,
+  success: boolean,
+  errorMessage: string | null,
+): Promise<void> {
+  if (!operationMetrics) return;
+  await finishOperationMetrics(operationMetrics, {
+    success,
+    errorMessage,
+    plannerAccuracy: buildPlannerAccuracyMetrics(result),
+    ...(result.guardTelemetry ? { guardTelemetry: result.guardTelemetry } : {}),
+  });
+}
+
+function buildPlannerAccuracyMetrics(result: AgentRunResult): {
+  firstPassCorrect: boolean;
+  revisionCount: number;
+  clarificationCount: number;
+  finalStatus: string;
+} {
+  const trace = result.trace ?? [];
+  const revisionCount = trace.filter((step) => /revise|revision|repair/i.test(`${step.toolName ?? ''} ${step.message}`)).length;
+  const clarificationCount = result.status === 'clarification' ? 1 : trace.filter((step) => /clarification/i.test(step.message)).length;
+  return {
+    firstPassCorrect: result.status === 'planned' && revisionCount === 0 && clarificationCount === 0,
+    revisionCount,
+    clarificationCount,
+    finalStatus: result.status,
   };
 }

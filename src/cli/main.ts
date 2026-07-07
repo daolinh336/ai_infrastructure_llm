@@ -16,6 +16,7 @@ import { normalizeProjectName } from '../domain/project-identity.js';
 import { clearManagedProjectState, clearManagedStateAfterDestroyAll, listProjectStates, loadProjectState, loadState, saveVerifiedRuntimeSnapshot } from '../state/sqlite-state-store.js';
 import { StatusService, formatStatusSnapshots } from '../status/status-service.js';
 import { registerPlanCommand } from './plan-command.js';
+import { finishOperationMetrics, startOperationMetrics } from '../metrics/metrics.js';
 import type { DriftReport, RepairPlan, RuntimeActualState, VerifiedRuntimeSnapshot } from '../domain/types.js';
 import {
   collectDestroyAllTargets,
@@ -49,8 +50,13 @@ program
       return;
     }
 
+    const doctorMetrics = startOperationMetrics({
+      operationType: 'doctor',
+      provider: process.env.INFRA_AGENT_PROVIDER ?? null,
+    });
     const report = await runDockerDoctor();
     printDockerDoctorReport(report);
+    await finishOperationMetrics(doctorMetrics, { success: report.status !== 'failed', errorMessage: report.status === 'failed' ? report.issues.join('; ') : null });
 
     if (report.status === 'failed') {
       process.exitCode = 1;
@@ -109,6 +115,10 @@ program
   .option('--remove-volumes', 'Also remove volumes referenced by saved tool state', false)
   .option('--yes', 'Skip interactive approval by typing the verification phrase automatically', false)
   .action(async (options) => {
+    const destroyAllMetrics = startOperationMetrics({
+      operationType: 'destroy-all',
+      provider: process.env.INFRA_AGENT_PROVIDER ?? null,
+    });
     const state = await loadState();
     const projectStates = await listProjectStates();
     const mcpClient = createDockerMcpGatewayFromEnv();
@@ -128,6 +138,7 @@ program
       const totalTargets = targets.containers.length + targets.networks.length + targets.volumes.length;
       if (totalTargets === 0) {
         console.log(chalk.green('No managed Docker resources found to destroy.'));
+        await finishOperationMetrics(destroyAllMetrics, { success: true });
         return;
       }
 
@@ -139,6 +150,7 @@ program
           const answer = (await readline.question(chalk.yellow(`Type exactly "${verificationPhrase}" to continue: `))).trim();
           if (answer !== verificationPhrase) {
             console.log(chalk.yellow('Destroy-all rejected. No Docker mutation performed.'));
+            await finishOperationMetrics(destroyAllMetrics, { success: true, errorMessage: 'destroy-all rejected' });
             return;
           }
         } finally {
@@ -216,10 +228,12 @@ program
         summary: `Destroy-all removed ${removed.containers.length} container(s), ${removed.networks.length} network(s), and ${removed.volumes.length} volume(s). Verified SQLite snapshots were cleared.`,
       });
       console.log(chalk.green('SQLite state updated: verified snapshots cleared.'));
+      await finishOperationMetrics(destroyAllMetrics, { success: failed.length === 0, errorMessage: failed.length === 0 ? null : failed.map((entry) => entry.error).join('; ') });
     } catch (error) {
       console.log(chalk.red('Destroy-all failed:'));
       console.log('- ' + getErrorMessage(error));
       process.exitCode = 1;
+      await finishOperationMetrics(destroyAllMetrics, { success: false, errorMessage: getErrorMessage(error) });
     } finally {
       await mcpClient.shutdown();
     }
@@ -242,6 +256,13 @@ program
       message: 'acting... load saved infrastructure snapshot.',
     });
     const requestedProjectName = options.prjName ? normalizeProjectName(String(options.prjName)) : null;
+    const statusMetrics = startOperationMetrics({
+      operationType: options.drift ? 'drift' : 'status',
+      projectName: requestedProjectName,
+      provider: process.env.INFRA_AGENT_PROVIDER ?? null,
+    });
+    let statusSuccess = true;
+    let statusError: string | null = null;
     const selectedProjectState = requestedProjectName ? await loadProjectState(requestedProjectName) : null;
     const projectStates = requestedProjectName
       ? (selectedProjectState?.current ? [selectedProjectState] : [])
@@ -256,6 +277,7 @@ program
     if (options.repair && !options.drift) {
       console.log(chalk.yellow('Option --repair requires --drift. Example: aiagent status --drift --repair'));
       process.exitCode = 1;
+      await finishOperationMetrics(statusMetrics, { success: false, errorMessage: 'Option --repair requires --drift' });
       return;
     }
     if (options.drift) {
@@ -269,6 +291,7 @@ program
         console.log(chalk.yellow(requestedProjectName
           ? 'No verified runtime snapshot found for project "' + requestedProjectName + '"; cannot detect drift.'
           : 'No verified runtime snapshot found; cannot detect drift.'));
+        await finishOperationMetrics(statusMetrics, { success: true });
         return;
       }
       for (const projectState of projectsToCheck) {
@@ -298,14 +321,18 @@ program
           console.log(chalk.red('Drift detection failed for project "' + project + '":'));
           console.log('- ' + getErrorMessage(error));
           process.exitCode = 1;
+          statusSuccess = false;
+          statusError = getErrorMessage(error);
         } finally {
           await mcpClient.shutdown();
         }
       }
+      await finishOperationMetrics(statusMetrics, { success: statusSuccess, errorMessage: statusError });
       return;
     }
     const status = await new StatusService().showStatus(requestedProjectName);
     console.log(status);
+    await finishOperationMetrics(statusMetrics, { success: true });
   });
 
 program
@@ -325,10 +352,16 @@ program
       process.exitCode = 1;
       return;
     }
+    const destroyMetrics = startOperationMetrics({
+      operationType: 'destroy',
+      projectName: project,
+      provider: process.env.INFRA_AGENT_PROVIDER ?? null,
+    });
     const projectState = options.project ? await loadProjectState(project) : state;
     if (!projectState?.current) {
       console.log(chalk.red(`No verified managed state found for project "${project}".`));
       process.exitCode = 1;
+      await finishOperationMetrics(destroyMetrics, { success: false, errorMessage: 'No verified managed state found' });
       return;
     }
     const destroySnapshot = projectState.current;
@@ -354,6 +387,7 @@ program
         const answer = (await readline.question(chalk.yellow('Approve destroying these resources? (y/N) '))).trim().toLowerCase();
         if (answer !== 'y' && answer !== 'yes') {
           console.log(chalk.yellow('Destroy rejected. No Docker mutation performed.'));
+          await finishOperationMetrics(destroyMetrics, { success: true });
           return;
         }
       } finally { readline.close(); }
@@ -403,10 +437,12 @@ program
         });
         console.log(chalk.yellow('Destroy verification did not pass; managed SQLite state for this project was cleared.'));
       }
+      await finishOperationMetrics(destroyMetrics, { success: result.verificationReport.status === 'passed', errorMessage: result.verificationReport.status === 'passed' ? null : result.verificationReport.issues.join('; ') });
     } catch (error) {
       console.log(chalk.red('Destroy failed:'));
       console.log('- ' + getErrorMessage(error));
       process.exitCode = 1;
+      await finishOperationMetrics(destroyMetrics, { success: false, errorMessage: getErrorMessage(error) });
     } finally {
       await mcpClient.shutdown();
     }
@@ -425,6 +461,11 @@ program
     return;
   }
   const project = state.current.desired.projectName;
+  const repairMetrics = startOperationMetrics({
+    operationType: 'drift',
+    projectName: project,
+    provider: process.env.INFRA_AGENT_PROVIDER ?? null,
+  });
   const mcpClient = createDockerMcpGatewayFromEnv();
   try {
     await mcpClient.initialize();
@@ -433,10 +474,12 @@ program
     console.log('- ' + drift.summary);
     for (const finding of drift.findings) { console.log('  - [' + finding.severity + '] ' + finding.message); }
     await promptAndApplyDriftResolution(state.current, mcpClient, engine, drift, actual);
+    await finishOperationMetrics(repairMetrics, { success: true });
   } catch (error) {
     console.log(chalk.red('Repair failed:'));
     console.log('- ' + getErrorMessage(error));
     process.exitCode = 1;
+    await finishOperationMetrics(repairMetrics, { success: false, errorMessage: getErrorMessage(error) });
   } finally {
     await mcpClient.shutdown();
   }
@@ -671,6 +714,3 @@ function getCommanderExitCode(error: unknown): number {
   }
   return 1;
 }
-
-
-

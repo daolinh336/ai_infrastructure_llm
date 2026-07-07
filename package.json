@@ -20,7 +20,14 @@
     "format:check": "prettier --check .",
     "build:supernova-mcp": "npm --prefix packages/docker-mcp-server-supernova run build",
     "test:chaos": "vitest run tests/three-tier-chaos-pipeline.test.ts",
-    "test:pipeline": "npm run test:chaos"
+    "test:pipeline": "npm run test:chaos",
+    "demo:metrics": "tsx scripts/run-demo-metrics.ts",
+    "eval:planner-prompt": "tsx scripts/run-planner-prompt-eval.ts",
+    "metrics:report": "tsx scripts/write-metrics-reports.ts",
+    "demo:acceptance": "tsx scripts/run-acceptance-metrics.ts",
+    "demo:drift-sync": "tsx scripts/run-drift-sync-metrics.ts",
+    "demo:mentor-main": "tsx scripts/run-mentor-main-metrics.ts",
+    "demo:main": "tsx scripts/run-mentor-main-metrics.ts"
   },
   "engines": {
     "node": ">=20"

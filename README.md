@@ -520,3 +520,22 @@ infra-react-agent --help
 - `docs/tool-system-policy.vi.md`: runtime tool and policy notes.
 - `docs/testing/three-tier-chaos-matrix.md`: real Docker lifecycle and chaos scenarios.
 - `packages/docker-mcp-server-supernova/README.md`: notes for the vendored Docker MCP plugin package.
+
+## Demo metrics and LLM call trace
+
+Metrics are opt-in and disabled by default. Enable them with `INFRA_METRICS=1` or run the benchmark helper:
+
+```bash
+npm run demo:metrics -- --runs 5
+npm run demo:metrics -- --runs 1 --dry-run-only
+npm run metrics:report
+```
+
+Generated files:
+
+- `state/metrics/llm-calls.jsonl`: one record per LLM call, with schema name, purpose, latency, usage, and safe context fields only.
+- `state/metrics/operations.jsonl`: one record per dry-run/deploy/status/drift/destroy operation.
+- `state/metrics/demo-summary.md`: aggregate latency, tokens, planner first-pass correctness, and guard triggers.
+- `state/metrics/llm-call-report.md`: explains how many times LLM was called, why each step called it, and which context fields were supplied.
+
+Normal plan creation calls LLM 3 times when no clarification/revision is needed: `intent_classification`, `draft_query`, and `react_reasoning_output`. Adjust/revision paths may add `feedback_intent` and `spec_patch_plan`. Status, drift, and destroy do not call LLM by default.

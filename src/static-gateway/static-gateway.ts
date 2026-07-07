@@ -27,10 +27,11 @@ import type { LlmProvider } from '../llm/provider.js';
 const INTENT_CLASSIFIER_SYSTEM_PROMPT = [
   'INTENT_CLASSIFIER_V1',
   'Decide whether the full user request is related to infrastructure management before any infrastructure planning starts.',
-  'Return accepted=true when the request asks to create, update, inspect status, destroy, deploy, or check drift for infrastructure, services, containers, databases, networks, or app stacks.',
-  'Accept infrastructure requests even when details are missing, because the structured parser and later validators can ask for clarification.',
-  'Return accepted=false only when the request is not an infrastructure management request or no infrastructure action can be inferred.',
-  'When accepted=true, intent must be one of create, update, status, destroy, or drift. When accepted=false, intent must be null.',
+  'Return accepted=true only when the request asks to create new infrastructure, services, containers, databases, networks, or app stacks.',
+  'Return accepted=false for update, status, destroy, delete, remove, drift, deploy-only, or repair requests because plan static validation currently supports create intent only.',
+  'Accept create infrastructure requests even when details are missing, because the structured parser and later validators can ask for clarification.',
+  'Return accepted=false when the request is not a create infrastructure management request or no create action can be inferred.',
+  'When accepted=true, intent must be create. When accepted=false, intent must be null.',
   'Return only JSON with shape: {"accepted":true|false,"intent":"create|update|status|destroy|drift|null","reason":"..."}',
 ].join('\n');
 
@@ -138,12 +139,21 @@ export class StaticGateway {
       };
     }
 
-    metrics.intentAccepted = 1;
-    this.reportProgress({
-      phase: 'gate',
-      message: `observe... intent accepted as "${classification.intent}".`,
-      toolName: 'intent_classifier',
-    });
+    if (classification.intent !== 'create') {
+      const issue = `Only create intent is currently supported by plan static validation; got "${classification.intent}".`;
+      metrics.intentRejected = 1;
+      this.reportProgress({
+        phase: 'gate',
+        message: `observe... request rejected by create-only intent gate: ${issue}`,
+        toolName: 'intent_classifier',
+      });
+      return {
+        status: 'rejected',
+        reason: issue,
+        issues: [issue],
+        metrics,
+      };
+    }
 
     let draft: DraftQuery;
 
@@ -163,6 +173,29 @@ export class StaticGateway {
         metrics,
       };
     }
+
+    if (draft.intent !== 'create') {
+      const issue = `Only create intent is currently supported by plan static validation; got "${draft.intent}".`;
+      metrics.intentRejected = 1;
+      this.reportProgress({
+        phase: 'gate',
+        message: `observe... request rejected by create-only draft gate: ${issue}`,
+        toolName: 'structured_parser',
+      });
+      return {
+        status: 'rejected',
+        reason: issue,
+        issues: [issue],
+        metrics,
+      };
+    }
+
+    metrics.intentAccepted = 1;
+    this.reportProgress({
+      phase: 'gate',
+      message: `observe... intent accepted as "${draft.intent}".`,
+      toolName: 'intent_classifier',
+    });
 
     const normalization = normalizeDraftQueryImageAliases(draft);
     draft = normalization.draft;

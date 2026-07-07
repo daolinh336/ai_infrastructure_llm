@@ -1,4 +1,6 @@
 import OpenAI from 'openai';
+import { describeLlmCall, isMetricsEnabled, recordLlmCall } from '../metrics/metrics.js';
+import type { TokenUsage } from '../metrics/types.js';
 import type {
   DraftQuery,
   DraftServiceQuery,
@@ -37,6 +39,8 @@ export interface StructuredLlmRequest extends LlmRequest {
 
 export interface LlmResponse {
   text: string;
+  usage?: TokenUsage | undefined;
+  model?: string;
 }
 
 export interface LlmProvider {
@@ -83,6 +87,13 @@ export interface OpenAiResponsesClient {
 
 export interface OpenAiResponse {
   output_text?: unknown;
+  usage?: {
+    input_tokens?: unknown;
+    output_tokens?: unknown;
+    total_tokens?: unknown;
+    prompt_tokens?: unknown;
+    completion_tokens?: unknown;
+  };
   output?: Array<{
     type?: unknown;
     content?: Array<{
@@ -112,6 +123,11 @@ export interface GeminiGenerateContentInput {
 }
 
 export interface GeminiGenerateContentResponse {
+  usageMetadata?: {
+    promptTokenCount?: unknown;
+    candidatesTokenCount?: unknown;
+    totalTokenCount?: unknown;
+  };
   candidates?: Array<{
     content?: {
       parts?: Array<{ text?: string }>;
@@ -206,8 +222,9 @@ export class OpenAiLlmProvider implements LlmProvider {
   }
 
   async complete(input: LlmRequest): Promise<LlmResponse> {
+    const model = this.getModelForPurpose(input.purpose ?? 'react');
     const response = await this.client.responses.create({
-      model: this.getModelForPurpose(input.purpose ?? 'react'),
+      model,
       instructions: input.system,
       input: input.user,
       temperature: this.config.temperature,
@@ -215,12 +232,15 @@ export class OpenAiLlmProvider implements LlmProvider {
 
     return {
       text: getOpenAiOutputText(response),
+      usage: getOpenAiTokenUsage(response),
+      model,
     };
   }
 
   async completeStructured(input: StructuredLlmRequest): Promise<LlmResponse> {
+    const model = this.getModelForPurpose(input.purpose);
     const response = await this.client.responses.create({
-      model: this.getModelForPurpose(input.purpose),
+      model,
       instructions: input.system,
       input: input.user,
       temperature: this.config.temperature,
@@ -236,6 +256,8 @@ export class OpenAiLlmProvider implements LlmProvider {
 
     return {
       text: getOpenAiOutputText(response),
+      usage: getOpenAiTokenUsage(response),
+      model,
     };
   }
 
@@ -320,19 +342,23 @@ export class GeminiLlmProvider implements LlmProvider {
   }
 
   async complete(input: LlmRequest): Promise<LlmResponse> {
+    const model = this.getModelForPurpose(input.purpose ?? 'react');
     const response = await this.client.generateContent(
-      this.getModelForPurpose(input.purpose ?? 'react'),
+      model,
       this.createGenerateContentInput(input),
     );
 
     return {
       text: getGeminiOutputText(response),
+      usage: getGeminiTokenUsage(response),
+      model,
     };
   }
 
   async completeStructured(input: StructuredLlmRequest): Promise<LlmResponse> {
+    const model = this.getModelForPurpose(input.purpose);
     const response = await this.client.generateContent(
-      this.getModelForPurpose(input.purpose),
+      model,
       this.createGenerateContentInput(input, {
         responseMimeType: 'application/json',
         responseSchema: input.schema,
@@ -341,6 +367,8 @@ export class GeminiLlmProvider implements LlmProvider {
 
     return {
       text: getGeminiOutputText(response),
+      usage: getGeminiTokenUsage(response),
+      model,
     };
   }
 
@@ -426,20 +454,20 @@ export function createProvider(
     primary = createSingleProvider(name, env);
   } catch (error) {
     if (fallbackName !== null && error instanceof ProviderConfigurationError) {
-      return createSingleProvider(fallbackName, env);
+      return maybeWrapMetricsProvider(createSingleProvider(fallbackName, env), env);
     }
 
     throw error;
   }
 
   if (fallbackName === null || fallbackName === name) {
-    return primary;
+    return maybeWrapMetricsProvider(primary, env);
   }
 
-  return new FallbackLlmProvider(
+  return maybeWrapMetricsProvider(new FallbackLlmProvider(
     primary,
     createSingleProvider(fallbackName, env),
-  );
+  ), env);
 }
 
 function createSingleProvider(
@@ -967,4 +995,123 @@ function isInfrastructureIntent(value: unknown): value is InfrastructureIntent {
     value === 'destroy' ||
     value === 'drift'
   );
+}
+
+
+
+class MeteredLlmProvider implements LlmProvider {
+  readonly name: ProviderName | 'test';
+
+  constructor(private readonly inner: LlmProvider) {
+    this.name = inner.name;
+  }
+
+  async complete(input: LlmRequest): Promise<LlmResponse> {
+    const startedAt = performance.now();
+    try {
+      const response = await this.inner.complete(input);
+      await this.recordCall({
+        purpose: input.purpose ?? 'react',
+        schemaName: null,
+        structured: false,
+        latencyMs: Math.round(performance.now() - startedAt),
+        response,
+        errorMessage: null,
+      });
+      return response;
+    } catch (error) {
+      await this.recordCall({
+        purpose: input.purpose ?? 'react',
+        schemaName: null,
+        structured: false,
+        latencyMs: Math.round(performance.now() - startedAt),
+        response: null,
+        errorMessage: getErrorMessage(error),
+      });
+      throw error;
+    }
+  }
+
+  async completeStructured(input: StructuredLlmRequest): Promise<LlmResponse> {
+    const startedAt = performance.now();
+    try {
+      const response = await this.inner.completeStructured(input);
+      await this.recordCall({
+        purpose: input.purpose,
+        schemaName: input.schemaName,
+        structured: true,
+        latencyMs: Math.round(performance.now() - startedAt),
+        response,
+        errorMessage: null,
+      });
+      return response;
+    } catch (error) {
+      await this.recordCall({
+        purpose: input.purpose,
+        schemaName: input.schemaName,
+        structured: true,
+        latencyMs: Math.round(performance.now() - startedAt),
+        response: null,
+        errorMessage: getErrorMessage(error),
+      });
+      throw error;
+    }
+  }
+
+  private async recordCall(input: {
+    purpose: LlmPurpose;
+    schemaName: string | null;
+    structured: boolean;
+    latencyMs: number;
+    response: LlmResponse | null;
+    errorMessage: string | null;
+  }): Promise<void> {
+    const description = describeLlmCall(input.schemaName, input.structured);
+    await recordLlmCall({
+      provider: this.inner.name,
+      model: input.response?.model ?? null,
+      purpose: input.purpose,
+      schemaName: input.schemaName,
+      structured: input.structured,
+      latencyMs: input.latencyMs,
+      ...(input.response?.usage ? { usage: input.response.usage } : {}),
+      success: input.errorMessage === null,
+      errorMessage: input.errorMessage,
+      reason: description.reason,
+      contextFields: description.contextFields,
+    });
+  }
+}
+
+function maybeWrapMetricsProvider(provider: LlmProvider, env: NodeJS.ProcessEnv): LlmProvider {
+  return isMetricsEnabled(env) ? new MeteredLlmProvider(provider) : provider;
+}
+
+function getOpenAiTokenUsage(response: OpenAiResponse): TokenUsage | undefined {
+  const usage = response.usage;
+  if (!usage) return undefined;
+  const inputTokens = numberOrUndefined(usage.input_tokens) ?? numberOrUndefined(usage.prompt_tokens);
+  const outputTokens = numberOrUndefined(usage.output_tokens) ?? numberOrUndefined(usage.completion_tokens);
+  const totalTokens = numberOrUndefined(usage.total_tokens) ?? ((inputTokens ?? 0) + (outputTokens ?? 0) || undefined);
+  return compactUsage({ inputTokens, outputTokens, totalTokens });
+}
+
+function getGeminiTokenUsage(response: GeminiGenerateContentResponse): TokenUsage | undefined {
+  const usage = response.usageMetadata;
+  if (!usage) return undefined;
+  return compactUsage({
+    inputTokens: numberOrUndefined(usage.promptTokenCount),
+    outputTokens: numberOrUndefined(usage.candidatesTokenCount),
+    totalTokens: numberOrUndefined(usage.totalTokenCount),
+  });
+}
+
+function compactUsage(usage: TokenUsage): TokenUsage | undefined {
+  return usage.inputTokens !== undefined || usage.outputTokens !== undefined || usage.totalTokens !== undefined
+    ? usage
+    : undefined;
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
