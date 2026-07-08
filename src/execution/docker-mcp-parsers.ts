@@ -28,13 +28,21 @@ export function parseContainerList(output: string): RuntimeContainerObservation[
 
   const lines = output.trim().split('\n');
   if (lines.length <= 1) return [];
+  const headerColumns = (lines[0] ?? '').trim().split(/\s{2,}/);
+  const imageIndex = findColumnIndex(headerColumns, 'IMAGE', 1);
+  const statusIndex = findColumnIndex(headerColumns, 'STATUS', 4);
+  const portsIndex = findColumnIndex(headerColumns, 'PORTS', 5);
+  const nameIndex = findColumnIndex(headerColumns, 'NAMES', headerColumns.length - 1);
   return lines.slice(1).filter((l) => l.trim().length > 0).map((line) => {
     const parts = line.trim().split(/\s{2,}/);
+    const rawPorts = parts.length > nameIndex ? parts[portsIndex] ?? '' : '';
     return {
-      name: parts[parts.length - 1] ?? '',
-      image: parts[1] ?? null,
-      status: parts[3] ?? null,
-      ports: parts[4] ? parts[4].split(',').map((port) => port.trim()).filter(Boolean) : [],
+      name: parts[nameIndex] ?? parts[parts.length - 1] ?? '',
+      image: parts[imageIndex] ?? parts[1] ?? null,
+      status: parts[statusIndex] ?? null,
+      ports: rawPorts
+        ? rawPorts.split(',').map(normalizePortText).filter(Boolean)
+        : [],
     };
   });
 }
@@ -277,7 +285,7 @@ function numberField(record: Record<string, unknown>, key: string): number | nul
 }
 
 function normalizePorts(value: unknown): string[] {
-  if (Array.isArray(value)) return value.map(String);
+  if (Array.isArray(value)) return value.map(String).map(normalizePortText).filter(Boolean);
   if (isRecord(value)) {
     return Object.entries(value).flatMap(([containerPort, bindings]) => {
       const port = containerPort.split('/')[0] ?? containerPort;
@@ -293,6 +301,26 @@ function normalizePorts(value: unknown): string[] {
     });
   }
   return [];
+}
+
+function findColumnIndex(columns: string[], name: string, fallback: number): number {
+  const index = columns.findIndex((column) => column.trim().toUpperCase() === name);
+  return index >= 0 ? index : fallback;
+}
+
+function normalizePortText(value: string): string {
+  const trimmed = value.trim();
+  const arrowMatch = /(?:^|:)(\d{1,5})->(\d{1,5})(?:\/[A-Za-z0-9_-]+)?$/.exec(trimmed);
+  if (arrowMatch) {
+    return `${arrowMatch[1]}:${arrowMatch[2]}`;
+  }
+
+  const directMatch = /^(\d{1,5}):(\d{1,5})(?:\/[A-Za-z0-9_-]+)?$/.exec(trimmed);
+  if (directMatch) {
+    return `${directMatch[1]}:${directMatch[2]}`;
+  }
+
+  return trimmed;
 }
 
 function normalizeImage(value: unknown): string | null {

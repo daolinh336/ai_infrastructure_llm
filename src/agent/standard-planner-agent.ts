@@ -127,15 +127,22 @@ export class StandardPlannerAgent implements PlannerAgent {
           feedbackIntent,
         );
         if (shouldPreferDeterministicFeedbackPatchPlan(
+          spec,
           deterministicPatchPlan,
           patchPlan,
           obs.userFeedback.message,
           feedbackIntent,
         )) {
+          const patchPlanUnavailable = patchPlan === null
+            || (patchPlan.patches.length === 0 && !isServiceTargetAmbiguityPatchPlan(patchPlan));
           assumptions.push(
             feedbackIntent !== null
-              ? 'Revision patch source: structured feedback intent fallback replaced empty/unavailable LLM patch plan.'
-              : 'Revision patch source: deterministic fallback replaced empty/unavailable LLM patch plan.',
+              ? patchPlanUnavailable
+                ? 'Revision patch source: structured feedback intent fallback replaced empty/unavailable LLM patch plan.'
+                : 'Revision patch source: structured feedback intent fallback replaced conflicting/unrelated LLM patch plan.'
+              : patchPlanUnavailable
+                ? 'Revision patch source: deterministic fallback replaced empty/unavailable LLM patch plan.'
+                : 'Revision patch source: deterministic fallback replaced conflicting/unrelated LLM patch plan.',
           );
           patchPlan = deterministicPatchPlan;
         }
@@ -1826,6 +1833,7 @@ function resolveSingleStatefulDatabaseGroupForFeedback(
 }
 
 function shouldPreferDeterministicFeedbackPatchPlan(
+  spec: InfrastructureSpec,
   deterministicPatchPlan: SpecPatchPlan,
   llmPatchPlan: SpecPatchPlan | null,
   feedback: string,
@@ -1843,15 +1851,47 @@ function shouldPreferDeterministicFeedbackPatchPlan(
     && deterministicPatchPlan.patches.every((patch) =>
       patch.op === 'set-service-replicas' && isSupportedDeterministicReplicaTarget(patch.target),
     );
-  const llmHasReplicaPatch = llmPatchPlan.patches.some((patch) => patch.op === 'set-service-replicas');
-  if (deterministicReplicaOnly && !llmHasReplicaPatch && isClearReplicaOnlyFeedback(feedback, feedbackIntent)) {
-    return true;
+  const clearReplicaOnlyFeedback = isClearReplicaOnlyFeedback(feedback, feedbackIntent);
+  const llmReplicaPatches = llmPatchPlan.patches.filter(isSetServiceReplicasPatch);
+  if (deterministicReplicaOnly && clearReplicaOnlyFeedback) {
+    if (llmReplicaPatches.length === 0) return true;
+
+    const hasCompatibleLlmReplicaPatch = llmReplicaPatches.some((llmPatch) =>
+      deterministicPatchPlan.patches.some((deterministicPatch) =>
+        deterministicPatch.op === 'set-service-replicas'
+        && serviceSelectorsResolveCompatibly(spec, deterministicPatch.target, llmPatch.target),
+      ),
+    );
+    if (!hasCompatibleLlmReplicaPatch) return true;
+
+    const llmReplicaOnly = llmPatchPlan.patches.length === llmReplicaPatches.length;
+    if (!llmReplicaOnly) return true;
   }
 
-  return deterministicPatchPlan.patches.every((patch) =>
-    patch.op === 'set-service-replicas'
-    && (patch.target.kind === 'backend' || patch.target.name === 'backend' || patch.target.nameLike === 'backend'),
-  );
+  return false;
+}
+
+function isSetServiceReplicasPatch(patch: SpecPatch): patch is Extract<SpecPatch, { op: 'set-service-replicas' }> {
+  return patch.op === 'set-service-replicas';
+}
+
+function serviceSelectorsResolveCompatibly(
+  spec: InfrastructureSpec,
+  left: ServiceSelector,
+  right: ServiceSelector,
+): boolean {
+  const leftNames = resolveServiceSelector(spec, left).map((service) => service.name);
+  const rightNames = resolveServiceSelector(spec, right).map((service) => service.name);
+  if (leftNames.length > 0 && rightNames.length > 0) {
+    return leftNames.some((name) => rightNames.includes(name));
+  }
+
+  if (left.name && right.name) return left.name === right.name;
+  if (left.kind && right.kind) return left.kind === right.kind;
+  if (left.imageFamily && right.imageFamily) return left.imageFamily === right.imageFamily;
+  if (left.nameLike && right.nameLike) return left.nameLike === right.nameLike;
+
+  return false;
 }
 
 function isSupportedDeterministicReplicaTarget(target: ServiceSelector): boolean {

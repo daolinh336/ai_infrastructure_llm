@@ -18,17 +18,25 @@ export function applySpecPatchPlan(
   let revised = stripDisallowedHostPortsFromSpec(cloneSpec(spec));
   const results: ResolvedSpecPatchResult[] = [];
   const allowedBlockedOps = new Set(options.allowBlockedPatchOps ?? []);
+  const serviceNameAliases = new Map<string, string>();
 
   for (const patch of patches) {
-    const resolution = resolvePatchTargets(revised, patch);
+    const patchForResolution = rewritePatchTargetAliases(patch, serviceNameAliases);
+    const resolution = resolvePatchTargets(revised, patchForResolution);
     const relevanceBlock = resolution.blockedReason === null
-      ? evaluatePatchRelevance(patch, resolution.matchedServices, options.verificationFindings ?? [], options.feedbackIntent ?? null)
+      ? evaluatePatchRelevance(patchForResolution, resolution.matchedServices, options.verificationFindings ?? [], options.feedbackIntent ?? null)
       : null;
-    const policyBlock = resolution.blockedReason ?? relevanceBlock ?? (allowedBlockedOps.has(patch.op) ? null : evaluatePatchPolicy(revised, patch, resolution.matchedServices));
+    const policyBlock = resolution.blockedReason ?? relevanceBlock ?? (allowedBlockedOps.has(patchForResolution.op) ? null : evaluatePatchPolicy(revised, patchForResolution, resolution.matchedServices));
     const before = JSON.stringify(revised);
+    const imageAppliedToServices = patchForResolution.op === 'set-service-image' && policyBlock === null
+      ? resolution.matchedServices
+      : [];
     revised = policyBlock === null
-      ? stripDisallowedHostPortsFromSpec(applyResolvedPatch(revised, patch, resolution.matchedServices))
+      ? stripDisallowedHostPortsFromSpec(applyResolvedPatch(revised, patchForResolution, resolution.matchedServices))
       : revised;
+    if (imageAppliedToServices.length > 0 && patchForResolution.op === 'set-service-image') {
+      rememberImagePatchRenames(serviceNameAliases, imageAppliedToServices, normalizeTrustedImageReference(patchForResolution.image) ?? patchForResolution.image);
+    }
     results.push({
       patch,
       matchedServiceNames: resolution.matchedServices.map((service) => service.name),
@@ -38,6 +46,54 @@ export function applySpecPatchPlan(
   }
 
   return { spec: revised, results };
+}
+
+function rewritePatchTargetAliases(
+  patch: SpecPatch,
+  serviceNameAliases: Map<string, string>,
+): SpecPatch {
+  if (!('target' in patch) || !patch.target.name || serviceNameAliases.size === 0) return patch;
+  const resolvedName = resolveServiceNameAlias(serviceNameAliases, patch.target.name);
+  return resolvedName === patch.target.name
+    ? patch
+    : { ...patch, target: { ...patch.target, name: resolvedName } } as SpecPatch;
+}
+
+function rememberImagePatchRenames(
+  serviceNameAliases: Map<string, string>,
+  matchedServices: InfrastructureService[],
+  image: string,
+): void {
+  for (const service of matchedServices) {
+    const rebuiltService = rebuildServiceForTrustedImage(service, image);
+    if (rebuiltService.name !== service.name) {
+      rememberServiceNameAlias(serviceNameAliases, service.name, rebuiltService.name);
+    }
+  }
+}
+
+function rememberServiceNameAlias(
+  serviceNameAliases: Map<string, string>,
+  from: string,
+  to: string,
+): void {
+  serviceNameAliases.set(from, to);
+  for (const [alias, currentName] of serviceNameAliases.entries()) {
+    if (currentName === from) serviceNameAliases.set(alias, to);
+  }
+}
+
+function resolveServiceNameAlias(
+  serviceNameAliases: Map<string, string>,
+  name: string,
+): string {
+  let currentName = name;
+  const seenNames = new Set<string>();
+  while (serviceNameAliases.has(currentName) && !seenNames.has(currentName)) {
+    seenNames.add(currentName);
+    currentName = serviceNameAliases.get(currentName)!;
+  }
+  return currentName;
 }
 
 function resolvePatchTargets(

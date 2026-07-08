@@ -11,12 +11,16 @@ import type { InfrastructureSpec } from '../domain/types.js';
  *   1. `.env` (process.env) — user-declared values win whenever present.
  *   2. auto-generated (the value already in the spec) — fallback when env is absent.
  *
+ * Username-like environment keys are resolved from `.env` only while the spec still
+ * contains a generated default username. Explicit planner revisions stay intact.
+ *
  * No new fields are added to InfrastructureSpec; the resolver only rewrites
- * `service.environment` values for secret-like keys.
+ * `service.environment` values for secret-like keys and unresolved default usernames.
  */
 
 const SECRET_KEY_PATTERN = /(PASSWORD|PASS|SECRET|TOKEN|KEY)$/i;
 const USER_KEY_PATTERN = /(^|_)USER(NAME)?$/i;
+const DEFAULT_USER_PATTERN = /^(app|admin|root|user)$/i;
 
 export type SecretSource = 'env-file' | 'auto-generated';
 
@@ -61,7 +65,6 @@ export function resolveSecrets(
 ): SecretResolutionResult {
   const env = options.env ?? process.env;
 
-  // 1. Count environment keys across services to detect duplicates that can be prefixed.
   const environmentKeyCounts = new Map<string, number>();
   for (const service of spec.services) {
     for (const key of Object.keys(service.environment ?? {})) {
@@ -84,29 +87,29 @@ export function resolveSecrets(
       }
 
       const isDuplicate = (environmentKeyCounts.get(key) ?? 0) > 1;
+      const envValue = resolveEnvValue(env, key, service.name, isDuplicate);
+
+      if (isUser && !isSecret) {
+        updatedEnvironment[key] = envValue !== null && isDefaultGeneratedUser(currentValue)
+          ? envValue.value
+          : currentValue;
+        continue;
+      }
 
       let value = currentValue;
-      let source: SecretSource = isSecret ? 'auto-generated' : 'env-file';
+      let source: SecretSource = 'auto-generated';
       let envVarName = key;
 
-      // Priority 1: `.env` — user-declared values win whenever present.
-      // Empty string counts as "not provided".
-      const envValue = resolveEnvValue(env, key, service.name, isDuplicate);
       if (envValue !== null) {
         value = envValue.value;
         envVarName = envValue.envVarName;
         source = 'env-file';
-      } else if (isSecret && isPlaceholderSecret(currentValue)) {
+      } else if (isPlaceholderSecret(currentValue)) {
         value = generateDefaultSecret();
-      } else if (!isSecret) {
-        source = 'auto-generated';
       }
-      // Priority 2: keep the auto-generated value already in the spec.
 
       updatedEnvironment[key] = value;
-      if (isSecret) {
-        secrets.push({ key, envVarName, value, source });
-      }
+      secrets.push({ key, envVarName, value, source });
     }
 
     if (secrets.length > 0) {
@@ -135,6 +138,10 @@ function generateDefaultSecret(): string {
 
 function isPlaceholderSecret(value: string): boolean {
   return /^(change-me|changeme|password|admin|root)$/i.test(value.trim());
+}
+
+function isDefaultGeneratedUser(value: string): boolean {
+  return DEFAULT_USER_PATTERN.test(value.trim());
 }
 
 function toEnvPrefix(serviceName: string): string {
