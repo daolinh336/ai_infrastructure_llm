@@ -764,6 +764,7 @@ export interface PlannerRevisionRequest {
   desiredSpec: InfrastructureSpec;
   currentPlan?: ExecutionPlan;
   runtimeIssueReport?: RuntimeIssueReport;
+  revisionHistory?: RevisionHistoryRecord[];
   feedbackIntent?: FeedbackIntent | null;
   revisionObservation: RevisionObservation;
   stateSnapshot: InfrastructureStateSnapshot | null;

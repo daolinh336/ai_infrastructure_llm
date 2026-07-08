@@ -41,7 +41,7 @@ export function parseContainerList(output: string): RuntimeContainerObservation[
       image: parts[imageIndex] ?? parts[1] ?? null,
       status: parts[statusIndex] ?? null,
       ports: rawPorts
-        ? rawPorts.split(',').map(normalizePortText).filter(Boolean)
+        ? [...new Set(rawPorts.split(',').map(normalizePortText).filter(Boolean))]
         : [],
     };
   });
@@ -144,7 +144,7 @@ export function extractPortsFromInspect(inspect: Record<string, unknown>): strin
     const ns = inspect.NetworkSettings as Record<string, unknown> | undefined;
     const ports = ns?.Ports as Record<string, unknown> | undefined;
     if (!ports) return [];
-    return Object.entries(ports)
+    return [...new Set(Object.entries(ports)
       .filter(([, bindings]) => bindings !== null)
       .map(([containerPort, bindings]) => {
         if (Array.isArray(bindings) && bindings.length > 0) {
@@ -152,7 +152,7 @@ export function extractPortsFromInspect(inspect: Record<string, unknown>): strin
           return b.HostPort + ':' + containerPort.split('/')[0];
         }
         return containerPort;
-      });
+      }))];
   } catch {
     return [];
   }
@@ -285,9 +285,9 @@ function numberField(record: Record<string, unknown>, key: string): number | nul
 }
 
 function normalizePorts(value: unknown): string[] {
-  if (Array.isArray(value)) return value.map(String).map(normalizePortText).filter(Boolean);
+  if (Array.isArray(value)) return [...new Set(value.flatMap(normalizePortEntry).filter(Boolean))];
   if (isRecord(value)) {
-    return Object.entries(value).flatMap(([containerPort, bindings]) => {
+    return [...new Set(Object.entries(value).flatMap(([containerPort, bindings]) => {
       const port = containerPort.split('/')[0] ?? containerPort;
       if (Array.isArray(bindings) && bindings.length > 0) {
         return bindings
@@ -298,9 +298,30 @@ function normalizePorts(value: unknown): string[] {
           });
       }
       return [port];
-    });
+    }))];
   }
   return [];
+}
+
+function normalizePortEntry(value: unknown): string[] {
+  if (typeof value === 'string') {
+    const normalized = normalizePortText(value);
+    return normalized ? [normalized] : [];
+  }
+  if (!isRecord(value)) return [];
+
+  const publicPort = numberOrStringField(value, 'public') ?? numberOrStringField(value, 'PublicPort');
+  const privatePort = numberOrStringField(value, 'private') ?? numberOrStringField(value, 'PrivatePort');
+
+  if (publicPort && privatePort) return [`${publicPort}:${privatePort}`];
+  return [];
+}
+
+function numberOrStringField(record: Record<string, unknown>, key: string): string | null {
+  const value = record[key];
+  if (typeof value === 'number' && Number.isInteger(value) && value > 0 && value <= 65535) return String(value);
+  if (typeof value === 'string' && /^\d{1,5}$/.test(value)) return value;
+  return null;
 }
 
 function findColumnIndex(columns: string[], name: string, fallback: number): number {

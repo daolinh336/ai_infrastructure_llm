@@ -125,6 +125,8 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
 
       const revisionRequest: PlannerRevisionRequest = {
         desiredSpec: currentApprovedAction.validatedSpec,
+        currentPlan,
+        revisionHistory: [...revisionHistory],
         revisionObservation: {
           verificationReport: conflictReport,
           userFeedback: null,
@@ -135,10 +137,34 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         attemptIndex,
       };
       const initialRevisionResult = await options.agent.reviseFromFeedback(revisionRequest, plannerRuntimeReader);
+
+      const runtimeDecision = await options.requestRuntimeApproval(conflictReport, attemptIndex, initialRevisionResult);
+      if (runtimeDecision.choice === 'rejected') {
+        return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
+      }
+
+      const requestedRevision = runtimeDecision.userFeedback === null
+        ? initialRevisionResult
+        : await options.agent.reviseFromFeedback({
+          ...revisionRequest,
+          revisionObservation: {
+            ...revisionRequest.revisionObservation,
+            userFeedback: runtimeDecision.userFeedback,
+          },
+        }, plannerRuntimeReader);
+      const requestedRevisionRequest = runtimeDecision.userFeedback === null
+        ? revisionRequest
+        : {
+          ...revisionRequest,
+          revisionObservation: {
+            ...revisionRequest.revisionObservation,
+            userFeedback: runtimeDecision.userFeedback,
+          },
+        };
       const revisionResolution = await resolveRevisionWithClarifications(
         options,
-        revisionRequest,
-        initialRevisionResult,
+        requestedRevisionRequest,
+        requestedRevision,
         plannerRuntimeReader,
       );
       const revisionResult = withExpectedProjectName(
@@ -193,6 +219,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         desiredSpec: currentApprovedAction.validatedSpec,
         currentPlan,
         runtimeIssueReport,
+        revisionHistory: [...revisionHistory],
         revisionObservation: {
           verificationReport,
           userFeedback: null,
@@ -298,6 +325,8 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
 
     const revisionRequest: PlannerRevisionRequest = {
       desiredSpec: currentApprovedAction.validatedSpec,
+      currentPlan,
+      revisionHistory: [...revisionHistory],
       revisionObservation: {
         verificationReport,
         userFeedback: null,

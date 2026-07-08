@@ -7,6 +7,7 @@ import type {
   InfrastructureStateSnapshot,
   PlannerRevisionRequest,
   PlannerRevisionResult,
+  RevisionHistoryRecord,
   ResolvedSpecPatchResult,
   ServiceSelector,
   SpecPatch,
@@ -91,7 +92,6 @@ export class StandardPlannerAgent implements PlannerAgent {
     const findings = obs.verificationReport?.findings ?? [];
     const requiresUserInput = findings.some((finding) => findingNeedsUserInput(finding));
     const assumptions: string[] = [];
-    const observedOccupiedHostPorts = await readObservedOccupiedHostPorts(runtimeReader, issues, findings, assumptions);
 
     let revisedSpec = spec;
     let patchPlan: SpecPatchPlan | null = null;
@@ -129,34 +129,6 @@ export class StandardPlannerAgent implements PlannerAgent {
         patchPlanError = patchPlanResult.error;
         assumptions.push(...patchPlanResult.diagnostics);
       }
-      if (obs.userFeedback != null && !feedbackLimitBlocked) {
-        const deterministicPatchPlan = buildDeterministicFeedbackPatchPlan(
-          spec,
-          obs.userFeedback.message,
-          patchPlanError,
-          feedbackIntent,
-        );
-        if (shouldPreferDeterministicFeedbackPatchPlan(
-          spec,
-          deterministicPatchPlan,
-          patchPlan,
-          obs.userFeedback.message,
-          feedbackIntent,
-        )) {
-          const patchPlanUnavailable = patchPlan === null
-            || (patchPlan.patches.length === 0 && !isServiceTargetAmbiguityPatchPlan(patchPlan));
-          assumptions.push(
-            feedbackIntent !== null
-              ? patchPlanUnavailable
-                ? 'Revision patch source: structured feedback intent fallback replaced empty/unavailable LLM patch plan.'
-                : 'Revision patch source: structured feedback intent fallback replaced conflicting/unrelated LLM patch plan.'
-              : patchPlanUnavailable
-                ? 'Revision patch source: deterministic fallback replaced empty/unavailable LLM patch plan.'
-                : 'Revision patch source: deterministic fallback replaced conflicting/unrelated LLM patch plan.',
-          );
-          patchPlan = deterministicPatchPlan;
-        }
-      }
       if (patchPlan !== null && obs.userFeedback != null) {
         const normalizedPatchPlan = normalizeStatefulDatabaseReplicaPatchPlan(
           spec,
@@ -175,15 +147,13 @@ export class StandardPlannerAgent implements PlannerAgent {
           patchPlan,
           issues,
           findings,
-          request.attemptIndex,
-          observedOccupiedHostPorts,
         );
         if (portConflictPatchPlan !== patchPlan) {
           patchPlan = portConflictPatchPlan;
-          assumptions.push('Revision patch source: normalized host port conflict to replace-service-port; port removal is not allowed for this issue.');
+          assumptions.push('Revision patch source: host port conflict requires an explicit replace-service-port patch; port removal and deterministic port synthesis are not allowed for this issue.');
         }
       }
-      if (patchPlan !== null && (patchPlan.patches.length > 0 || isServiceTargetAmbiguityPatchPlan(patchPlan))) {
+      if (patchPlan !== null && (patchPlan.patches.length > 0 || patchPlan.requiresUserInput || patchPlan.ambiguities.length > 0 || isServiceTargetAmbiguityPatchPlan(patchPlan))) {
         const plannedRevision = applySpecPatchPlan(spec, patchPlan.patches, {
           allowBlockedPatchOps: extractAllowedPatchOps(issues),
           verificationFindings: findings,
@@ -224,7 +194,7 @@ export class StandardPlannerAgent implements PlannerAgent {
           assumptions.push(`LLM structured revision failed or was unavailable: ${patchPlanError ?? 'unknown error'}. Deterministic feedback parsing is disabled.`);
         }
       } else {
-        const revision = applyRevisionRepairs(spec, issues, request.attemptIndex + 1, findings, observedOccupiedHostPorts);
+        const revision = applyRevisionRepairs(spec, issues, request.attemptIndex + 1, findings);
         revisionStats = revision;
         revisedSpec = revision.spec;
         revisionDecision = requiresUserInput || revision.unmatchedIssueCount > 0 || (revision.appliedPatchCount === 0 && revision.skippedPatchCount > 0) ? 'needs-user-input' : hasNoSafeResolution(findings) ? 'no-safe-resolution' : 'auto-revised';
@@ -291,6 +261,7 @@ export class StandardPlannerAgent implements PlannerAgent {
         userFeedback: request.revisionObservation.userFeedback,
         feedbackIntent: request.feedbackIntent ?? null,
         runtimeIssueReport: request.runtimeIssueReport ?? null,
+        revisionHistory: buildRevisionHistoryContext(request.revisionHistory ?? []),
         runtimeRefs: request.resourceRefs ?? null,
         services: spec.services.map((service) => ({
           name: service.name,
@@ -340,6 +311,7 @@ export class StandardPlannerAgent implements PlannerAgent {
           'When databaseReplicaGroups are present, treat expanded names like postgres-1/postgres-2 as one logical stateful database group for replica-count changes.',
           'Only for explicit stateful database total/group/overall instance changes, emit one set-service-replicas patch with targetKind="replica-group", name=databaseReplicaGroups.baseName, kind="database", and imageFamily; do not emit separate patches for each physical service.',
           'Use verifierObservation, userFeedback, and runtimeRefs as observations about the same desired spec; do not ignore verifier evidence when user feedback is present.',
+          'Use revisionHistory as prior failed attempts for the same deploy loop; if earlier findings show a host port or value already failed, do not propose that failed value again.',
           'Treat userFeedback from an "other" answer as a fresh natural-language instruction, but still ground target selection in logicalServiceCatalog, physicalServiceCatalog, and verifierObservation.',
           'Choose targets by comparing the user request with each service name, role, image family, exposed ports, dependencies, dependents, and current replicas.',
           'If prior clarification feedback contains targetService:<name>, use the requested change to that exact existing service name.',
@@ -401,6 +373,7 @@ export class StandardPlannerAgent implements PlannerAgent {
         databaseReplicaGroups: buildDatabaseReplicaGroups(spec),
         verifierObservation: buildVerifierObservationContext(spec, request.revisionObservation),
         runtimeIssueReport: request.runtimeIssueReport ?? null,
+        revisionHistory: buildRevisionHistoryContext(request.revisionHistory ?? []),
         runtimeRefs: request.resourceRefs ?? null,
         services: spec.services.map((service) => ({
           name: service.name,
@@ -498,32 +471,34 @@ async function readPlannerRuntimeContext(runtimeReader: PlannerRuntimeReader | u
   }
 }
 
-async function readObservedOccupiedHostPorts(
-  runtimeReader: PlannerRuntimeReader | undefined,
-  issues: string[],
-  findings: VerificationFinding[],
-  assumptions: string[],
-): Promise<Set<number>> {
-  if (!runtimeReader || !hasHostPortConflictObservation(issues, findings)) return new Set();
-
-  try {
-    const usedHostPorts = await runtimeReader.listUsedHostPorts();
-    const occupiedPorts = new Set<number>();
-    for (const usedPort of usedHostPorts) {
-      const port = Number(usedPort.hostPort);
-      if (Number.isInteger(port) && port > 0 && port <= 65535) occupiedPorts.add(port);
-    }
-    assumptions.push(`Runtime port scan: observed ${occupiedPorts.size} occupied host port(s) before choosing a replacement.`);
-    return occupiedPorts;
-  } catch {
-    assumptions.push('Runtime port scan failed; falling back to verifier-reported conflicting port(s) only.');
-    return new Set();
-  }
-}
-
-function hasHostPortConflictObservation(issues: string[], findings: VerificationFinding[]): boolean {
-  return findings.some((finding) => finding.code === 'HOST_PORT_CONFLICT')
-    || issues.some((issue) => /host port conflict|port .*already (?:allocated|used)|already used by/i.test(issue));
+function buildRevisionHistoryContext(history: RevisionHistoryRecord[]): Array<{
+  attemptIndex: number;
+  revisionDecision: RevisionHistoryRecord['revisionDecision'];
+  revisionSummary: string;
+  findings: Array<{
+    code: string;
+    resourceKind: string;
+    resourceName: string | null;
+    expected: string | null;
+    actual: string | null;
+    evidence: string[];
+  }>;
+  userFeedback: string | null;
+}> {
+  return history.map((record) => ({
+    attemptIndex: record.attemptIndex,
+    revisionDecision: record.revisionDecision,
+    revisionSummary: record.revisionSummary,
+    findings: record.findings.map((finding) => ({
+      code: finding.code,
+      resourceKind: finding.resourceKind,
+      resourceName: finding.resourceName ?? null,
+      expected: finding.expected ?? null,
+      actual: finding.actual ?? null,
+      evidence: finding.evidence,
+    })),
+    userFeedback: record.userFeedback?.message ?? null,
+  }));
 }
 
 function hasPlannerPortConflict(runtimeContext: PlannerRuntimeContext, port: number): boolean {
@@ -1792,14 +1767,11 @@ function normalizeHostPortConflictPatchPlan(
   patchPlan: SpecPatchPlan,
   issues: string[],
   findings: VerificationFinding[],
-  attemptIndex: number,
-  observedOccupiedHostPorts: Set<number> = new Set(),
 ): SpecPatchPlan {
   const conflicts = collectHostPortConflicts(spec, issues, findings);
   if (conflicts.length === 0) return patchPlan;
 
   const affectedServices = new Set(conflicts.map((conflict) => conflict.service.name));
-  const occupiedPorts = new Set([...observedOccupiedHostPorts, ...conflicts.map((conflict) => conflict.hostPort)]);
   const patches = patchPlan.patches.filter((patch) => {
     if (patch.op !== 'remove-service-port') return true;
     const matched = resolveServiceSelector(spec, patch.target);
@@ -1810,32 +1782,26 @@ function normalizeHostPortConflictPatchPlan(
       .filter((patch) => patch.op === 'replace-service-port')
       .flatMap((patch) => resolveServiceSelector(spec, patch.target).map((service) => service.name)),
   );
-  const hasAnyReplacementPatch = patches.some((patch) => patch.op === 'replace-service-port');
+  const missingReplacementServices = conflicts
+    .filter((conflict) => !hasReplacementFor.has(conflict.service.name))
+    .map((conflict) => conflict.service.name);
 
-  for (const conflict of conflicts) {
-    if (hasAnyReplacementPatch) continue;
-    if (hasReplacementFor.has(conflict.service.name)) continue;
-    const replacementHostPort = nextSafePort(conflict.hostPort, occupiedPorts, Math.max(1, attemptIndex + 1));
-    occupiedPorts.add(replacementHostPort);
-    patches.push({
-      op: 'replace-service-port',
-      target: { name: conflict.service.name },
-      from: conflict.currentPort,
-      to: `${replacementHostPort}:${conflict.containerPort}`,
-      reason: `Host port ${conflict.hostPort} is occupied; replace with ${replacementHostPort}:${conflict.containerPort}.`,
-      resolvesIssueCodes: ['HOST_PORT_CONFLICT'],
-      affectedServiceNames: [conflict.service.name],
-    });
-  }
-
-  if (patches.length === patchPlan.patches.length && patches.every((patch, index) => patch === patchPlan.patches[index])) return patchPlan;
+  const unchanged = patches.length === patchPlan.patches.length
+    && patches.every((patch, index) => patch === patchPlan.patches[index])
+    && missingReplacementServices.length === 0;
+  if (unchanged) return patchPlan;
 
   return {
     ...patchPlan,
     patches,
-    explanation: `${patchPlan.explanation} Host port conflicts are resolved by replacing the host port, not by removing exposure.`,
-    ambiguities: patches.length > 0 ? patchPlan.ambiguities.filter((ambiguity) => !/LLM provider|required|port|feedback/i.test(ambiguity)) : patchPlan.ambiguities,
-    requiresUserInput: patches.length === 0,
+    explanation: `${patchPlan.explanation} Host port conflicts require an explicit replace-service-port patch from the planner or user feedback; deterministic port synthesis is disabled.`,
+    ambiguities: missingReplacementServices.length > 0
+      ? uniqueIdentifiers([
+          ...patchPlan.ambiguities,
+          `Choose a replacement host port for ${missingReplacementServices.join(', ')}.`,
+        ])
+      : patchPlan.ambiguities.filter((ambiguity) => !/LLM provider|required|port|feedback/i.test(ambiguity)),
+    requiresUserInput: patchPlan.requiresUserInput || missingReplacementServices.length > 0,
   };
 }
 
@@ -2187,9 +2153,8 @@ function applyRevisionRepairs(
   issues: string[],
   attemptNumber: number,
   findings: VerificationFinding[] = [],
-  observedOccupiedHostPorts: Set<number> = new Set(),
 ): RevisionRepairResult {
-  const patches = parseRevisionPatches(spec, issues, attemptNumber, findings, observedOccupiedHostPorts);
+  const patches = parseRevisionPatches(spec, issues, attemptNumber, findings);
   return applyRevisionPatches(spec, issues, patches);
 }
 
@@ -2198,21 +2163,13 @@ function parseRevisionPatches(
   issues: string[],
   attemptNumber: number,
   findings: VerificationFinding[] = [],
-  observedOccupiedHostPorts: Set<number> = new Set(),
 ): RevisionPatch[] {
   const patches: RevisionPatch[] = [];
   const conflictingContainerNames = new Set<string>();
-  const conflictingHostPorts = new Set<number>(observedOccupiedHostPorts);
 
   for (const finding of findings) {
     if (finding.code === 'CONTAINER_NAME_CONFLICT' && finding.resourceName) {
       conflictingContainerNames.add(finding.resourceName);
-    }
-    if (finding.code === 'HOST_PORT_CONFLICT' && finding.expected) {
-      const port = Number(finding.expected.replace(/\D+/g, ''));
-      if (Number.isInteger(port) && port > 0 && port <= 65535) {
-        conflictingHostPorts.add(port);
-      }
     }
     if ((finding.code === 'IMAGE_NOT_FOUND' || finding.code === 'IMAGE_PULL_FAILED') && finding.resourceName) {
       const fallback = supportedImageFallback(finding.expected ?? finding.resourceName);
@@ -2228,12 +2185,8 @@ function parseRevisionPatches(
       conflictingContainerNames.add(containerName);
     }
 
-    const hostPort = /Host port conflict: service "[^"]+" wants (\d+)/.exec(issue)?.[1];
-    if (hostPort) {
-      conflictingHostPorts.add(Number(hostPort));
-    }
-
-    const requestedPortMapping = parseRequestedPortMapping(issue);
+    const allowExplicitPortFromText = issue.startsWith('User feedback:');
+    const requestedPortMapping = allowExplicitPortFromText ? parseRequestedPortMapping(issue) : null;
     if (requestedPortMapping) {
       patches.push({
         kind: 'set-service-host-port',
@@ -2243,7 +2196,7 @@ function parseRevisionPatches(
       });
     }
 
-    const requestedPort = requestedPortMapping ? null : parseRequestedHostPort(issue);
+    const requestedPort = allowExplicitPortFromText && !requestedPortMapping ? parseRequestedHostPort(issue) : null;
     if (requestedPort) {
       const parsedPort = requestedPort;
       if (Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
@@ -2310,17 +2263,6 @@ function parseRevisionPatches(
 
   if (projectName !== spec.projectName) {
     patches.push({ kind: 'set-project-name', name: sanitizeIdentifier(projectName) });
-  }
-
-  for (const service of spec.services) {
-    if (!service.ports?.length) continue;
-    for (const port of service.ports) {
-      const [host] = port.split(':');
-      const hostPort = Number(host);
-      if (Number.isInteger(hostPort) && conflictingHostPorts.has(hostPort)) {
-        patches.push({ kind: 'set-service-host-port', serviceName: service.name, hostPort: nextSafePort(hostPort, conflictingHostPorts, attemptNumber) });
-      }
-    }
   }
 
   return patches;
@@ -2703,13 +2645,6 @@ function findingNeedsUserInput(finding: VerificationFinding): boolean {
   return finding.requiresUserInput || ((finding.code === 'IMAGE_NOT_FOUND' || finding.code === 'IMAGE_PULL_FAILED') && supportedImageFallback(finding.expected ?? finding.resourceName ?? '') === null);
 }
 
-function nextSafePort(port: number, occupiedPorts: Set<number>, attemptNumber: number): number {
-  let candidate = Math.min(65535, port + attemptNumber);
-  while (occupiedPorts.has(candidate) && candidate < 65535) {
-    candidate += 1;
-  }
-  return candidate;
-}
 
 function supportedImageFallback(image: string): string | null {
   const direct = getTrustedDefaultImageForBase(image);
@@ -2782,5 +2717,3 @@ function buildRevisionSummary(
   }
   return parts.join(' ');
 }
-
-

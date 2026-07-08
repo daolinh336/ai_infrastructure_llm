@@ -427,13 +427,13 @@ export function buildPreDeployVerificationReport(
     }
   }
 
-  const usedHostPorts = new Map<string, RuntimeContainerObservation[]>();
+  const usedHostPorts = new Map<string, Map<string, RuntimeContainerObservation>>();
   for (const container of actual.containers) {
     for (const port of container.ports ?? []) {
       const hostPort = port.split(':')[0]?.trim();
       if (!hostPort || !/^\d+$/.test(hostPort)) continue;
-      const entries = usedHostPorts.get(hostPort) ?? [];
-      entries.push(container);
+      const entries = usedHostPorts.get(hostPort) ?? new Map<string, RuntimeContainerObservation>();
+      entries.set(container.name, container);
       usedHostPorts.set(hostPort, entries);
     }
   }
@@ -442,7 +442,7 @@ export function buildPreDeployVerificationReport(
     for (const port of service.ports ?? []) {
       const hostPort = port.split(':')[0]?.trim();
       if (!hostPort || !/^\d+$/.test(hostPort)) continue;
-      const conflicts = usedHostPorts.get(hostPort) ?? [];
+      const conflicts = [...(usedHostPorts.get(hostPort)?.values() ?? [])];
       if (conflicts.length > 0) {
         findings.push(createFinding({
           code: 'HOST_PORT_CONFLICT',

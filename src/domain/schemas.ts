@@ -1385,6 +1385,7 @@ export const plannerRevisionRequestSchema = z
     desiredSpec: infrastructureSpecSchema,
     currentPlan: executionPlanSchema.optional(),
     runtimeIssueReport: z.unknown().optional(),
+    revisionHistory: z.array(revisionHistoryRecordSchema).optional(),
     feedbackIntent: feedbackIntentSchema.nullable().optional(),
     revisionObservation: revisionObservationSchema,
     stateSnapshot: infrastructureStateSnapshotSchema.nullable(),
