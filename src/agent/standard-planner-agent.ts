@@ -27,6 +27,7 @@ import {
   getTrustedImageProfile,
   getTrustedReplacementImages,
 } from '../domain/supported-images.js';
+import { loadInfrastructureSchemaLimitConfig } from '../config/runtime-limits.js';
 
 export class StandardPlannerAgent implements PlannerAgent {
   constructor(private readonly provider: LlmProvider) {}
@@ -98,6 +99,7 @@ export class StandardPlannerAgent implements PlannerAgent {
     let patchResults: ResolvedSpecPatchResult[] | undefined;
     let revisionDecision: PlannerRevisionResult['revisionDecision'] = 'auto-revised';
     let revisionStats: RevisionRepairResult | null = null;
+    let feedbackLimitBlocked = false;
 
     if (issues.length > 0) {
       let feedbackIntent = request.feedbackIntent ?? null;
@@ -105,6 +107,14 @@ export class StandardPlannerAgent implements PlannerAgent {
         const intentResult = await this.getFeedbackIntent(spec, request, issues, findings);
         feedbackIntent = intentResult.feedbackIntent;
         assumptions.push(...intentResult.diagnostics);
+      }
+      if (obs.userFeedback !== null) {
+        const limitPatchPlan = buildLimitViolationPatchPlan(obs.userFeedback.message, feedbackIntent);
+        if (limitPatchPlan !== null) {
+          patchPlan = limitPatchPlan;
+          feedbackLimitBlocked = true;
+          assumptions.push('Revision blocked before patch planning because user feedback exceeded a configured limit.');
+        }
       }
       if (patchPlan === null) {
         const patchPlanMode = selectRevisionPatchPlanMode(request, feedbackIntent, findings);
@@ -119,7 +129,7 @@ export class StandardPlannerAgent implements PlannerAgent {
         patchPlanError = patchPlanResult.error;
         assumptions.push(...patchPlanResult.diagnostics);
       }
-      if (obs.userFeedback != null) {
+      if (obs.userFeedback != null && !feedbackLimitBlocked) {
         const deterministicPatchPlan = buildDeterministicFeedbackPatchPlan(
           spec,
           obs.userFeedback.message,
@@ -1545,6 +1555,85 @@ function buildDeterministicFeedbackPatchPlan(
     requiresUserInput: ambiguities.length > 0 && patches.length === 0,
     confidence: patches.length > 0 && ambiguities.length === 0 ? 0.82 : patches.length > 0 ? 0.65 : 0.25,
   });
+}
+
+function buildLimitViolationPatchPlan(
+  feedback: string,
+  feedbackIntent: FeedbackIntent | null,
+): SpecPatchPlan | null {
+  const ambiguities = collectFeedbackLimitViolations(feedback, feedbackIntent);
+  if (ambiguities.length === 0) return null;
+
+  return validateSpecPatchPlan({
+    patches: [],
+    explanation: 'User feedback requested values outside configured safety limits.',
+    assumptions: ['No InfrastructureSpec patch was produced because at least one requested value exceeds the current configured limit.'],
+    ambiguities,
+    requiresUserInput: true,
+    confidence: 1,
+  });
+}
+
+function collectFeedbackLimitViolations(
+  feedback: string,
+  feedbackIntent: FeedbackIntent | null,
+): string[] {
+  const { maxServiceReplicas } = loadInfrastructureSchemaLimitConfig();
+  const replicaValues = uniqueNumbers([
+    ...parseReplicaFeedbackValues(feedback),
+    ...(feedbackIntent?.intent === 'change-replicas' && feedbackIntent.desiredChange?.replicas !== undefined
+      ? [feedbackIntent.desiredChange.replicas]
+      : []),
+  ]);
+  const portValues = uniqueNumbers([
+    ...parsePortFeedbackValues(feedback),
+    ...(feedbackIntent?.desiredChange?.hostPort !== undefined ? [feedbackIntent.desiredChange.hostPort] : []),
+    ...(feedbackIntent?.desiredChange?.containerPort !== undefined ? [feedbackIntent.desiredChange.containerPort] : []),
+  ]);
+
+  return [
+    ...replicaValues
+      .filter((replicas) => replicas < 1 || replicas > maxServiceReplicas)
+      .map((replicas) => replicas < 1
+        ? `Requested replicas ${replicas} is below minimum 1.`
+        : `Requested replicas ${replicas} exceeds max allowed ${maxServiceReplicas}.`),
+    ...portValues
+      .filter((port) => port < 1 || port > 65535)
+      .map((port) => `Requested port ${port} is outside allowed range 1-65535.`),
+  ];
+}
+
+function parseReplicaFeedbackValues(feedback: string): number[] {
+  const values: number[] = [];
+  const patterns = [
+    /\b(?:total|overall|group|database\s+group|db\s+group)\b[^\d-]{0,80}\b(?:is|are|to|=|thanh|con)?\s*(-?\d+)\b/gi,
+    /\b(?:tong|nhom)\b[^\d-]{0,80}\b(?:la|thanh|con)?\s*(-?\d+)\b/gi,
+    /\b(?:giam|tang|ha|nang|xuong|len)\s+(?:(?:xuong|len)\s+)?(?:(?:con|thanh|toi|to)\s+)?(-?\d+)\s*(?:instances?|replicas?)?\b/gi,
+    /\b(?:just|only|to|use|with|set|make|want|needs?|need)\s+(-?\d+)\s+(?:[a-z0-9_-]+\s+){0,4}(?:instances?|replicas?|containers?)\b/gi,
+    /\b(?:instances?|replicas?|containers?)\s+(?:to|=|is|are)?\s*(-?\d+)\b/gi,
+    /\b(?:scale|replicas?)\s+[^\d-]{0,30}\bto\s+(-?\d+)\b/gi,
+    /\b(-?\d+)\s*(?:instances?|replicas?|containers?)\s*(?:of|for)?\s*(?:backend|api|nodejs?|server|db|database|postgres(?:ql)?|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka|web|nginx|proxy|reverse-proxy|frontend)\b/gi,
+    /\b(?:backend|api|nodejs?|server|db|database|postgres(?:ql)?|mysql|mariadb|mongo|redis|rabbitmq|elasticsearch|kafka|web|nginx|proxy|reverse-proxy|frontend)\b[^\d-]{0,30}\b(-?\d+)\s*(?:instances?|replicas?|containers?)\b/gi,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of feedback.matchAll(pattern)) {
+      const value = Number(match[1]);
+      if (Number.isInteger(value)) values.push(value);
+    }
+  }
+  return values;
+}
+
+function parsePortFeedbackValues(feedback: string): number[] {
+  if (!/\b(port|ports|host\s*port|container\s*port|c[oÃ´]ng)\b/i.test(feedback)) return [];
+  return [...feedback.matchAll(/\b(\d{1,6})\b/g)]
+    .map((match) => Number(match[1]))
+    .filter((value) => Number.isInteger(value));
+}
+
+function uniqueNumbers(values: number[]): number[] {
+  return [...new Set(values)];
 }
 
 function buildPatchesFromFeedbackIntent(

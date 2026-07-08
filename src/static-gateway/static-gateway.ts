@@ -17,6 +17,7 @@ import {
 } from '../domain/structured-output-schemas.js';
 import { parseJsonResponse } from '../llm/json-response.js';
 import type { LlmProvider } from '../llm/provider.js';
+import { loadInfrastructureSchemaLimitConfig, loadStaticResourceLimitConfig } from '../config/runtime-limits.js';
 
 const INTENT_CLASSIFIER_SYSTEM_PROMPT = [
   'INTENT_CLASSIFIER_V1',
@@ -181,6 +182,23 @@ export class StaticGateway {
       };
     }
 
+    const resourceEstimate = estimateResources(draft.services);
+    const resourceLimitIssues = validateStaticResourceLimits(draft.services, resourceEstimate);
+    if (resourceLimitIssues.length > 0) {
+      metrics.resourceLimitBlocked = 1;
+      this.reportProgress({
+        phase: 'gate',
+        message: 'observe... request rejected by static resource limits.',
+        toolName: 'structured_parser',
+      });
+      return {
+        status: 'rejected',
+        reason: 'Static resource limit exceeded.',
+        issues: resourceLimitIssues,
+        metrics,
+      };
+    }
+
     const validatedQuery = validateValidatedQuery({
       raw: draft.raw,
       normalizedPrompt: draft.normalizedPrompt,
@@ -188,7 +206,7 @@ export class StaticGateway {
       draft,
       riskFlags: [],
       securityFindings: [],
-      resourceEstimate: estimateResources(draft.services),
+      resourceEstimate,
       clarificationRequired: false,
       clarificationQuestion: null,
     });
@@ -334,6 +352,44 @@ function estimateResources(services: DraftServiceQuery[]): {
     maxCpu: cpus.length ? Math.max(...cpus) : null,
     maxMemoryGb: memories.length ? Math.max(...memories) : null,
   };
+}
+
+function validateStaticResourceLimits(
+  services: DraftServiceQuery[],
+  resourceEstimate: ReturnType<typeof estimateResources>,
+): string[] {
+  const staticLimits = loadStaticResourceLimitConfig();
+  const { maxServiceReplicas } = loadInfrastructureSchemaLimitConfig();
+  const issues: string[] = [];
+
+  if (resourceEstimate.totalContainers > staticLimits.maxTotalContainers) {
+    issues.push(`Requested total containers ${resourceEstimate.totalContainers} exceeds max allowed ${staticLimits.maxTotalContainers}.`);
+  }
+
+  for (const service of services) {
+    const serviceName = service.name ?? service.image ?? 'unnamed service';
+    if (service.replicas !== null) {
+      if (service.replicas > staticLimits.maxAbsurdReplicas) {
+        issues.push(`Requested replicas ${service.replicas} for ${serviceName} exceeds absurd-safety limit ${staticLimits.maxAbsurdReplicas}.`);
+      }
+      if (service.replicas > maxServiceReplicas) {
+        issues.push(`Requested replicas ${service.replicas} for ${serviceName} exceeds max allowed ${maxServiceReplicas}.`);
+      }
+      if (service.replicas < 1) {
+        issues.push(`Requested replicas ${service.replicas} for ${serviceName} is below minimum 1.`);
+      }
+    }
+
+    if (service.cpu !== null && service.cpu > staticLimits.maxCpu) {
+      issues.push(`Requested CPU ${service.cpu} for ${serviceName} exceeds max allowed ${staticLimits.maxCpu}.`);
+    }
+
+    if (service.memoryGb !== null && service.memoryGb > staticLimits.maxMemoryGb) {
+      issues.push(`Requested memory ${service.memoryGb}GB for ${serviceName} exceeds max allowed ${staticLimits.maxMemoryGb}GB.`);
+    }
+  }
+
+  return issues;
 }
 
 function getFirstPortCandidate(value: unknown): unknown {
