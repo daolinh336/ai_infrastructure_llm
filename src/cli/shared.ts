@@ -95,12 +95,18 @@ export function printRevisionPatchResults(result: PlannerRevisionResult): void {
       console.log(`- ambiguities: ${result.patchPlan.ambiguities.join('; ')}`);
     }
   }
-  for (const patchResult of result.patchResults ?? []) {
+  const patchResults = result.patchResults ?? [];
+  for (const patchResult of patchResults) {
     const target = patchResult.matchedServiceNames.join(', ') || 'n/a';
     const status = patchResult.applied ? 'applied' : patchResult.blockedReason ? 'blocked' : 'skipped';
     console.log(`- ${patchResult.patch.op}: ${status}; target=${target}; reason=${patchResult.patch.reason}`);
     if (patchResult.blockedReason) {
       console.log(chalk.yellow(`  blocked: ${patchResult.blockedReason}`));
+    }
+  }
+  if (patchResults.length === 0 && result.patchPlan?.patches.length) {
+    for (const patch of result.patchPlan.patches) {
+      console.log(`- ${patch.op}: planned; target=${describePreviewPatchTarget(patch)}${describePreviewPatchChange(patch)}; reason=${patch.reason}`);
     }
   }
   console.log();
@@ -374,14 +380,36 @@ export async function requestRuntimeApproval(
 
 function printRuntimeRevisionPreview(result: PlannerRevisionResult): void {
   const patchResults = result.patchResults ?? [];
-  if (patchResults.length === 0) return;
+  const plannedPatches = result.patchPlan?.patches ?? [];
+  if (patchResults.length === 0 && plannedPatches.length === 0) return;
 
   console.log(chalk.cyan('- Planned revision if you choose y:'));
-  for (const patchResult of patchResults) {
-    const patch = patchResult.patch;
-    const target = patchResult.matchedServiceNames.join(', ') || 'global';
-    console.log(chalk.cyan(`  - ${patch.op} ${target}${describePreviewPatchChange(patch)}`));
+  if (patchResults.length > 0) {
+    for (const patchResult of patchResults) {
+      const patch = patchResult.patch;
+      const target = patchResult.matchedServiceNames.join(', ') || describePreviewPatchTarget(patch);
+      console.log(chalk.cyan(`  - ${patch.op} ${target}${describePreviewPatchChange(patch)}`));
+    }
+    return;
   }
+  for (const patch of plannedPatches) {
+    console.log(chalk.cyan(`  - ${patch.op} ${describePreviewPatchTarget(patch)}${describePreviewPatchChange(patch)}`));
+  }
+}
+
+function describePreviewPatchTarget(patch: SpecPatch): string {
+  if ('target' in patch) {
+    const selector = patch.target;
+    if (selector.name) return selector.name;
+    if (selector.nameLike) return `nameLike=${selector.nameLike}`;
+    if (selector.kind) return `kind=${selector.kind}`;
+    if (selector.imageFamily) return `imageFamily=${selector.imageFamily}`;
+    if (selector.exposesHostPort) return 'exposesHostPort=true';
+    if (selector.dependsOn) return `dependsOn=${selector.dependsOn}`;
+    if (selector.dependentOf) return `dependentOf=${selector.dependentOf}`;
+  }
+  if ('service' in patch) return patch.service.name;
+  return 'global';
 }
 
 function describePreviewPatchChange(patch: SpecPatch): string {

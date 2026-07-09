@@ -1777,11 +1777,7 @@ function normalizeHostPortConflictPatchPlan(
     const matched = resolveServiceSelector(spec, patch.target);
     return !matched.some((service) => affectedServices.has(service.name));
   });
-  const hasReplacementFor = new Set(
-    patches
-      .filter((patch) => patch.op === 'replace-service-port')
-      .flatMap((patch) => resolveServiceSelector(spec, patch.target).map((service) => service.name)),
-  );
+  const hasReplacementFor = collectPortReplacementServiceNames(spec, patches);
   const missingReplacementServices = conflicts
     .filter((conflict) => !hasReplacementFor.has(conflict.service.name))
     .map((conflict) => conflict.service.name);
@@ -1803,6 +1799,34 @@ function normalizeHostPortConflictPatchPlan(
       : patchPlan.ambiguities.filter((ambiguity) => !/LLM provider|required|port|feedback/i.test(ambiguity)),
     requiresUserInput: patchPlan.requiresUserInput || missingReplacementServices.length > 0,
   };
+}
+
+function collectPortReplacementServiceNames(spec: InfrastructureSpec, patches: SpecPatch[]): Set<string> {
+  const replacementServices = new Set<string>();
+  const renamedToOriginal = new Map<string, string>();
+
+  const resolveOriginalServiceNames = (selector: ServiceSelector): string[] => {
+    const directMatches = resolveServiceSelector(spec, selector).map((service) => service.name);
+    const aliasMatch = selector.name ? renamedToOriginal.get(selector.name) : undefined;
+    return uniqueIdentifiers(aliasMatch ? [...directMatches, aliasMatch] : directMatches);
+  };
+
+  for (const patch of patches) {
+    if (patch.op === 'rename-service') {
+      for (const originalName of resolveOriginalServiceNames(patch.target)) {
+        renamedToOriginal.set(patch.name, originalName);
+      }
+      continue;
+    }
+
+    if (patch.op === 'replace-service-port') {
+      for (const serviceName of resolveOriginalServiceNames(patch.target)) {
+        replacementServices.add(serviceName);
+      }
+    }
+  }
+
+  return replacementServices;
 }
 
 function collectHostPortConflicts(

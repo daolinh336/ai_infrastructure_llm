@@ -144,7 +144,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
       }
 
-      const requestedRevision = runtimeDecision.userFeedback === null
+      const requestedRevision = runtimeDecision.userFeedback == null
         ? initialRevisionResult
         : await options.agent.reviseFromFeedback({
           ...revisionRequest,
@@ -153,7 +153,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
             userFeedback: runtimeDecision.userFeedback,
           },
         }, plannerRuntimeReader);
-      const requestedRevisionRequest = runtimeDecision.userFeedback === null
+      const requestedRevisionRequest = runtimeDecision.userFeedback == null
         ? revisionRequest
         : {
           ...revisionRequest,
@@ -172,6 +172,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         revisionResolution.revisionResult,
         currentApprovedAction.validatedSpec.projectName,
       );
+      const previousSpec = currentApprovedAction.validatedSpec;
       revisionHistory.push({
         attemptIndex,
         revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
@@ -193,7 +194,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         ...currentApprovedAction,
         validatedSpec: revisionResult.revisedSpec,
       };
-      logPlannerRevision(log, revisionResult);
+      logPlannerRevision(log, revisionResult, previousSpec);
       log('Pre-deploy conflict revised before Docker mutation.');
       continue;
     }
@@ -237,7 +238,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
       }
 
-      const requestedRevision = runtimeDecision.userFeedback === null
+      const requestedRevision = runtimeDecision.userFeedback == null
         ? initialRevisionResult
         : await options.agent.reviseFromFeedback({
           ...revisionRequest,
@@ -246,7 +247,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
             userFeedback: runtimeDecision.userFeedback,
           },
         }, plannerRuntimeReader);
-      const requestedRevisionRequest = runtimeDecision.userFeedback === null
+      const requestedRevisionRequest = runtimeDecision.userFeedback == null
         ? revisionRequest
         : {
           ...revisionRequest,
@@ -265,6 +266,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         revisionResolution.revisionResult,
         currentApprovedAction.validatedSpec.projectName,
       );
+      const previousSpec = currentApprovedAction.validatedSpec;
       revisionHistory.push({
         attemptIndex,
         revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
@@ -283,7 +285,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
         assumptions: [...currentPlan.assumptions, ...revisionResult.assumptions],
       };
       currentApprovedAction = { ...currentApprovedAction, validatedSpec: revisionResult.revisedSpec };
-      logPlannerRevision(log, revisionResult);
+      logPlannerRevision(log, revisionResult, previousSpec);
       log('Deploy error normalized into runtime issue report; revised before redeploy.');
       continue;
     }
@@ -346,7 +348,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       return { status: 'rejected', attempts: attemptIndex, revisionHistory, currentApprovedAction, currentPlan };
     }
 
-    const requestedRevision = runtimeDecision.userFeedback === null
+    const requestedRevision = runtimeDecision.userFeedback == null
       ? initialRevisionResult
       : await options.agent.reviseFromFeedback({
         ...revisionRequest,
@@ -355,7 +357,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
           userFeedback: runtimeDecision.userFeedback,
         },
       }, plannerRuntimeReader);
-    const requestedRevisionRequest = runtimeDecision.userFeedback === null
+    const requestedRevisionRequest = runtimeDecision.userFeedback == null
       ? revisionRequest
       : {
         ...revisionRequest,
@@ -374,6 +376,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       revisionResolution.revisionResult,
       currentApprovedAction.validatedSpec.projectName,
     );
+    const previousSpec = currentApprovedAction.validatedSpec;
     revisionHistory.push({
       attemptIndex,
       revisionDecision: revisionResult.revisionDecision ?? 'auto-revised',
@@ -393,7 +396,7 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       assumptions: [...currentPlan.assumptions, ...revisionResult.assumptions],
     };
     currentApprovedAction = { ...currentApprovedAction, validatedSpec: revisionResult.revisedSpec };
-    logPlannerRevision(log, revisionResult);
+    logPlannerRevision(log, revisionResult, previousSpec);
     log(`Attempt ${attemptIndex} post-deploy verification failed; cleaned up and revised before redeploy.`);
   }
 }
@@ -418,7 +421,7 @@ async function resolveRevisionWithClarifications(
     }
 
     const clarificationFeedback = await options.requestRevisionClarification(revisionResult);
-    if (clarificationFeedback === null) {
+    if (clarificationFeedback == null) {
       return {
         status: 'rejected',
         revisionResult,
@@ -520,17 +523,95 @@ function runtimeIssueReportToVerificationReport(report: RuntimeIssueReport): Ver
 function logPlannerRevision(
   log: (message: string) => void,
   revisionResult: Awaited<ReturnType<ClosedLoopAgentPort['reviseFromFeedback']>>,
+  previousSpec?: ApprovedAction['validatedSpec'],
 ): void {
   log('Planner revision decision: ' + (revisionResult.revisionDecision ?? 'auto-revised'));
   log('Planner revision summary: ' + revisionResult.revisionSummary);
   const patchResults = revisionResult.patchResults ?? [];
-  if (patchResults.length === 0) return;
-  log('Planner patches:');
-  for (const result of patchResults) {
-    const patch = result.patch;
-    const target = result.matchedServiceNames.length > 0 ? result.matchedServiceNames.join(', ') : 'global';
-    log(`- ${patch.op} ${target}${describePatchChange(patch)} -> ${result.applied ? 'applied' : 'skipped'}${result.blockedReason ? ' (' + result.blockedReason + ')' : ''}`);
+  if (patchResults.length > 0) {
+    log('Planner patches:');
+    for (const result of patchResults) {
+      const patch = result.patch;
+      const target = result.matchedServiceNames.length > 0 ? result.matchedServiceNames.join(', ') : describePatchTarget(patch);
+      log(`- ${patch.op} ${target}${describePatchChange(patch)} -> ${result.applied ? 'applied' : 'skipped'}; reason=${patch.reason}${result.blockedReason ? ' (blocked: ' + result.blockedReason + ')' : ''}`);
+    }
+  } else if ((revisionResult.patchPlan?.patches.length ?? 0) > 0) {
+    log('Planner patches (planned; no resolution details returned):');
+    for (const patch of revisionResult.patchPlan?.patches ?? []) {
+      log(`- ${patch.op} ${describePatchTarget(patch)}${describePatchChange(patch)}; reason=${patch.reason}`);
+    }
+  } else {
+    log('Planner patches: none reported by planner.');
   }
+
+  if (previousSpec) {
+    const changes = describeSpecChanges(previousSpec, revisionResult.revisedSpec);
+    if (changes.length > 0) {
+      log('Planner resulting spec changes:');
+      for (const change of changes) log(`- ${change}`);
+    } else {
+      log('Planner resulting spec changes: none.');
+    }
+  }
+}
+
+function describePatchTarget(patch: SpecPatchPlan['patches'][number]): string {
+  if ('target' in patch) {
+    const selector = patch.target;
+    if (selector.name) return selector.name;
+    if (selector.nameLike) return `nameLike=${selector.nameLike}`;
+    if (selector.kind) return `kind=${selector.kind}`;
+    if (selector.imageFamily) return `imageFamily=${selector.imageFamily}`;
+    if (selector.exposesHostPort) return 'exposesHostPort=true';
+    if (selector.dependsOn) return `dependsOn=${selector.dependsOn}`;
+    if (selector.dependentOf) return `dependentOf=${selector.dependentOf}`;
+  }
+  if ('service' in patch) return patch.service.name;
+  return 'global';
+}
+
+function describeSpecChanges(
+  before: ApprovedAction['validatedSpec'],
+  after: ApprovedAction['validatedSpec'],
+): string[] {
+  const changes: string[] = [];
+  if (before.projectName !== after.projectName) {
+    changes.push(`projectName: ${before.projectName} -> ${after.projectName}`);
+  }
+
+  const beforeServices = new Map(before.services.map((service) => [service.name, service]));
+  const afterServices = new Map(after.services.map((service) => [service.name, service]));
+
+  for (const [name, service] of beforeServices) {
+    if (!afterServices.has(name)) changes.push(`service ${name}: removed (${service.image})`);
+  }
+  for (const [name, service] of afterServices) {
+    const previous = beforeServices.get(name);
+    if (!previous) {
+      changes.push(`service ${name}: added (${service.image}${formatPortsForDiff(service.ports)})`);
+      continue;
+    }
+    if (previous.image !== service.image) changes.push(`service ${name} image: ${previous.image} -> ${service.image}`);
+    if ((previous.replicas ?? 1) !== (service.replicas ?? 1)) changes.push(`service ${name} replicas: ${previous.replicas ?? 1} -> ${service.replicas ?? 1}`);
+    if (!sameStringList(previous.ports ?? [], service.ports ?? [])) changes.push(`service ${name} ports: ${formatListForDiff(previous.ports ?? [])} -> ${formatListForDiff(service.ports ?? [])}`);
+    if (previous.desiredStatus !== service.desiredStatus) changes.push(`service ${name} desiredStatus: ${previous.desiredStatus ?? 'running'} -> ${service.desiredStatus ?? 'running'}`);
+  }
+
+  if (!sameStringList(before.networks, after.networks)) changes.push(`networks: ${formatListForDiff(before.networks)} -> ${formatListForDiff(after.networks)}`);
+  if (!sameStringList(before.volumes, after.volumes)) changes.push(`volumes: ${formatListForDiff(before.volumes)} -> ${formatListForDiff(after.volumes)}`);
+  return changes;
+}
+
+function sameStringList(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function formatListForDiff(values: string[]): string {
+  return values.length > 0 ? values.join(', ') : 'none';
+}
+
+function formatPortsForDiff(ports: string[] | undefined): string {
+  return ports && ports.length > 0 ? ` ports ${ports.join(', ')}` : '';
 }
 
 function describePatchChange(patch: SpecPatchPlan['patches'][number]): string {
