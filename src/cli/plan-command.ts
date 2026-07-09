@@ -62,6 +62,7 @@ import {
 } from './shared.js';
 import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 import { toReplicaContainerNames } from '../execution/container-names.js';
+import { scopeRuntimeActualStateToSpec } from '../domain/runtime-state-scope.js';
 
 export function registerPlanCommand(program: Command): void {
   program
@@ -1091,9 +1092,10 @@ async function refreshAdjustStateAfterDeploy(
         service,
       ),
   );
-  const actual = await mcpClient.observeActualStateWithInspect({
+  const observedActual = await mcpClient.observeActualStateWithInspect({
     containerNames,
   });
+  const actual = scopeRuntimeActualStateToSpec(observedActual, approvedAction.validatedSpec);
   const verificationReport: VerificationReport = {
     status: 'passed',
     scope: 'tool-runtime',
@@ -1167,9 +1169,10 @@ async function rollbackAdjustToSnapshot(
   const containerNames = snapshot.desired.services.flatMap((service) =>
     toReplicaContainerNames(snapshot.desired.projectName, service),
   );
-  const actual = await mcpClient.observeActualStateWithInspect({
+  const observedActual = await mcpClient.observeActualStateWithInspect({
     containerNames,
   });
+  const actual = scopeRuntimeActualStateToSpec(observedActual, snapshot.desired);
   const verificationReport: VerificationReport = {
     status: 'passed',
     scope: 'tool-runtime',

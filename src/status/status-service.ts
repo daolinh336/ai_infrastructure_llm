@@ -1,9 +1,11 @@
 import type {
+  DriftReport,
   InfrastructureStateSnapshot,
   VerifiedRuntimeSnapshot,
 } from '../domain/types.js';
 import { desiredPortMappingsPresent } from '../domain/port-mappings.js';
 import { toReplicaContainerNames } from '../execution/container-names.js';
+import { scopeRuntimeActualStateToSpec } from '../domain/runtime-state-scope.js';
 import {
   listProjectStates,
   loadProjectState,
@@ -53,8 +55,53 @@ export function formatStatusSnapshots(snapshots: InfrastructureStateSnapshot[]):
     .join('\n\n');
 }
 
+export function formatDriftStatusSummary(
+  snapshot: InfrastructureStateSnapshot,
+  drift: DriftReport,
+  reportPath: string,
+): string {
+  if (!snapshot.current) {
+    return 'No verified infrastructure state found yet.';
+  }
+
+  return [
+    'Desired vs actual comparison:',
+    ...formatDesiredActualComparison(snapshot.current),
+    'History records: ' + String(snapshot.history.length),
+    'Live drift for project "' + snapshot.current.desired.projectName + '":',
+    '- ' + drift.summary,
+    '- Report file: ' + reportPath,
+  ].join('\n');
+}
+
 function isRunningStatus(status: string | null): boolean {
   return status === 'running';
+}
+
+
+function stripProjectPrefix(name: string, projectName: string): string {
+  const prefix = projectName + '-';
+  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
+}
+
+function stripComposeReplicaSuffix(name: string): string {
+  return name.replace(/[-_][1-9][0-9]*$/, '');
+}
+
+function normalizeObservedContainerName(name: string, projectName: string): string {
+  return stripComposeReplicaSuffix(stripProjectPrefix(name, projectName));
+}
+
+function matchesDesiredContainerName(
+  containerName: string,
+  expectedName: string,
+  service: VerifiedRuntimeSnapshot['desired']['services'][number],
+  projectName: string,
+): boolean {
+  const replicas = service.replicas ?? 1;
+  return containerName === expectedName || (
+    replicas <= 1 && normalizeObservedContainerName(containerName, projectName) === service.name
+  );
 }
 
 function formatDesiredEnvironment(environment: Record<string, string> | undefined): string {
@@ -90,17 +137,28 @@ function formatEnvironmentComparison(
 
 function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string[] {
   const desired = current.desired;
-  const containers = current.actual.containers;
+  const scopedActual = scopeRuntimeActualStateToSpec(current.actual, desired);
+  const containers = scopedActual.containers;
   const nameWidth = Math.max(...desired.services.map((service) => service.name.length), '(extra)'.length);
   const lines: string[] = [];
   const matched = new Set<string>();
 
   for (const service of desired.services) {
     const expectedNames = toReplicaContainerNames(desired.projectName, service);
+    const matchedExpectedNames = new Set<string>();
     const serviceContainers = expectedNames
-      .map((expected) => containers.find((entry) => entry.name === expected) ?? null)
+      .map((expected) => {
+        const container = containers.find((entry) =>
+          !matched.has(entry.name) &&
+          matchesDesiredContainerName(entry.name, expected, service, desired.projectName),
+        ) ?? null;
+        if (container) {
+          matched.add(container.name);
+          matchedExpectedNames.add(expected);
+        }
+        return container;
+      })
       .filter((container): container is NonNullable<typeof container> => container !== null);
-    for (const container of serviceContainers) matched.add(container.name);
     const label = service.name.padEnd(nameWidth);
 
     if (serviceContainers.length === 0) {
@@ -132,7 +190,7 @@ function formatDesiredActualComparison(current: VerifiedRuntimeSnapshot): string
       );
     }
 
-    const missingNames = expectedNames.filter((expected) => !matched.has(expected));
+    const missingNames = expectedNames.filter((expected) => !matchedExpectedNames.has(expected));
     for (const missingName of missingNames) {
       const desiredStatus = service.desiredStatus ?? 'running';
       lines.push(
@@ -161,7 +219,8 @@ function formatCurrentState(snapshot: InfrastructureStateSnapshot): string {
   }
 
   const current = snapshot.current;
-  const observedContainers = current.actual.containers
+  const scopedActual = scopeRuntimeActualStateToSpec(current.actual, current.desired);
+  const observedContainers = scopedActual.containers
     .map((container) => container.name)
     .join(', ');
 
@@ -175,9 +234,9 @@ function formatCurrentState(snapshot: InfrastructureStateSnapshot): string {
     `Last observed: ${current.actual.lastObservedAt ?? 'never'}`,
     `Verification status: ${current.verificationReport?.status ?? current.verification.status}`,
     `Verification findings: ${formatVerificationFindings(current)}`,
-    `Observed networks: ${current.actual.networks.map((n) => n.name).join(', ') || 'none'}`,
-    `Observed volumes: ${current.actual.volumes.map((v) => v.name).join(', ') || 'none'}`,
-    `Observed images: ${current.actual.images.map((i) => i.reference).join(', ') || 'none'}`,
+    `Observed networks: ${scopedActual.networks.map((n) => n.name).join(', ') || 'none'}`,
+    `Observed volumes: ${scopedActual.volumes.map((v) => v.name).join(', ') || 'none'}`,
+    `Observed images: ${scopedActual.images.map((i) => i.reference).join(', ') || 'none'}`,
     `Drift status: ${current.driftReport?.status ?? 'not checked'}`,
     `Revision history: ${formatRevisionHistory(current)}`,
     `Operation: ${current.operation ?? 'deploy'}`,

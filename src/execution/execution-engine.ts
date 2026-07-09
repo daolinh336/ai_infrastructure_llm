@@ -62,6 +62,7 @@ import { validateVerificationReport } from '../domain/schemas.js';
 import { buildDriftReport } from './drift-detector.js';
 import { toReplicaContainerNames } from './container-names.js';
 import { isProtectedDockerNetwork } from './protected-docker-resources.js';
+import { scopeRuntimeActualStateToSpec } from '../domain/runtime-state-scope.js';
 import {
   normalizeTrustedImageReference,
   isSupportedImageReference,
@@ -725,9 +726,10 @@ export class ExecutionEngine {
     const containerNames = desired.services.flatMap((service) =>
       toReplicaContainerNames(desired.projectName, service),
     );
-    const actual = await mcpClient.observeActualStateWithInspect({
+    const observed = await mcpClient.observeActualStateWithInspect({
       containerNames,
     });
+    const actual = scopeRuntimeActualStateToSpec(observed, desired);
     const drift = buildDriftReport(snapshot.desired, actual);
     return { drift, actual };
   }
@@ -774,6 +776,7 @@ export class ExecutionEngine {
                   `Cannot recreate container "${action.resourceName}": no matching service in desired spec.`,
                 );
               }
+              await removeExistingContainerIfPresent(mcpClient, action.resourceName);
               const command = getRuntimeKeepaliveCommand(service.image);
               await mcpClient.createContainer({
                 name: action.resourceName,
@@ -816,7 +819,7 @@ export class ExecutionEngine {
     });
     return {
       report: { status, actionsAttempted, actionsSucceeded, actionsFailed },
-      actual: observed,
+      actual: scopeRuntimeActualStateToSpec(observed, snapshot.desired),
     };
   }
 
@@ -1304,9 +1307,40 @@ function repairActionsToOperations(
     if (action.kind === 'create-network') operations.push('createNetwork');
     if (action.kind === 'create-volume') operations.push('createVolume');
     if (action.kind === 'recreate-container')
-      operations.push('createContainer', 'startContainer');
+      operations.push('stopContainer', 'removeContainer', 'createContainer', 'startContainer');
   }
   return operations;
+}
+
+async function removeExistingContainerIfPresent(
+  mcpClient: DockerMcpGateway,
+  containerName: string,
+): Promise<void> {
+  try {
+    await mcpClient.stopContainer(containerName);
+  } catch (error) {
+    if (!isMissingContainerError(error) && !isContainerAlreadyStoppedError(error)) {
+      throw error;
+    }
+  }
+
+  try {
+    await mcpClient.removeContainer(containerName);
+  } catch (error) {
+    if (!isMissingContainerError(error)) {
+      throw error;
+    }
+  }
+}
+
+function isMissingContainerError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes('404') || message.includes('no such container') || message.includes('container not found');
+}
+
+function isContainerAlreadyStoppedError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes('container already stopped') || message.includes('is not running') || message.includes('not running');
 }
 
 function buildOperationLabels(scope: AttemptScope): Record<string, string> {

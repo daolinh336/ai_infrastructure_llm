@@ -803,32 +803,25 @@ export function collectDestroyAllTargets(
     const expectedNetworks = new Set(snapshot.desired.networks);
     const expectedVolumes = new Set(snapshot.desired.volumes);
 
-    for (const name of snapshot.resourceRefs?.containers ?? [...expectedContainers]) {
+    const containerRefs = snapshot.resourceRefs?.containers;
+    const networkRefs = snapshot.resourceRefs?.networks;
+    const volumeRefs = snapshot.resourceRefs?.volumes;
+
+    for (const name of containerRefs ?? [...expectedContainers]) {
       if (name.startsWith(snapshot.desired.projectName + '-') || expectedContainers.has(name)) {
         containers.add(name);
       }
     }
-    for (const name of expectedContainers) {
-      containers.add(name);
-    }
-    for (const name of snapshot.resourceRefs?.networks ?? snapshot.desired.networks) {
+    for (const name of networkRefs ?? snapshot.desired.networks) {
       if (!isProtectedDockerNetwork(name) && (name.startsWith(snapshot.desired.projectName + '-') || expectedNetworks.has(name))) {
         networks.add(name);
       }
     }
-    for (const name of expectedNetworks) {
-      if (!isProtectedDockerNetwork(name)) {
-        networks.add(name);
-      }
-    }
     if (removeVolumes) {
-      for (const name of snapshot.resourceRefs?.volumes ?? snapshot.desired.volumes) {
+      for (const name of volumeRefs ?? snapshot.desired.volumes) {
         if (name.startsWith(snapshot.desired.projectName + '-') || expectedVolumes.has(name)) {
           volumes.add(name);
         }
-      }
-      for (const name of expectedVolumes) {
-        volumes.add(name);
       }
     }
   };

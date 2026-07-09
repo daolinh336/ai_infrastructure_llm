@@ -23,6 +23,7 @@ import type { DockerMcpGateway } from '../execution/docker-mcp-gateway.js';
 import { createPlannerRuntimeReader, type PlannerRuntimeReader } from '../execution/runtime-environment-reader.js';
 import { buildDriftReport } from '../execution/drift-detector.js';
 import { toReplicaContainerNames } from '../execution/container-names.js';
+import { scopeRuntimeActualStateToSpec } from '../domain/runtime-state-scope.js';
 import {
   createConflictVerificationReport,
   detectPreDeployConflicts,
@@ -292,7 +293,8 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
       toReplicaContainerNames(currentApprovedAction.validatedSpec.projectName, service),
     );
     progress({ phase: 'observe', message: 'Reading container inspect details...', toolName: 'observeActualStateWithInspect' });
-    const actualState = await options.mcpClient.observeActualStateWithInspect({ containerNames });
+    const observedActualState = await options.mcpClient.observeActualStateWithInspect({ containerNames });
+    const actualState = scopeRuntimeActualStateToSpec(observedActualState, currentApprovedAction.validatedSpec);
     const resourceRefs = buildResourceRefs(currentApprovedAction.validatedSpec.projectName, actualState, currentApprovedAction.validatedSpec);
     const driftReport = buildDriftReport(currentApprovedAction.validatedSpec, actualState);
 

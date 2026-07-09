@@ -5,6 +5,7 @@ import type {
   RuntimeContainerObservation,
 } from '../domain/types.js';
 import { isProtectedDockerNetwork } from './protected-docker-resources.js';
+import { scopeRuntimeActualStateToSpec } from '../domain/runtime-state-scope.js';
 
 const PROXY_HINTS = ['nginx', 'traefik', 'caddy', 'envoy', 'haproxy', 'apache', 'httpd'];
 const DB_HINTS = ['postgres', 'postgresql', 'mysql', 'mariadb', 'redis', 'mongodb', 'mongo', 'sqlite'];
@@ -69,14 +70,57 @@ function belongsToProjectResource(
   );
 }
 
+
+function sortObservedContainersByReplicaOrdinal(
+  containers: RuntimeContainerObservation[],
+  projectName: string,
+  knownServiceNames: ReadonlySet<string>,
+): RuntimeContainerObservation[] {
+  const result: RuntimeContainerObservation[] = [];
+  const consumed = new Set<number>();
+
+  for (const [index, container] of containers.entries()) {
+    if (consumed.has(index)) continue;
+    const parsed = parseComposeReplicaName(container.name, projectName, knownServiceNames);
+    if (parsed.ordinal === null) {
+      result.push(container);
+      consumed.add(index);
+      continue;
+    }
+
+    const group = containers
+      .map((candidate, candidateIndex) => ({
+        candidate,
+        candidateIndex,
+        parsed: parseComposeReplicaName(candidate.name, projectName, knownServiceNames),
+      }))
+      .filter((entry) =>
+        !consumed.has(entry.candidateIndex) &&
+        entry.parsed.ordinal !== null &&
+        entry.parsed.baseName === parsed.baseName,
+      )
+      .sort((left, right) => left.parsed.ordinal! - right.parsed.ordinal!);
+
+    for (const entry of group) {
+      result.push(entry.candidate);
+      consumed.add(entry.candidateIndex);
+    }
+  }
+
+  return result;
+}
+
 function serviceFromContainer(
   container: RuntimeContainerObservation,
   projectName: string,
   knownServiceNames: ReadonlySet<string>,
+  options: { preserveReplicaSuffix?: boolean } = {},
 ): InfrastructureService | null {
   const rawName = container.name;
   const withoutProject = stripProjectPrefix(rawName, projectName);
-  const serviceName = knownServiceNames.has(withoutProject) ? withoutProject : stripComposeReplicaSuffix(withoutProject);
+  const serviceName = options.preserveReplicaSuffix || knownServiceNames.has(withoutProject)
+    ? withoutProject
+    : stripComposeReplicaSuffix(withoutProject);
   const name = sanitizeIdentifier(serviceName);
   const image = container.image;
   if (!image) return null;
@@ -91,6 +135,12 @@ function serviceFromContainer(
   }
   if (ports.length > 0) service.ports = ports;
   return service;
+}
+
+function isDenseReplicaOrdinalSet(ordinals: ReadonlySet<number>): boolean {
+  if (ordinals.size === 0) return false;
+  const sorted = [...ordinals].sort((left, right) => left - right);
+  return sorted.every((ordinal, index) => ordinal === index + 1);
 }
 
 function syncManagedEnvironment(
@@ -117,11 +167,17 @@ export function deriveSpecFromRuntime(
   const sourceServiceNames = new Set(sourceSpec.services.map((service) => service.name));
   const sourceNetworkNames = new Set(sourceSpec.networks);
   const sourceVolumeNames = new Set(sourceSpec.volumes);
+  const scopedActual = scopeRuntimeActualStateToSpec(actual, sourceSpec);
+  const scopedContainers = sortObservedContainersByReplicaOrdinal(
+    scopedActual.containers,
+    projectName,
+    sourceServiceNames,
+  );
   const services: InfrastructureService[] = [];
   const seen = new Set<string>();
   const observedReplicaOrdinals = new Map<string, Set<number>>();
 
-  for (const container of actual.containers) {
+  for (const container of scopedContainers) {
     if (!belongsToProjectResource(container.name, projectName, sourceServiceNames)) continue;
     const parsed = parseComposeReplicaName(container.name, projectName, sourceServiceNames);
     if (parsed.ordinal === null) continue;
@@ -130,22 +186,30 @@ export function deriveSpecFromRuntime(
     observedReplicaOrdinals.set(parsed.baseName, existing);
   }
 
-  for (const container of actual.containers) {
+  for (const container of scopedContainers) {
     if (!belongsToProjectResource(container.name, projectName, sourceServiceNames)) continue;
-    const derived = serviceFromContainer(container, projectName, sourceServiceNames);
+    const parsed = parseComposeReplicaName(container.name, projectName, sourceServiceNames);
+    const ordinals = parsed.ordinal === null ? undefined : observedReplicaOrdinals.get(parsed.baseName);
+    const compactReplicaCount = ordinals && ordinals.size > 1 && isDenseReplicaOrdinalSet(ordinals)
+      ? ordinals.size
+      : null;
+    const preserveReplicaSuffix = parsed.ordinal !== null && ordinals !== undefined && ordinals.size > 1 && compactReplicaCount === null;
+    const derived = serviceFromContainer(container, projectName, sourceServiceNames, { preserveReplicaSuffix });
     if (!derived) continue;
     if (seen.has(derived.name)) continue;
     seen.add(derived.name);
 
-    const existing = sourceByName.get(derived.name);
+    const existingByName = sourceByName.get(derived.name);
+    const existingFromBase = preserveReplicaSuffix ? sourceByName.get(parsed.baseName) : undefined;
+    const existing = existingByName ?? existingFromBase;
     if (existing) {
       const merged: InfrastructureService = {
         ...existing,
+        name: existingByName ? existing.name : derived.name,
         image: container.image ?? existing.image,
       };
-      const ordinals = observedReplicaOrdinals.get(derived.name);
-      if (ordinals && ordinals.size > 1) {
-        merged.replicas = ordinals.size;
+      if (compactReplicaCount !== null && derived.name === parsed.baseName) {
+        merged.replicas = compactReplicaCount;
       } else {
         delete merged.replicas;
       }
@@ -167,20 +231,23 @@ export function deriveSpecFromRuntime(
       }
       services.push(merged);
     } else {
+      if (compactReplicaCount !== null && derived.name === parsed.baseName) {
+        derived.replicas = compactReplicaCount;
+      }
       services.push(derived);
     }
   }
 
   const finalServices = services;
 
-  const observedNetworks = actual.networks
+  const observedNetworks = scopedActual.networks
     .filter((network) => belongsToProjectResource(network.name, projectName, sourceNetworkNames))
     .map((network) => normalizeRuntimeResourceName(network.name, projectName))
     .filter((name) => !isProtectedDockerNetwork(name))
     .filter((name) => IDENTIFIER_RE.test(name));
   const finalNetworks = observedNetworks.length > 0 ? observedNetworks : sourceSpec.networks;
 
-  const observedVolumes = actual.volumes
+  const observedVolumes = scopedActual.volumes
     .filter((volume) => belongsToProjectResource(volume.name, projectName, sourceVolumeNames))
     .map((volume) => normalizeRuntimeResourceName(volume.name, projectName))
     .filter((name) => IDENTIFIER_RE.test(name));

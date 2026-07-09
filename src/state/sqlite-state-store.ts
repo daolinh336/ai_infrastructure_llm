@@ -11,6 +11,7 @@ import {
 } from '../domain/schemas.js';
 import { namespaceInfrastructureSpec } from '../domain/project-identity.js';
 import { normalizeStatefulDatabaseReplicaVolumes } from '../domain/stateful-database-volumes.js';
+import { scopeRuntimeActualStateToSpec } from '../domain/runtime-state-scope.js';
 import type {
   AgentObservation,
   ApprovedAction,
@@ -813,6 +814,7 @@ function canonicalizeVerifiedSnapshotForStorage(
   return {
     ...snapshot,
     desired,
+    actual: scopeRuntimeActualStateToSpec(snapshot.actual, desired),
     ...(snapshot.resourceRefs
       ? { resourceRefs: canonicalizeRuntimeResourceRefs(snapshot.resourceRefs, desired) }
       : {}),

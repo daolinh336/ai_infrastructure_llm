@@ -8,6 +8,7 @@ import type {
 } from '../domain/types.js';
 import { missingDesiredPortMappings } from '../domain/port-mappings.js';
 import { toReplicaContainerNames } from './container-names.js';
+import { scopeRuntimeActualStateToSpec } from '../domain/runtime-state-scope.js';
 
 function imageBase(image: string): string {
   return (image.split(':')[0] ?? '').split('/').pop() ?? image.toLowerCase();
@@ -59,12 +60,13 @@ export function buildDriftReport(
   actual: RuntimeActualState,
   checkedAt = new Date().toISOString(),
 ): DriftReport {
+  const scopedActual = scopeRuntimeActualStateToSpec(actual, desired);
   const findings: DriftFinding[] = [];
 
   for (const service of desired.services) {
     const expectedNames = toReplicaContainerNames(desired.projectName, service);
     const replicas = service.replicas ?? 1;
-    const matches = actual.containers.filter((container) =>
+    const matches = scopedActual.containers.filter((container) =>
       expectedNames.includes(container.name) ||
       (replicas <= 1 && normalizeObservedContainerName(container.name, desired.projectName) === service.name),
     );
@@ -228,7 +230,7 @@ export function buildDriftReport(
   }
 
   for (const network of desired.networks) {
-    if (!actual.networks.some((entry) => resourceNameMatches(entry.name, network, desired.projectName))) {
+    if (!scopedActual.networks.some((entry) => resourceNameMatches(entry.name, network, desired.projectName))) {
       findings.push(
         finding(
           'missing-network',
@@ -247,7 +249,7 @@ export function buildDriftReport(
   for (const service of desired.services) {
     for (const volume of service.volumes ?? []) {
       const volumeName = volume.split(':')[0] ?? '';
-      if (volumeName && !actual.volumes.some((entry) => resourceNameMatches(entry.name, volumeName, desired.projectName))) {
+      if (volumeName && !scopedActual.volumes.some((entry) => resourceNameMatches(entry.name, volumeName, desired.projectName))) {
         findings.push(
           finding(
             'missing-volume',
@@ -265,7 +267,7 @@ export function buildDriftReport(
   }
 
   for (const image of new Set(desired.services.map((service) => service.image))) {
-    if (!actual.images.some((entry) => entry.reference === image || imageBase(entry.reference) === imageBase(image))) {
+    if (!scopedActual.images.some((entry) => entry.reference === image || imageBase(entry.reference) === imageBase(image))) {
       findings.push(
         finding(
           'missing-image',
