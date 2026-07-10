@@ -2,8 +2,6 @@
 
 `infra-react-agent` is a natural-language infrastructure management CLI built around a ReAct-style AI Agent. A user describes the target infrastructure in plain language, and the system validates the request, generates a plan, previews the result, asks for approval, executes through a runtime plugin, observes the runtime state, and stores verified state in SQLite.
 
-The current mini-project proves the architecture with Docker and Docker Compose, but the long-term direction is broader: the AI Agent is the core, while Docker, Kubernetes, AWS, GCP, on-prem systems, or process-based runtimes such as JAR runners are plugin-style capability layers that can be integrated through MCP servers or runtime adapters.
-
 ## Mini-Project Contributions
 
 This mini-project contributes three concrete pieces, all backed by code rather than only diagrams:
@@ -34,7 +32,7 @@ This project turns natural-language infrastructure requests into a controlled in
 Instead of requiring a user to manually write Compose files or call Docker commands directly, the CLI can take a request such as:
 
 ```bash
-npm run dev -- plan "Create a web application with nginx, 2 node backends, and postgres" --prjName web-stack --dry-run
+aiagent plan "Create a web application with nginx, 2 node backends, and postgres" --prjName web-stack --dry-run
 ```
 
 From there, the system:
@@ -102,9 +100,9 @@ Commands:
 #### `plan [options] <prompt>`
 
 ```bash
-npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --dry-run
-npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --deploy
-npm run dev -- plan "Scale backend to 3 replicas" --prjName web-stack --adjust
+aiagent plan "Create nginx on port 8080" --prjName nginx-demo --dry-run
+aiagent plan "Create nginx on port 8080" --prjName nginx-demo --deploy
+aiagent plan "Scale backend to 3 replicas" --prjName web-stack --adjust
 ```
 
 - `--dry-run`: renders outputs without writing verified state or deploying Docker. Default: `true`.
@@ -116,7 +114,7 @@ npm run dev -- plan "Scale backend to 3 replicas" --prjName web-stack --adjust
 #### `doctor [options]`
 
 ```bash
-npm run dev -- doctor --docker
+aiagent doctor --docker
 ```
 
 - `--docker`: performs a read-only Docker Engine API reachability check.
@@ -124,7 +122,7 @@ npm run dev -- doctor --docker
 #### `observe`
 
 ```bash
-npm run dev -- observe
+aiagent observe
 ```
 
 Lists the current Docker runtime state through MCP.
@@ -132,10 +130,10 @@ Lists the current Docker runtime state through MCP.
 #### `status [options]`
 
 ```bash
-npm run dev -- status
-npm run dev -- status --prjName web-stack
-npm run dev -- status --prjName web-stack --drift
-npm run dev -- status --prjName web-stack --drift --repair
+aiagent status
+aiagent status --prjName web-stack
+aiagent status --prjName web-stack --drift
+aiagent status --prjName web-stack --drift --repair
 ```
 
 - `--drift`: compares live Docker runtime state with the saved desired state.
@@ -145,9 +143,9 @@ npm run dev -- status --prjName web-stack --drift --repair
 #### `destroy [options]`
 
 ```bash
-npm run dev -- destroy --project web-stack
-npm run dev -- destroy --project web-stack --remove-volumes
-npm run dev -- destroy -p web-stack --remove-volumes --yes
+aiagent destroy --project web-stack
+aiagent destroy --project web-stack --remove-volumes
+aiagent destroy -p web-stack --remove-volumes --yes
 ```
 
 - `-p, --project <name>`: project name override.
@@ -157,9 +155,9 @@ npm run dev -- destroy -p web-stack --remove-volumes --yes
 #### `destroy-all|destroy-all-infra [options]`
 
 ```bash
-npm run dev -- destroy-all
-npm run dev -- destroy-all --remove-volumes
-npm run dev -- destroy-all-infra --remove-volumes --yes
+aiagent destroy-all
+aiagent destroy-all --remove-volumes
+aiagent destroy-all-infra --remove-volumes --yes
 ```
 
 - `--remove-volumes`: also removes volumes referenced by managed state.
@@ -168,7 +166,7 @@ npm run dev -- destroy-all-infra --remove-volumes --yes
 #### `repair`
 
 ```bash
-npm run dev -- repair
+aiagent repair
 ```
 
 Detects drift for the current verified snapshot, previews a repair plan, asks for `yes`, `no`, or `sync`, and applies the selected path.
@@ -432,13 +430,13 @@ npm run build:supernova-mcp
 ### Validate Docker connectivity
 
 ```bash
-npm run dev -- doctor --docker
+aiagent doctor --docker
 ```
 
 ### Run a safe dry-run
 
 ```bash
-npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --dry-run
+aiagent plan "Create nginx on port 8080" --prjName nginx-demo --dry-run
 ```
 
 Expected output includes:
@@ -455,7 +453,7 @@ Expected output includes:
 ### Deploy after approval
 
 ```bash
-npm run dev -- plan "Create nginx on port 8080" --prjName nginx-demo --deploy
+aiagent plan "Create nginx on port 8080" --prjName nginx-demo --deploy
 ```
 
 Expected behavior:
@@ -469,15 +467,15 @@ Expected behavior:
 ### Observe and inspect saved state
 
 ```bash
-npm run dev -- observe
-npm run dev -- status --prjName nginx-demo
-npm run dev -- status --prjName nginx-demo --drift
+aiagent observe
+aiagent status --prjName nginx-demo
+aiagent status --prjName nginx-demo --drift
 ```
 
 ### Repair drift
 
 ```bash
-npm run dev -- status --prjName nginx-demo --drift --repair
+aiagent status --prjName nginx-demo --drift --repair
 ```
 
 Repair choices:
@@ -491,13 +489,13 @@ Repair choices:
 Destroy one project:
 
 ```bash
-npm run dev -- destroy --project nginx-demo --remove-volumes
+aiagent destroy --project nginx-demo --remove-volumes
 ```
 
 Destroy all managed resources:
 
 ```bash
-npm run dev -- destroy-all --remove-volumes
+aiagent destroy-all --remove-volumes
 ```
 
 ### Run the built CLI
