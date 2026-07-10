@@ -74,6 +74,22 @@ export function formatDriftStatusSummary(
   ].join('\n');
 }
 
+export function formatConciseDriftStatusSummary(
+  snapshot: InfrastructureStateSnapshot,
+  drift: DriftReport,
+): string {
+  if (!snapshot.current) {
+    return 'No verified infrastructure state found yet.';
+  }
+
+  return [
+    'Desired vs actual comparison:',
+    ...formatDesiredActualComparison(snapshot.current),
+    'Live drift for project "' + snapshot.current.desired.projectName + '":',
+    '- ' + drift.summary,
+  ].join('\n');
+}
+
 function isRunningStatus(status: string | null): boolean {
   return status === 'running';
 }

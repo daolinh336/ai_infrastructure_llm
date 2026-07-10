@@ -199,12 +199,6 @@ export function printDetailedDryRunPreview(
     console.log(`- [${finding.severity}] ${finding.code}${target}: ${finding.message}`);
   }
   console.log();
-
-  console.log(chalk.cyan('Actions not performed:'));
-  for (const action of preview.actionsNotPerformed) {
-    console.log(`- ${action}`);
-  }
-  console.log();
 }
 
 function isUserFacingServiceWarning(warning: string): boolean {
@@ -292,11 +286,6 @@ export function printPreflightReport(preflight: PreflightReport): void {
     for (const issue of preflight.issues) {
       console.log(`- ${issue}`);
     }
-  }
-
-  console.log(chalk.cyan('Preflight evidence:'));
-  for (const item of preflight.evidence) {
-    console.log(`- ${item}`);
   }
   console.log();
 }
@@ -536,7 +525,6 @@ export async function requestCliApproval(request: ApprovalRequest): Promise<{ ap
   console.log(`- target: ${request.artifactTargetPath}`);
   console.log(`- compose hash: ${request.composePreviewSha256}`);
   console.log(`- containers if later applied: ${request.totalContainers}`);
-  console.log('- Phase 8 will not call Docker or MCP.');
   console.log();
   console.log(
     chalk.cyan(

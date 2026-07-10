@@ -14,7 +14,11 @@ import { isProtectedDockerNetwork } from '../execution/protected-docker-resource
 import { toReplicaContainerNames } from '../execution/container-names.js';
 import { normalizeProjectName } from '../domain/project-identity.js';
 import { clearManagedProjectState, clearManagedStateAfterDestroyAll, listProjectStates, loadProjectState, loadState, saveVerifiedRuntimeSnapshot } from '../state/sqlite-state-store.js';
-import { StatusService, formatDriftStatusSummary, formatStatusSnapshots } from '../status/status-service.js';
+import {
+  StatusService,
+  formatConciseDriftStatusSummary,
+  formatStatusSnapshots,
+} from '../status/status-service.js';
 import { registerPlanCommand } from './plan-command.js';
 import { finishOperationMetrics, startOperationMetrics } from '../metrics/metrics.js';
 import type { DriftReport, InfrastructureStateSnapshot, RepairPlan, RuntimeActualState, VerifiedRuntimeSnapshot } from '../domain/types.js';
@@ -304,13 +308,13 @@ program
           if (options.repair && drift.status !== 'none') {
             const resolution = await promptAndApplyDriftResolution(projectState.current, mcpClient, engine, drift, actual);
             if (resolution) {
-              const driftReportPath = await writeProjectDriftReport(
+              await writeProjectDriftReport(
                 project,
                 resolution.state.current!,
                 resolution.drift,
                 resolution.actual,
               );
-              console.log(formatDriftStatusSummary(resolution.state, resolution.drift, driftReportPath));
+              printConciseDriftStatusSummary(resolution.state, resolution.drift);
               continue;
             }
           }
@@ -322,11 +326,16 @@ program
               driftReport: drift,
             },
           };
-          const driftReportPath = await writeProjectDriftReport(project, projectState.current, drift, actual);
-          console.log(formatStatusSnapshots([renderedState]));
-          console.log(chalk.cyan('Live drift for project "' + project + '":'));
-          console.log('- ' + drift.summary);
-          console.log('- Report file: ' + driftReportPath);
+          if (options.repair) {
+            await writeProjectDriftReport(project, projectState.current, drift, actual);
+            printConciseDriftStatusSummary(renderedState, drift);
+          } else {
+            const driftReportPath = await writeProjectDriftReport(project, projectState.current, drift, actual);
+            console.log(formatStatusSnapshots([renderedState]));
+            console.log(chalk.cyan('Live drift for project "' + project + '":'));
+            console.log('- ' + drift.summary);
+            console.log('- Report file: ' + driftReportPath);
+          }
         } catch (error) {
           console.log(chalk.red('Drift detection failed for project "' + project + '":'));
           console.log('- ' + getErrorMessage(error));
@@ -485,13 +494,13 @@ program
     for (const finding of drift.findings) { console.log('  - [' + finding.severity + '] ' + finding.message); }
     const resolution = await promptAndApplyDriftResolution(state.current, mcpClient, engine, drift, actual);
     if (resolution) {
-      const driftReportPath = await writeProjectDriftReport(
+      await writeProjectDriftReport(
         project,
         resolution.state.current!,
         resolution.drift,
         resolution.actual,
       );
-      console.log(formatDriftStatusSummary(resolution.state, resolution.drift, driftReportPath));
+      printConciseDriftStatusSummary(resolution.state, resolution.drift);
     }
     await finishOperationMetrics(repairMetrics, { success: true });
   } catch (error) {
@@ -510,6 +519,15 @@ interface AppliedDriftResolution {
   state: InfrastructureStateSnapshot;
   drift: DriftReport;
   actual: RuntimeActualState;
+}
+
+function printConciseDriftStatusSummary(
+  snapshot: InfrastructureStateSnapshot,
+  drift: DriftReport,
+): void {
+  for (const line of formatConciseDriftStatusSummary(snapshot, drift).split('\n')) {
+    console.log(line.startsWith('Live drift for project ') ? chalk.cyan(line) : line);
+  }
 }
 
 async function promptAndApplyDriftResolution(

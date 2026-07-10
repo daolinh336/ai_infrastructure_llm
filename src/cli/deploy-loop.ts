@@ -162,7 +162,9 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
             userFeedback: runtimeDecision.userFeedback,
           },
         };
-      const revisionResolution = await resolveRevisionWithClarifications(
+      const revisionResolution = runtimeDecision.choice === 'approved' && isConcreteRevision(requestedRevision, currentApprovedAction.validatedSpec)
+        ? { status: 'resolved' as const, revisionResult: requestedRevision, userFeedback: runtimeDecision.userFeedback }
+        : await resolveRevisionWithClarifications(
         options,
         requestedRevisionRequest,
         requestedRevision,
@@ -256,7 +258,9 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
             userFeedback: runtimeDecision.userFeedback,
           },
         };
-      const revisionResolution = await resolveRevisionWithClarifications(
+      const revisionResolution = runtimeDecision.choice === 'approved' && isConcreteRevision(requestedRevision, currentApprovedAction.validatedSpec)
+        ? { status: 'resolved' as const, revisionResult: requestedRevision, userFeedback: runtimeDecision.userFeedback }
+        : await resolveRevisionWithClarifications(
         options,
         requestedRevisionRequest,
         requestedRevision,
@@ -366,7 +370,9 @@ export async function runClosedLoopDeploy(options: ClosedLoopDeployOptions): Pro
           userFeedback: runtimeDecision.userFeedback,
         },
       };
-    const revisionResolution = await resolveRevisionWithClarifications(
+    const revisionResolution = runtimeDecision.choice === 'approved' && isConcreteRevision(requestedRevision, currentApprovedAction.validatedSpec)
+      ? { status: 'resolved' as const, revisionResult: requestedRevision, userFeedback: runtimeDecision.userFeedback }
+      : await resolveRevisionWithClarifications(
       options,
       requestedRevisionRequest,
       requestedRevision,
@@ -477,6 +483,11 @@ function withExpectedProjectName(
   };
 }
 
+function isConcreteRevision(revisionResult: RevisionResult, previousSpec: ApprovedAction['validatedSpec']): boolean {
+  const normalizedRevision = withExpectedProjectName(revisionResult, previousSpec.projectName);
+  return hashSpec(normalizedRevision.revisedSpec) !== hashSpec(previousSpec);
+}
+
 function createDeployErrorRuntimeIssueReport(
   error: unknown,
   desiredSpec: ApprovedAction['validatedSpec'],
@@ -526,6 +537,7 @@ function logPlannerRevision(
   previousSpec?: ApprovedAction['validatedSpec'],
 ): void {
   log('Planner revision decision: ' + (revisionResult.revisionDecision ?? 'auto-revised'));
+  log('Planner revision source: ' + describePlannerRevisionSource(revisionResult));
   log('Planner revision summary: ' + revisionResult.revisionSummary);
   const patchResults = revisionResult.patchResults ?? [];
   if (patchResults.length > 0) {
@@ -553,6 +565,22 @@ function logPlannerRevision(
       log('Planner resulting spec changes: none.');
     }
   }
+}
+
+function describePlannerRevisionSource(
+  revisionResult: Awaited<ReturnType<ClosedLoopAgentPort['reviseFromFeedback']>>,
+): string {
+  const assumptions = revisionResult.assumptions.join('\n');
+  if (/LLM revision request sent to structured provider with schema spec_patch_plan/.test(assumptions)) {
+    return 'llm-structured-spec-patch-plan';
+  }
+  if (/LLM revision request failed or returned invalid structured output/.test(assumptions)) {
+    return 'llm-structured-spec-patch-plan-failed';
+  }
+  if (/deterministic fallback patch\(es\)/i.test(assumptions)) {
+    return 'deterministic-fallback';
+  }
+  return 'planner-local-validation';
 }
 
 function describePatchTarget(patch: SpecPatchPlan['patches'][number]): string {
